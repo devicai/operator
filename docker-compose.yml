@@ -1,0 +1,56 @@
+services:
+  app:
+    build: .
+    ports:
+      - "${PORT:-3200}:3200"
+    volumes:
+      - ./config.yml:/app/config.yml:ro
+    environment:
+      - DATABASE_URI=${DATABASE_URI:-mongodb://mongo:27017/devic-sandbox}
+      - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "${FRONTEND_PORT:-5174}:80"
+
+  # --- Infrastructure (optional, use --profile infra) ---
+
+  mongo:
+    image: mongo:7
+    profiles: [infra]
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    healthcheck:
+      test: echo 'db.runCommand("ping").ok' | mongosh --quiet
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    profiles: [infra]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: redis-cli ping
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  microsandbox:
+    image: microsandbox/microsandbox:latest
+    profiles: [infra]
+    privileged: true
+    ports:
+      - "5555:5555"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+volumes:
+  mongo-data:
+  redis-data:

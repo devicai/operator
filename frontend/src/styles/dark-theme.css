@@ -1,0 +1,92 @@
+/* =============================================================================
+ * Devic Knowledge — Dark Theme Overrides
+ * =============================================================================
+ * Ant Design component overrides for dark mode.
+ * Aligned with the Devic module design system.
+ */
+
+[data-theme='dark'] {
+  /* --- Cards --- */
+  .ant-card {
+    background-color: #1f1f1f;
+    border-color: #424242;
+  }
+  .ant-card-head {
+    background-color: #2f2f2f;
+    border-bottom-color: #424242;
+  }
+  .ant-card-head-title {
+    color: #d9d9d9;
+  }
+
+  /* --- Inputs --- */
+  .ant-input,
+  .ant-input-affix-wrapper,
+  .ant-select-selector {
+    background-color: #2f2f2f !important;
+    border-color: #424242 !important;
+    color: #d9d9d9 !important;
+  }
+  .ant-input::placeholder,
+  .ant-input-affix-wrapper input::placeholder {
+    color: #8e8e8e !important;
+  }
+  .ant-input:focus,
+  .ant-input-affix-wrapper-focused {
+    border-color: var(--theme-info-color) !important;
+    box-shadow: 0 0 0 2px var(--theme-info-shadow) !important;
+  }
+
+  /* --- Modals --- */
+  .ant-modal-content {
+    background-color: #1f1f1f;
+  }
+  .ant-modal-header {
+    background-color: #2f2f2f;
+    border-bottom-color: #424242;
+  }
+  .ant-modal-title {
+    color: #d9d9d9;
+  }
+
+  /* --- Tooltips --- */
+  .ant-tooltip-inner {
+    background-color: #1f1f1f;
+    color: #d9d9d9;
+    border: 1px solid #424242;
+  }
+  .ant-tooltip-arrow::before {
+    background: #1f1f1f;
+  }
+
+  /* --- Tables --- */
+  .ant-table {
+    background-color: transparent;
+  }
+  .ant-table-thead > tr > th {
+    background-color: #2f2f2f;
+    color: #d9d9d9;
+    border-bottom-color: #424242;
+  }
+  .ant-table-tbody > tr > td {
+    background-color: #1f1f1f;
+    border-bottom-color: #424242;
+    color: #b3b3b3;
+  }
+  .ant-table-tbody > tr:hover > td {
+    background-color: rgba(255, 255, 255, 0.1) !important;
+  }
+
+  /* --- Menu --- */
+  .ant-menu {
+    background-color: transparent;
+  }
+  .ant-menu-item:hover {
+    background-color: rgba(255, 255, 255, 0.1);
+  }
+
+  /* --- Divider --- */
+  .ant-divider {
+    border-color: #424242;
+  }
+}

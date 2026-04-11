@@ -1,0 +1,48 @@
+server:
+  port: 3200
+  basePath: /api/v1
+  cors:
+    enabled: true
+    origins:
+      - http://localhost:5174
+
+database:
+  provider: mongodb
+  uri: ${DATABASE_URI:-mongodb://localhost:27017/devic-sandbox}
+
+redis:
+  url: ${REDIS_URL:-redis://localhost:6379}
+
+microsandbox:
+  defaultImage: node:24
+  defaultCpus: 1
+  defaultMemoryMib: 256
+  defaultTtlSeconds: 1800
+  maxTtlSeconds: 7200
+  ttlCheckIntervalMs: 30000
+
+mcp:
+  enabled: true
+
+auth:
+  enabled: false
+  strategy: api-key
+  apiKeys:
+    - name: devic-backend
+      key: ${SANDBOX_API_KEY:-dev-key-local}
+
+extensions:
+  properties: []
+  # When integrated with Devic, uncomment:
+  # properties:
+  #   - name: clientUID
+  #     type: string
+  #     required: true
+  #     index: true
+  #     entities: "*"
+  #     source: header
+  #     headerName: x-client-uid
+
+logging:
+  level: debug
+  format: pretty
