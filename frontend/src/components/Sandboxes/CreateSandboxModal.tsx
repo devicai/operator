@@ -1,6 +1,10 @@
-import { Form, Input, InputNumber, Modal, Select, message } from 'antd';
+import { Form, Input, InputNumber, Modal, Select, message, Divider, Typography } from 'antd';
 import { useCreateSandbox } from '../../hooks/useSandboxes';
+import { useRestoreSnapshot } from '../../hooks/useSnapshots';
 import { useSandboxProfiles } from '../../hooks/useSandboxProfiles';
+import { useSnapshots } from '../../hooks/useSnapshots';
+
+const { Text } = Typography;
 
 interface Props {
   open: boolean;
@@ -10,14 +14,33 @@ interface Props {
 const CreateSandboxModal: React.FC<Props> = ({ open, onCancel }) => {
   const [form] = Form.useForm();
   const createSandbox = useCreateSandbox();
+  const restoreSnapshot = useRestoreSnapshot();
   const { data: profilesData } = useSandboxProfiles();
+  const { data: snapshotsData } = useSnapshots();
   const profiles = profilesData?.data ?? [];
+  const snapshots = (snapshotsData?.data ?? []).filter((s) => s.status === 'ready');
 
   const handleSubmit = async () => {
     try {
       const values = await form.validateFields();
-      await createSandbox.mutateAsync(values);
-      message.success('Sandbox created');
+      const { snapshotId, ...rest } = values;
+
+      if (snapshotId) {
+        // Create independent sandbox from snapshot
+        await restoreSnapshot.mutateAsync({
+          id: snapshotId,
+          dto: {
+            linked: false,
+            ttlSeconds: rest.ttlSeconds,
+            cpus: rest.cpus,
+            memoryMib: rest.memoryMib,
+          },
+        });
+        message.success('Sandbox created from snapshot');
+      } else {
+        await createSandbox.mutateAsync(rest);
+        message.success('Sandbox created');
+      }
       form.resetFields();
       onCancel();
     } catch (e: any) {
@@ -26,40 +49,66 @@ const CreateSandboxModal: React.FC<Props> = ({ open, onCancel }) => {
     }
   };
 
+  const selectedSnapshotId = Form.useWatch('snapshotId', form);
+
   return (
     <Modal
       open={open}
       title="Create Sandbox"
       onCancel={onCancel}
       onOk={handleSubmit}
-      confirmLoading={createSandbox.isPending}
+      confirmLoading={createSandbox.isPending || restoreSnapshot.isPending}
       width={520}
     >
       <Form form={form} layout="vertical" size="small">
-        <Form.Item name="profileId" label="Profile">
-          <Select
-            placeholder="Select a profile (optional)"
-            allowClear
-            options={profiles.map((p) => ({
-              label: `${p.name} (${p.image})`,
-              value: p._id,
-            }))}
-          />
-        </Form.Item>
-        <Form.Item name="bindingId" label="Binding ID">
-          <Input placeholder="Optional external binding identifier" />
-        </Form.Item>
-        <Form.Item name="image" label="Image">
-          <Select
-            placeholder="Default from profile or node:24"
-            allowClear
-            options={[
-              { label: 'node:24', value: 'node:24' },
-              { label: 'node:22', value: 'node:22' },
-              { label: 'python:3.13', value: 'python:3.13' },
-            ]}
-          />
-        </Form.Item>
+        {snapshots.length > 0 && (
+          <>
+            <Form.Item name="snapshotId" label="From Snapshot">
+              <Select
+                placeholder="Start from a snapshot (optional)"
+                allowClear
+                options={snapshots.map((s) => ({
+                  label: `${s.name} (${s.image})`,
+                  value: s.snapshotId,
+                }))}
+              />
+            </Form.Item>
+            {selectedSnapshotId && (
+              <Text type="secondary" style={{ display: 'block', fontSize: 11, marginTop: -16, marginBottom: 12 }}>
+                Independent copy — changes will not affect the snapshot
+              </Text>
+            )}
+            <Divider style={{ margin: '8px 0 16px' }} />
+          </>
+        )}
+        {!selectedSnapshotId && (
+          <>
+            <Form.Item name="profileId" label="Profile">
+              <Select
+                placeholder="Select a profile (optional)"
+                allowClear
+                options={profiles.map((p) => ({
+                  label: `${p.name} (${p.image})`,
+                  value: p._id,
+                }))}
+              />
+            </Form.Item>
+            <Form.Item name="bindingId" label="Binding ID">
+              <Input placeholder="Optional external binding identifier" />
+            </Form.Item>
+            <Form.Item name="image" label="Image">
+              <Select
+                placeholder="Default from profile or node:24"
+                allowClear
+                options={[
+                  { label: 'node:24', value: 'node:24' },
+                  { label: 'node:22', value: 'node:22' },
+                  { label: 'python:3.13', value: 'python:3.13' },
+                ]}
+              />
+            </Form.Item>
+          </>
+        )}
         <div style={{ display: 'flex', gap: 12 }}>
           <Form.Item name="cpus" label="CPUs" style={{ flex: 1 }}>
             <InputNumber min={1} max={8} placeholder="1" style={{ width: '100%' }} />

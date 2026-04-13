@@ -142,3 +142,40 @@ export interface UpdateMcpProfileDto {
   defaultSandboxProfileId?: string;
   readOnly?: boolean;
 }
+
+// Snapshots
+export type SnapshotStatus = 'creating' | 'ready' | 'restoring' | 'failed';
+
+export interface SnapshotDto {
+  _id: string;
+  snapshotId: string;
+  sandboxId: string;
+  name: string;
+  description: string;
+  status: SnapshotStatus;
+  image: string;
+  workdir: string;
+  cpus: number;
+  memoryMib: number;
+  envVars: Record<string, string>;
+  ports: Record<string, number>;
+  snapshotPath: string;
+  sizeBytes: number;
+  metadata: Record<string, any>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface CreateSnapshotDto {
+  sandboxId: string;
+  name?: string;
+  description?: string;
+}
+
+export interface RestoreSnapshotDto {
+  name?: string;
+  ttlSeconds?: number;
+  cpus?: number;
+  memoryMib?: number;
+  linked?: boolean;
+}

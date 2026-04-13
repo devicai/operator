@@ -1,5 +1,6 @@
 import { useEffect } from 'react';
-import { Form, Input, InputNumber, Modal, Select, message } from 'antd';
+import { Button, Form, Input, InputNumber, Modal, Select, Space, message } from 'antd';
+import { DeleteOutlined, PlusOutlined } from '@ant-design/icons';
 import {
   useCreateSandboxProfile,
   useUpdateSandboxProfile,
@@ -7,6 +8,21 @@ import {
 import type { SandboxProfileDto } from '../../api/types';
 
 const { TextArea } = Input;
+
+type EnvVarEntry = { key: string; value: string };
+
+const envVarsToEntries = (envVars?: Record<string, string>): EnvVarEntry[] =>
+  Object.entries(envVars ?? {}).map(([key, value]) => ({ key, value }));
+
+const entriesToEnvVars = (entries?: EnvVarEntry[]): Record<string, string> => {
+  const out: Record<string, string> = {};
+  for (const entry of entries ?? []) {
+    const key = entry?.key?.trim();
+    if (!key) continue;
+    out[key] = entry.value ?? '';
+  }
+  return out;
+};
 
 interface Props {
   open: boolean;
@@ -22,7 +38,10 @@ const ProfileModal: React.FC<Props> = ({ open, profile, onCancel }) => {
   useEffect(() => {
     if (open) {
       if (profile) {
-        form.setFieldsValue(profile);
+        form.setFieldsValue({
+          ...profile,
+          envVars: envVarsToEntries(profile.envVars),
+        });
       } else {
         form.resetFields();
       }
@@ -32,11 +51,15 @@ const ProfileModal: React.FC<Props> = ({ open, profile, onCancel }) => {
   const handleSubmit = async () => {
     try {
       const values = await form.validateFields();
+      const payload = {
+        ...values,
+        envVars: entriesToEnvVars(values.envVars),
+      };
       if (profile) {
-        await updateProfile.mutateAsync({ id: profile._id, dto: values });
+        await updateProfile.mutateAsync({ id: profile._id, dto: payload });
         message.success('Profile updated');
       } else {
-        await createProfile.mutateAsync(values);
+        await createProfile.mutateAsync(payload);
         message.success('Profile created');
       }
       onCancel();
@@ -90,6 +113,49 @@ const ProfileModal: React.FC<Props> = ({ open, profile, onCancel }) => {
             placeholder="#!/bin/bash&#10;npm install&#10;# Commands run on first sandbox creation"
             style={{ fontFamily: 'monospace', fontSize: 12 }}
           />
+        </Form.Item>
+        <Form.Item label="Environment Variables">
+          <Form.List name="envVars">
+            {(fields, { add, remove }) => (
+              <Space direction="vertical" size={4} style={{ width: '100%' }}>
+                {fields.map((field) => (
+                  <Space key={field.key} align="baseline" style={{ display: 'flex' }}>
+                    <Form.Item
+                      name={[field.name, 'key']}
+                      rules={[
+                        {
+                          pattern: /^[A-Za-z_][A-Za-z0-9_]*$/,
+                          message: 'Invalid env var name',
+                        },
+                      ]}
+                      style={{ marginBottom: 0, flex: 1 }}
+                    >
+                      <Input placeholder="KEY" style={{ fontFamily: 'monospace' }} />
+                    </Form.Item>
+                    <Form.Item
+                      name={[field.name, 'value']}
+                      style={{ marginBottom: 0, flex: 2 }}
+                    >
+                      <Input placeholder="value" style={{ fontFamily: 'monospace' }} />
+                    </Form.Item>
+                    <Button
+                      type="text"
+                      icon={<DeleteOutlined />}
+                      onClick={() => remove(field.name)}
+                    />
+                  </Space>
+                ))}
+                <Button
+                  type="dashed"
+                  onClick={() => add({ key: '', value: '' })}
+                  icon={<PlusOutlined />}
+                  block
+                >
+                  Add variable
+                </Button>
+              </Space>
+            )}
+          </Form.List>
         </Form.Item>
         <Form.Item name="networkPolicy" label="Network Policy">
           <Select

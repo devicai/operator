@@ -4,6 +4,7 @@ import {
   faCubes,
   faPlug,
   faCode,
+  faCamera,
 } from '@fortawesome/free-solid-svg-icons';
 
 export interface ModuleSubSection {
@@ -31,6 +32,12 @@ export const MODULE_CONFIG: ModuleConfig = {
       label: 'Sandboxes',
       icon: faTerminal,
       path: '/sandboxes',
+    },
+    {
+      key: 'snapshots',
+      label: 'Snapshots',
+      icon: faCamera,
+      path: '/snapshots',
     },
     {
       key: 'profiles',

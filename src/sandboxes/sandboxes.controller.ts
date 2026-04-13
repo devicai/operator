@@ -13,6 +13,7 @@ import { ApiTags, ApiOperation } from '@nestjs/swagger';
 import { SandboxesService } from './sandboxes.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
+import { WriteFileDto } from './dto/write-file.dto';
 
 @ApiTags('Sandboxes')
 @Controller('sandboxes')
@@ -113,11 +114,10 @@ export class SandboxesController {
   @ApiOperation({ summary: 'Write file to sandbox' })
   writeFile(
     @Param('id') id: string,
-    @Body('path') filePath: string,
-    @Body('content') content: string,
+    @Body() dto: WriteFileDto,
     @Req() req: any,
   ) {
-    return this.service.writeFile(id, filePath, content, req.extensionScope ?? {});
+    return this.service.writeFile(id, dto.path, dto.content, req.extensionScope ?? {});
   }
 
   @Delete(':id')

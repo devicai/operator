@@ -1,5 +1,6 @@
 import { NestFactory } from '@nestjs/core';
 import { ValidationPipe, Logger } from '@nestjs/common';
+import { json } from 'express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { WsAdapter } from '@nestjs/platform-ws';
 import { AppModule } from './app.module';
@@ -17,6 +18,9 @@ async function bootstrap() {
 
   // WebSocket adapter
   app.useWebSocketAdapter(new WsAdapter(app));
+
+  // Body size limit for file uploads
+  app.use(json({ limit: '10mb' }));
 
   // Global prefix
   const basePath = config.server.basePath ?? '/api/v1';

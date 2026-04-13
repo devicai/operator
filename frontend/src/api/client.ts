@@ -12,6 +12,9 @@ import type {
   McpProfileDto,
   CreateMcpProfileDto,
   UpdateMcpProfileDto,
+  SnapshotDto,
+  CreateSnapshotDto,
+  RestoreSnapshotDto,
 } from './types';
 
 const api = axios.create({
@@ -54,6 +57,12 @@ export const sandboxesApi = {
   extendTtl(id: string, additionalSeconds: number): Promise<AxiosResponse<SandboxDto>> {
     return api.post(`/sandboxes/${id}/extend-ttl`, { additionalSeconds });
   },
+  readFile(id: string, path: string): Promise<AxiosResponse<string>> {
+    return api.get(`/sandboxes/${id}/files`, { params: { path } });
+  },
+  writeFile(id: string, path: string, content: string): Promise<AxiosResponse<void>> {
+    return api.post(`/sandboxes/${id}/files`, { path, content });
+  },
 };
 
 // Sandbox Profiles
@@ -94,6 +103,25 @@ export const mcpProfilesApi = {
   },
   delete(id: string): Promise<AxiosResponse<void>> {
     return api.delete(`/mcp-profiles/${id}`);
+  },
+};
+
+// Snapshots
+export const snapshotsApi = {
+  getAll(params?: { limit?: number; offset?: number; sandboxId?: string }): Promise<AxiosResponse<PaginatedResponse<SnapshotDto>>> {
+    return api.get('/snapshots', { params });
+  },
+  getOne(id: string): Promise<AxiosResponse<SnapshotDto>> {
+    return api.get(`/snapshots/${id}`);
+  },
+  create(dto: CreateSnapshotDto): Promise<AxiosResponse<SnapshotDto>> {
+    return api.post('/snapshots', dto);
+  },
+  restore(id: string, dto: RestoreSnapshotDto = {}): Promise<AxiosResponse<SandboxDto>> {
+    return api.post(`/snapshots/${id}/restore`, dto);
+  },
+  delete(id: string): Promise<AxiosResponse<void>> {
+    return api.delete(`/snapshots/${id}`);
   },
 };
 

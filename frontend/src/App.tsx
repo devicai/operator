@@ -3,6 +3,7 @@ import { ConfigProvider, theme } from 'antd';
 import AppLayout from './components/Layout/AppLayout';
 import SandboxesPage from './components/Sandboxes/SandboxesPage';
 import ProfilesPage from './components/Profiles/ProfilesPage';
+import SnapshotsPage from './components/Snapshots/SnapshotsPage';
 import McpPage from './components/Mcp/McpPage';
 import ApiPage from './components/Api/ApiPage';
 
@@ -45,6 +46,7 @@ const App: React.FC = () => {
         <Routes>
           <Route element={<AppLayout />}>
             <Route path="/sandboxes" element={<SandboxesPage />} />
+            <Route path="/snapshots" element={<SnapshotsPage />} />
             <Route path="/profiles" element={<ProfilesPage />} />
             <Route path="/mcp" element={<McpPage />} />
             <Route path="/api" element={<ApiPage />} />

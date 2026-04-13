@@ -10,11 +10,14 @@ import { HealthController } from './health/health.controller';
 import { Sandbox, SandboxSchema } from './schemas/sandbox.schema';
 import { SandboxProfile, SandboxProfileSchema } from './schemas/sandbox-profile.schema';
 import { McpProfile, McpProfileSchema } from './schemas/mcp-profile.schema';
+import { Snapshot, SnapshotSchema } from './schemas/snapshot.schema';
 import { SandboxRepository } from './repositories/sandbox.repository';
 import { SandboxProfileRepository } from './repositories/sandbox-profile.repository';
 import { McpProfileRepository } from './repositories/mcp-profile.repository';
+import { SnapshotRepository } from './repositories/snapshot.repository';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { SandboxProfilesModule } from './sandbox-profiles/sandbox-profiles.module';
+import { SnapshotsModule } from './snapshots/snapshots.module';
 import { McpModule } from './mcp/mcp.module';
 import { TerminalModule } from './terminal/terminal.module';
 
@@ -23,6 +26,7 @@ const config = loadConfig();
 applyExtensions(SandboxSchema, 'Sandbox', config.extensions.properties);
 applyExtensions(SandboxProfileSchema, 'SandboxProfile', config.extensions.properties);
 applyExtensions(McpProfileSchema, 'McpProfile', config.extensions.properties);
+applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
 
 @Global()
 @Module({
@@ -33,9 +37,11 @@ applyExtensions(McpProfileSchema, 'McpProfile', config.extensions.properties);
       { name: Sandbox.name, schema: SandboxSchema },
       { name: SandboxProfile.name, schema: SandboxProfileSchema },
       { name: McpProfile.name, schema: McpProfileSchema },
+      { name: Snapshot.name, schema: SnapshotSchema },
     ]),
     SandboxesModule,
     SandboxProfilesModule,
+    SnapshotsModule,
     McpModule,
     TerminalModule,
   ],
@@ -48,12 +54,14 @@ applyExtensions(McpProfileSchema, 'McpProfile', config.extensions.properties);
     SandboxRepository,
     SandboxProfileRepository,
     McpProfileRepository,
+    SnapshotRepository,
   ],
   exports: [
     MongooseModule,
     SandboxRepository,
     SandboxProfileRepository,
     McpProfileRepository,
+    SnapshotRepository,
     CONFIG,
     EXTENSIONS_TOKEN,
   ],

@@ -13,6 +13,7 @@ import {
 } from 'antd';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
+  faCamera,
   faPlus,
   faStop,
   faTerminal,
@@ -20,6 +21,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
+import { useCreateSnapshot } from '../../hooks/useSnapshots';
 import type { SandboxDto } from '../../api/types';
 import CreateSandboxModal from './CreateSandboxModal';
 import TerminalDrawer from './TerminalDrawer';
@@ -52,6 +54,7 @@ const SandboxesPage: React.FC = () => {
   const { data, isLoading } = useSandboxes({ status: statusFilter });
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
+  const createSnapshot = useCreateSnapshot();
 
   const sandboxes = data?.data ?? [];
 
@@ -126,6 +129,18 @@ const SandboxesPage: React.FC = () => {
                   size="small"
                   icon={<FontAwesomeIcon icon={faTerminal} />}
                   onClick={() => setTerminalSandbox(row)}
+                />
+              </Tooltip>
+              <Tooltip title="Snapshot">
+                <Button
+                  size="small"
+                  icon={<FontAwesomeIcon icon={faCamera} />}
+                  onClick={() =>
+                    createSnapshot
+                      .mutateAsync({ sandboxId: row.sandboxId })
+                      .then(() => message.success('Snapshot created'))
+                      .catch((e) => message.error(e?.message ?? 'Snapshot failed'))
+                  }
                 />
               </Tooltip>
               <Tooltip title="Stop">

@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger, NotFoundException, BadRequestException } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef } from '@nestjs/common';
 import { Sandbox as MsbSandbox, Patch } from 'microsandbox';
 import type { SandboxConfig } from 'microsandbox';
 import { nanoid } from 'nanoid';
@@ -11,6 +11,7 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
+import { SnapshotsService } from '../snapshots/snapshots.service';
 
 const CWD_MARKER = '__SANDBOX_CWD__';
 
@@ -23,6 +24,8 @@ export class SandboxesService {
     private readonly sandboxRepo: SandboxRepository,
     private readonly profileRepo: SandboxProfileRepository,
     @Inject(CONFIG) private readonly config: ModuleConfig,
+    @Inject(forwardRef(() => SnapshotsService))
+    private readonly snapshotsService: SnapshotsService,
   ) {}
 
   async create(dto: CreateSandboxDto, scope: ExtensionScope): Promise<SandboxDocument> {
@@ -284,6 +287,11 @@ export class SandboxesService {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
+    // Persist filesystem state to linked snapshot before detaching
+    if (doc.snapshotId) {
+      await this.snapshotsService.persistToSnapshot(doc);
+    }
+
     try {
       const containerName = await this.registry.get(doc.sandboxId);
       if (containerName) {
@@ -298,7 +306,7 @@ export class SandboxesService {
     await this.registry.remove(doc.sandboxId);
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
-      { $set: { status: SandboxStatus.STOPPED, snapshotId: doc.name } },
+      { $set: { status: SandboxStatus.STOPPED } },
       scope,
     );
     return updated!;
