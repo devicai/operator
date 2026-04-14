@@ -5,6 +5,7 @@ services:
       - "${PORT:-3200}:3200"
     volumes:
       - ./config.yml:/app/config.yml:ro
+      - snapshots-data:/root/.microsandbox/snapshots
     environment:
       - DATABASE_URI=${DATABASE_URI:-mongodb://mongo:27017/devic-sandbox}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
@@ -54,3 +55,4 @@ services:
 volumes:
   mongo-data:
   redis-data:
+  snapshots-data:
