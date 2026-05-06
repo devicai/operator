@@ -22,7 +22,9 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSnapshots, useRestoreSnapshot, useDeleteSnapshot } from '../../hooks/useSnapshots';
+import { useUsage } from '../../hooks/useUsage';
 import type { SnapshotDto } from '../../api/types';
+import UsagePanel from '../Usage/UsagePanel';
 
 const { Title, Text } = Typography;
 
@@ -51,10 +53,15 @@ const SnapshotsPage: React.FC = () => {
   const [form] = Form.useForm();
 
   const { data, isLoading } = useSnapshots();
+  const { data: usage, isLoading: usageLoading } = useUsage();
   const restoreSnapshot = useRestoreSnapshot();
   const deleteSnapshot = useDeleteSnapshot();
 
   const snapshots = data?.data ?? [];
+  const totalDiskBytes = usage?.disk.usedBytes ?? 0;
+  const dbReportedBytes = snapshots
+    .filter((s) => s.status === 'ready')
+    .reduce((acc, s) => acc + (s.sizeBytes ?? 0), 0);
 
   const openModal = (snapshot: SnapshotDto, mode: 'restore' | 'fork') => {
     setSelectedSnapshot(snapshot);
@@ -132,6 +139,23 @@ const SnapshotsPage: React.FC = () => {
       render: (bytes: number) => <span style={{ fontSize: 11 }}>{formatSize(bytes)}</span>,
     },
     {
+      title: 'Disk share',
+      key: 'diskShare',
+      width: 90,
+      align: 'right',
+      render: (_: any, row) => {
+        if (row.status !== 'ready' || totalDiskBytes <= 0) {
+          return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
+        }
+        const pct = ((row.sizeBytes ?? 0) / totalDiskBytes) * 100;
+        return (
+          <Tooltip title={`${formatSize(row.sizeBytes ?? 0)} of ${formatSize(totalDiskBytes)} actually on disk`}>
+            <span style={{ fontSize: 11 }}>{pct.toFixed(1)}%</span>
+          </Tooltip>
+        );
+      },
+    },
+    {
       title: 'Created',
       dataIndex: 'createdAt',
       key: 'createdAt',
@@ -192,6 +216,8 @@ const SnapshotsPage: React.FC = () => {
         </Title>
       </div>
 
+      <UsagePanel usage={usage} loading={usageLoading} />
+
       <Table
         rowKey="_id"
         size="small"
@@ -207,6 +233,38 @@ const SnapshotsPage: React.FC = () => {
             />
           ),
         }}
+        summary={() =>
+          snapshots.some((s) => s.status === 'ready') ? (
+            <Table.Summary fixed>
+              <Table.Summary.Row>
+                <Table.Summary.Cell index={0} colSpan={4}>
+                  <Text strong style={{ fontSize: 12 }}>
+                    Total ({snapshots.filter((s) => s.status === 'ready').length} ready)
+                  </Text>
+                </Table.Summary.Cell>
+                <Table.Summary.Cell index={4}>
+                  <Tooltip
+                    title={
+                      Math.abs(dbReportedBytes - totalDiskBytes) > 1024
+                        ? `DB reports ${formatSize(dbReportedBytes)} but ${formatSize(totalDiskBytes)} is actually on disk. The drift usually comes from snapshots whose file is missing or from pending persists.`
+                        : 'Sum of sizeBytes recorded on each snapshot document'
+                    }
+                  >
+                    <span style={{ fontSize: 11 }}>{formatSize(dbReportedBytes)}</span>
+                  </Tooltip>
+                </Table.Summary.Cell>
+                <Table.Summary.Cell index={5}>
+                  <Tooltip title="Real bytes measured on the host by /usage">
+                    <span style={{ fontSize: 11, fontWeight: 600 }}>
+                      {formatSize(totalDiskBytes)} on disk
+                    </span>
+                  </Tooltip>
+                </Table.Summary.Cell>
+                <Table.Summary.Cell index={6} colSpan={2} />
+              </Table.Summary.Row>
+            </Table.Summary>
+          ) : null
+        }
       />
 
       <Modal

@@ -21,6 +21,7 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSnapshotDto } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
+import { ResourceUsageService } from '../providers/resource-usage.service';
 
 const SNAPSHOTS_DIR = join(homedir(), '.microsandbox', 'snapshots');
 
@@ -33,6 +34,7 @@ export class SnapshotsService {
     private readonly sandboxRepo: SandboxRepository,
     private readonly registry: SandboxRegistry,
     @Inject(CONFIG) private readonly config: ModuleConfig,
+    private readonly resourceUsage: ResourceUsageService,
   ) {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
@@ -49,6 +51,8 @@ export class SnapshotsService {
         `Sandbox is not running (status: ${sandboxDoc.status})`,
       );
     }
+
+    await this.resourceUsage.assertDiskAvailable();
 
     const sandbox = await this.getSandboxInstance(sandboxDoc);
     const snapshotId = nanoid(12);
@@ -153,6 +157,9 @@ export class SnapshotsService {
     const containerName = `sandbox-${sandboxId}`;
     const ttlSeconds = dto.ttlSeconds ?? defaults.defaultTtlSeconds;
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
+    const restoreMemoryMib = dto.memoryMib ?? snapshot.memoryMib;
+
+    await this.resourceUsage.assertMemoryAvailable(restoreMemoryMib);
 
     const isLinked = dto.linked !== false; // default true
 

@@ -12,6 +12,7 @@ import { CONFIG } from '../config/config.loader';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
+import { ResourceUsageService } from '../providers/resource-usage.service';
 
 const CWD_MARKER = '__SANDBOX_CWD__';
 
@@ -26,6 +27,7 @@ export class SandboxesService {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     @Inject(forwardRef(() => SnapshotsService))
     private readonly snapshotsService: SnapshotsService,
+    private readonly resourceUsage: ResourceUsageService,
   ) {}
 
   async create(dto: CreateSandboxDto, scope: ExtensionScope): Promise<SandboxDocument> {
@@ -59,6 +61,8 @@ export class SandboxesService {
     if (ttlSeconds > defaults.maxTtlSeconds) {
       ttlSeconds = defaults.maxTtlSeconds;
     }
+
+    await this.resourceUsage.assertMemoryAvailable(memoryMib);
 
     const sandboxId = nanoid(12);
     const containerName = `sandbox-${sandboxId}`;

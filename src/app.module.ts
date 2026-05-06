@@ -15,6 +15,8 @@ import { SandboxRepository } from './repositories/sandbox.repository';
 import { SandboxProfileRepository } from './repositories/sandbox-profile.repository';
 import { McpProfileRepository } from './repositories/mcp-profile.repository';
 import { SnapshotRepository } from './repositories/snapshot.repository';
+import { ResourceUsageService } from './providers/resource-usage.service';
+import { UsageController } from './providers/usage.controller';
 import { SandboxesModule } from './sandboxes/sandboxes.module';
 import { SandboxProfilesModule } from './sandbox-profiles/sandbox-profiles.module';
 import { SnapshotsModule } from './snapshots/snapshots.module';
@@ -45,7 +47,7 @@ applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
     McpModule,
     TerminalModule,
   ],
-  controllers: [HealthController],
+  controllers: [HealthController, UsageController],
   providers: [
     { provide: CONFIG, useValue: config },
     { provide: EXTENSIONS_TOKEN, useValue: config.extensions.properties },
@@ -55,6 +57,7 @@ applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
     SandboxProfileRepository,
     McpProfileRepository,
     SnapshotRepository,
+    ResourceUsageService,
   ],
   exports: [
     MongooseModule,
@@ -62,6 +65,7 @@ applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
     SandboxProfileRepository,
     McpProfileRepository,
     SnapshotRepository,
+    ResourceUsageService,
     CONFIG,
     EXTENSIONS_TOKEN,
   ],

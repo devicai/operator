@@ -8,6 +8,7 @@ export interface ModuleConfig {
   auth: AuthConfig;
   webhooks?: WebhooksConfig;
   logging: LoggingConfig;
+  resourceLimits?: ResourceLimitsConfig;
 }
 
 export interface ServerConfig {
@@ -75,4 +76,11 @@ export interface WebhooksConfig {
 export interface LoggingConfig {
   level: 'debug' | 'info' | 'warn' | 'error';
   format: 'json' | 'pretty';
+}
+
+export interface ResourceLimitsConfig {
+  /** Maximum total RAM (MiB) allocated across all running sandboxes. 0/undefined disables the limit. */
+  maxTotalMemoryMib?: number;
+  /** Maximum total disk usage (bytes) for stored snapshots. 0/undefined disables the limit. */
+  maxTotalDiskBytes?: number;
 }

@@ -21,6 +21,17 @@ microsandbox:
   maxTtlSeconds: 7200
   ttlCheckIntervalMs: 30000
 
+# Hard caps applied module-wide (across all tenants).
+# Omit a field or set it to 0 to disable that specific limit.
+resourceLimits:
+  # Sum of memoryMib for sandboxes in pending/creating/running/stopping state.
+  # New sandboxes (and snapshot restores) are rejected when the projected total
+  # would exceed this value.
+  maxTotalMemoryMib: 8192
+  # Sum of sizeBytes for snapshots in 'ready' state.
+  # New snapshots are rejected once total disk usage reaches this value.
+  maxTotalDiskBytes: 21474836480  # 20 GiB
+
 mcp:
   enabled: true
 

@@ -82,6 +82,7 @@ All configuration is in `config.yml`. Environment variables are supported via `$
 | `extensions` | Dynamic entity scoping (for multi-tenancy) |
 | `auth` | API key or JWT authentication |
 | `webhooks` | Event-driven HTTP callbacks |
+| `resourceLimits` | Module-wide caps for total RAM and snapshot disk usage |
 
 ### Microsandbox Defaults
 
@@ -94,6 +95,23 @@ microsandbox:
   maxTtlSeconds: 7200        # 2 hours max
   ttlCheckIntervalMs: 30000  # Check every 30s
 ```
+
+### Resource Limits
+
+Module-wide hard caps that prevent further growth once a threshold is reached. Both fields are optional — omit a field or set it to `0` to disable that specific limit.
+
+```yaml
+resourceLimits:
+  # Sum of memoryMib across sandboxes in pending/creating/running/stopping state.
+  # New sandboxes (and snapshot restores) are rejected with HTTP 400 when the
+  # projected total would exceed this value.
+  maxTotalMemoryMib: 8192
+  # Sum of sizeBytes across snapshots in 'ready' state.
+  # New snapshots are rejected once total disk usage reaches this value.
+  maxTotalDiskBytes: 21474836480  # 20 GiB
+```
+
+Limits are aggregated globally (across all tenants/scopes) — they act as a host-level guardrail, not as per-customer quotas. Read the current usage via `GET /api/v1/usage`.
 
 ## API Reference
 
@@ -164,6 +182,23 @@ Connect to `ws://host/ws/terminal` for interactive terminal sessions.
 | GET `/health` | Basic health check |
 | GET `/health/ready` | Readiness (DB + Redis) |
 
+### Usage
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/usage` | Aggregated RAM and disk usage with configured limits |
+
+Sample response:
+
+```json
+{
+  "memory": { "usedMib": 1280, "limitMib": 8192 },
+  "disk":   { "usedBytes": 524288000, "limitBytes": 21474836480 }
+}
+```
+
+`limitMib` / `limitBytes` are `null` when the corresponding limit is disabled in `config.yml`. The frontend Sandboxes page renders this summary as a progress bar above the table and shows each sandbox's share of the total RAM in use.
+
 ## Architecture
 
 ```
@@ -190,15 +225,17 @@ devic-sandbox/
 
 ## Docker Compose
 
-Infrastructure services use the `infra` profile and are optional:
+Both backend (`./Dockerfile`) and frontend (`./frontend/Dockerfile`) ship as Docker images. The frontend image is a multi-stage Vite build served by nginx, with `/api` and `/ws` proxied to the `app` service. Infrastructure services use the `infra` profile and are optional:
 
 ```bash
-# App only (connect to external Mongo/Redis/microsandbox)
+# App + frontend only (connect to external Mongo/Redis/microsandbox)
 docker compose up
 
-# Everything local
+# Everything local (Mongo, Redis, microsandbox)
 docker compose --profile infra up
 ```
+
+The frontend listens on `${FRONTEND_PORT:-5174}` and proxies API traffic to the `app` container internally.
 
 Connection URIs are configured via environment variables or `config.yml`:
 - `DATABASE_URI` — MongoDB
