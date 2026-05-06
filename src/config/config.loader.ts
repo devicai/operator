@@ -40,14 +40,20 @@ export function loadConfig(configPath?: string): ModuleConfig {
 
   const raw = readFileSync(path, 'utf-8');
   const parsed = yaml.load(raw) as Record<string, unknown>;
-  const resolved = resolveEnvVarsDeep(parsed) as ModuleConfig;
+  const resolved = resolveEnvVarsDeep(parsed) as ModuleConfig & {
+    microsandbox?: ModuleConfig['defaults'];
+  };
 
-  // Apply defaults
+  // Backwards-compat: the legacy `microsandbox:` block is read as `defaults:`.
+  if (!resolved.defaults && resolved.microsandbox) {
+    resolved.defaults = resolved.microsandbox;
+  }
+
   resolved.extensions = resolved.extensions ?? { properties: [] };
   resolved.logging = resolved.logging ?? { level: 'info', format: 'json' };
   resolved.auth = resolved.auth ?? { enabled: false, strategy: 'none' };
   resolved.redis = resolved.redis ?? { url: 'redis://localhost:6379' };
-  resolved.microsandbox = resolved.microsandbox ?? {
+  resolved.defaults = resolved.defaults ?? {
     defaultImage: 'node:24',
     defaultCpus: 1,
     defaultMemoryMib: 256,
@@ -55,6 +61,23 @@ export function loadConfig(configPath?: string): ModuleConfig {
     maxTtlSeconds: 7200,
     ttlCheckIntervalMs: 30000,
   };
+  resolved.runtime = resolved.runtime ?? { type: 'microsandbox' };
+  if (resolved.runtime.type === 'docker') {
+    resolved.runtime.docker = {
+      socketPath: '/var/run/docker.sock',
+      runtime: 'sysbox-runc',
+      network: 'bridge',
+      ...resolved.runtime.docker,
+      hardening: {
+        dropAllCaps: true,
+        noNewPrivileges: true,
+        readOnlyRootfs: false,
+        seccompProfile: 'default',
+        pidsLimit: 512,
+        ...resolved.runtime.docker?.hardening,
+      },
+    };
+  }
   resolved.mcp = resolved.mcp ?? { enabled: true };
 
   return resolved;

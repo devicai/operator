@@ -1,6 +1,13 @@
 # Devic Sandbox
 
-Standalone sandbox orchestration layer using [microsandbox](https://github.com/nichochar/microsandbox) for ephemeral, secure code execution environments.
+Standalone sandbox orchestration layer for ephemeral, secure code execution environments.
+
+Two pluggable runtime backends are supported:
+
+- **[microsandbox](https://github.com/nichochar/microsandbox)** — libkrun microVMs with their own kernel. Strongest isolation. Requires `/dev/kvm` on the host (bare metal, dedicated server, or VPS with nested virtualization).
+- **Docker** — runs each sandbox as a Docker container. No KVM required. For production use, the host should have [`sysbox-runc`](https://github.com/nestybox/sysbox) installed; the runtime falls back gracefully to plain `runc` if sysbox is unavailable.
+
+The runtime is selected via `runtime.type` in `config.yml` and can be swapped at any time without changing application code, schemas, or API surface.
 
 ## Features
 
@@ -23,7 +30,9 @@ Standalone sandbox orchestration layer using [microsandbox](https://github.com/n
 - Node.js >= 24
 - MongoDB
 - Redis
-- [microsandbox](https://github.com/nichochar/microsandbox) runtime installed
+- Either:
+  - [microsandbox](https://github.com/nichochar/microsandbox) runtime, **or**
+  - Docker daemon (with `sysbox-runc` installed for production-grade isolation — see [Runtime backends](#runtime-backends))
 
 ### 1. Install
 
@@ -77,17 +86,20 @@ All configuration is in `config.yml`. Environment variables are supported via `$
 | `server` | Port, base path, CORS |
 | `database` | MongoDB connection URI |
 | `redis` | Redis connection URL |
-| `microsandbox` | Default image, CPUs, memory, TTL limits |
+| `defaults` | Default image, CPUs, memory, TTL — applied to any backend |
+| `runtime` | Selects the backend (`microsandbox` or `docker`) and its options |
 | `mcp` | MCP server (enabled, path) |
 | `extensions` | Dynamic entity scoping (for multi-tenancy) |
 | `auth` | API key or JWT authentication |
 | `webhooks` | Event-driven HTTP callbacks |
 | `resourceLimits` | Module-wide caps for total RAM and snapshot disk usage |
 
-### Microsandbox Defaults
+### Sandbox defaults
+
+Applied when a `POST /sandboxes` or `POST /snapshots/:id/restore` request omits the corresponding field. Shared by both runtime backends.
 
 ```yaml
-microsandbox:
+defaults:
   defaultImage: node:24
   defaultCpus: 1
   defaultMemoryMib: 256
@@ -95,6 +107,66 @@ microsandbox:
   maxTtlSeconds: 7200        # 2 hours max
   ttlCheckIntervalMs: 30000  # Check every 30s
 ```
+
+> The legacy block name `microsandbox:` is still accepted for backwards compatibility — it is read as `defaults:` if `defaults:` is missing.
+
+### Runtime backends
+
+```yaml
+runtime:
+  type: microsandbox          # microsandbox | docker
+
+  # Only consulted when type=docker
+  docker:
+    socketPath: /var/run/docker.sock
+    runtime: sysbox-runc      # sysbox-runc | runc
+    network: bridge           # used when networkPolicy=allow-all
+    hardening:
+      dropAllCaps: true
+      noNewPrivileges: true
+      readOnlyRootfs: false   # most workloads (apt, npm install) break with this
+      seccompProfile: default
+      pidsLimit: 512
+```
+
+#### When to pick which
+
+|                              | `microsandbox`                                | `docker` (sysbox-runc)                         | `docker` (runc)                          |
+| ---------------------------- | --------------------------------------------- | ---------------------------------------------- | ---------------------------------------- |
+| Isolation level              | microVM with dedicated kernel                 | hardened container, virtualised /proc + /sys   | standard container, kernel shared        |
+| KVM required                 | **yes**                                       | no                                             | no                                       |
+| Snapshots                    | tar archive of the workdir                    | tar archive of the workdir                     | tar archive of the workdir               |
+| Memory / CPU caps            | enforced by libkrun                           | cgroup v2 (`--memory`, `--nano-cpus`)          | cgroup v2 (`--memory`, `--nano-cpus`)    |
+| Workload compatibility       | 100 % (real Linux)                            | ~99 % (DinD, systemd OK)                       | 100 %                                    |
+| Use against untrusted code   | recommended                                   | recommended                                    | only after additional hardening          |
+
+#### Installing `sysbox-runc` on the host
+
+`sysbox-runc` is an OCI-compatible runtime that runs containers under user namespaces with a virtualized `/proc` and `/sys`, blocking the most common container escape vectors. Once installed Docker treats it as a regular runtime; `devic-sandbox` requests it with `runtime.docker.runtime: sysbox-runc`.
+
+```bash
+# Ubuntu 22.04+ / Debian 12+
+wget https://downloads.nestybox.com/sysbox/releases/v0.6.5/sysbox-ce_0.6.5-0.linux_amd64.deb
+sudo apt install ./sysbox-ce_0.6.5-0.linux_amd64.deb
+
+# Verify
+docker info | grep -i sysbox-runc
+```
+
+If `sysbox-runc` is not present on the host, set `runtime.docker.runtime: runc` instead — the rest of the hardening (cap drop, no-new-privileges, seccomp, pids limit) still applies, but kernel-level isolation drops to standard container boundaries. Do not run untrusted code with `runc` unless additional layers (network policies, AppArmor profiles, dedicated VMs) are in place.
+
+#### Hardening flags
+
+All flags default to safe values when `type=docker`. Override them in `config.yml` only with reason:
+
+| Flag               | Default   | Effect when enabled                                                                  |
+| ------------------ | --------- | ------------------------------------------------------------------------------------ |
+| `dropAllCaps`      | `true`    | Drops all Linux capabilities (`CAP_DROP=ALL`). Required for sysbox-runc to be safe.  |
+| `noNewPrivileges`  | `true`    | Sets `--security-opt=no-new-privileges`. Stops setuid escalation inside the sandbox. |
+| `readOnlyRootfs`   | `false`   | `--read-only`. Useful for ephemeral execution; breaks `apt`, `npm install`, `pip install`. Tmpfs mounts for `/tmp` need to be added if enabled. |
+| `seccompProfile`   | `default` | Path to a seccomp profile, or `default` to use Docker's default profile.             |
+| `pidsLimit`        | `512`     | Maximum number of processes allowed inside the sandbox.                              |
+
 
 ### Resource Limits
 
@@ -137,7 +209,7 @@ resourceLimits:
 
 #### How each metric is computed
 
-- **RAM (`memory.usedMib`)** — sum of `memoryMib` over `Sandbox` documents whose status is one of `pending`, `creating`, `running`, `stopping`. Treated as a *reservation*: the limit accounts for capacity microsandbox could use, not what the VMs currently allocate from RSS.
+- **RAM (`memory.usedMib`)** — sum of `memoryMib` over `Sandbox` documents whose status is one of `pending`, `creating`, `running`, `stopping`. Treated as a *reservation*: the limit accounts for capacity the runtime could use, not what the sandbox currently allocates from RSS.
 - **Disk (`disk.usedBytes`)** — `fs.stat` over each `Snapshot` document in `ready` status, summed live. The DB's `sizeBytes` field is only refreshed on snapshot creation/persist and drifts while linked sandboxes are running, so it is **not** used for limit accounting. Snapshots whose file is missing on disk count as `0` bytes — they don't block new creations even if the document still reports a size.
 
 The frontend Snapshots page exposes both numbers side by side in the table footer (DB-reported total vs. real on-disk total) so the drift is visible.
@@ -261,7 +333,7 @@ devic-sandbox/
 Both backend (`./Dockerfile`) and frontend (`./frontend/Dockerfile`) ship as Docker images. The frontend image is a multi-stage Vite build served by nginx, with `/api` and `/ws` proxied to the `app` service. Infrastructure services use the `infra` profile and are optional:
 
 ```bash
-# App + frontend only (connect to external Mongo/Redis/microsandbox)
+# App + frontend only (connect to external Mongo/Redis/runtime)
 docker compose up
 
 # Everything local (Mongo, Redis, microsandbox)
@@ -303,9 +375,10 @@ Devic sends these headers automatically. No code changes needed.
 
 Planned improvements:
 
-- **External snapshot storage** — Support for pluggable storage backends (S3, GCS, Azure Blob) for snapshot archives. Currently stored on the local filesystem under `~/.microsandbox/snapshots/`.
+- **External snapshot storage** — Support for pluggable storage backends (S3, GCS, Azure Blob) for snapshot archives. Currently stored on the local filesystem under `~/.devic-sandbox/snapshots/` (legacy `~/.microsandbox/snapshots/` is still read transparently).
 - **Snapshot scheduling** — Periodic auto-snapshots for long-running sandboxes.
-- **Resource metrics** — CPU, memory, disk, and network usage monitoring per sandbox via the microsandbox metrics API.
+- **Resource metrics** — Per-sandbox CPU, memory, disk and network usage from the active runtime backend.
+- **Additional runtime backends** — gVisor (`runsc`) and Daytona self-hosted are candidates once the abstraction stabilises.
 
 ## License
 

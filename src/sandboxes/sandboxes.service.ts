@@ -1,6 +1,4 @@
 import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef } from '@nestjs/common';
-import { Sandbox as MsbSandbox, Patch } from 'microsandbox';
-import type { SandboxConfig } from 'microsandbox';
 import { nanoid } from 'nanoid';
 import { SandboxRegistry } from './sandbox-registry';
 import { SandboxRepository } from '../repositories/sandbox.repository';
@@ -13,6 +11,11 @@ import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ResourceUsageService } from '../providers/resource-usage.service';
+import {
+  RUNTIME_PROVIDER,
+  RuntimeProvider,
+  RuntimeSandbox,
+} from '../runtime/runtime-provider.interface';
 
 const CWD_MARKER = '__SANDBOX_CWD__';
 
@@ -28,10 +31,11 @@ export class SandboxesService {
     @Inject(forwardRef(() => SnapshotsService))
     private readonly snapshotsService: SnapshotsService,
     private readonly resourceUsage: ResourceUsageService,
+    @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
   ) {}
 
   async create(dto: CreateSandboxDto, scope: ExtensionScope): Promise<SandboxDocument> {
-    const defaults = this.config.microsandbox;
+    const defaults = this.config.defaults;
 
     let image = dto.image ?? defaults.defaultImage;
     let workdir = dto.workdir ?? '/workspace';
@@ -92,38 +96,24 @@ export class SandboxesService {
     );
 
     try {
-      const msbConfig: SandboxConfig = {
+      const sandbox = await this.runtime.create({
         name: containerName,
         image,
         workdir,
         cpus,
         memoryMib,
         env: envVars,
-        patches: [Patch.mkdir(workdir)],
-        network: {
-          policy: networkPolicy as any,
-          tls: { interceptedPorts: [] },
-        },
-        quietLogs: true,
-        replace: true,
-      };
-
-      if (Object.keys(ports).length > 0) {
-        msbConfig.ports = {};
-        for (const [k, v] of Object.entries(ports)) {
-          msbConfig.ports[k] = v;
-        }
-      }
-
-      const msbInstance = await MsbSandbox.create(msbConfig);
+        ports,
+        networkPolicy: networkPolicy as 'allow-all' | 'deny-all',
+      });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
 
       if (initScript) {
         try {
-          const result = await msbInstance.shell(initScript);
+          const result = await sandbox.exec(initScript);
           if (result.code !== 0) {
             this.logger.warn(
-              `Init script exited with code ${result.code} for ${sandboxId}: ${result.stderr()}`,
+              `Init script exited with code ${result.code} for ${sandboxId}: ${result.stderr}`,
             );
           } else {
             this.logger.log(`Init script completed for ${sandboxId}`);
@@ -185,15 +175,17 @@ export class SandboxesService {
     return this.create({ bindingId, profileId }, scope);
   }
 
-  private async getSandboxInstance(doc: SandboxDocument): Promise<MsbSandbox> {
+  private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
     const containerName = await this.registry.get(doc.sandboxId);
     const name = containerName ?? doc.name;
 
-    try {
-      const handle: any = await MsbSandbox.get(name);
-      const status = handle.status;
+    const handle = await this.runtime.get(name);
+    if (!handle) {
+      throw new BadRequestException(`Sandbox ${doc.sandboxId} is not reachable: not found`);
+    }
 
-      if (status === 'running') {
+    try {
+      if (handle.status === 'running') {
         return await handle.connect();
       }
       return await handle.start();
@@ -231,9 +223,9 @@ export class SandboxesService {
     }
 
     const fullCommand = `cd '${cwd}' && ${command} ; echo "${CWD_MARKER}$(pwd)"`;
-    const result = await sandbox.shell(fullCommand);
-    const stdout = result.stdout();
-    const stderr = result.stderr();
+    const result = await sandbox.exec(fullCommand);
+    const stdout = result.stdout;
+    const stderr = result.stderr;
 
     let newCwd = cwd;
     const markerIdx = stdout.lastIndexOf(CWD_MARKER);
@@ -269,8 +261,7 @@ export class SandboxesService {
   ): Promise<void> {
     const doc = await this.findById(id, scope);
     const sandbox = await this.getSandboxInstance(doc);
-    const fs = sandbox.fs();
-    await fs.write(filePath, Buffer.from(content));
+    await sandbox.writeFile(filePath, Buffer.from(content));
   }
 
   async readFile(
@@ -280,9 +271,8 @@ export class SandboxesService {
   ): Promise<string> {
     const doc = await this.findById(id, scope);
     const sandbox = await this.getSandboxInstance(doc);
-    const fs = sandbox.fs();
-    const data = await fs.read(filePath);
-    return Buffer.isBuffer(data) ? data.toString('utf-8') : String(data);
+    const data = await sandbox.readFile(filePath);
+    return data.toString('utf-8');
   }
 
   async stop(id: string, scope: ExtensionScope): Promise<SandboxDocument> {
@@ -291,7 +281,6 @@ export class SandboxesService {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
-    // Persist filesystem state to linked snapshot before detaching
     if (doc.snapshotId) {
       await this.snapshotsService.persistToSnapshot(doc);
     }
@@ -299,9 +288,11 @@ export class SandboxesService {
     try {
       const containerName = await this.registry.get(doc.sandboxId);
       if (containerName) {
-        const handle = await MsbSandbox.get(containerName);
-        const sandbox = await handle.connect();
-        await sandbox.detach();
+        const handle = await this.runtime.get(containerName);
+        if (handle?.status === 'running') {
+          const sandbox = await handle.connect();
+          await sandbox.detach();
+        }
       }
     } catch (err) {
       this.logger.warn(`Error stopping sandbox ${doc.sandboxId}: ${(err as Error).message}`);
@@ -320,7 +311,7 @@ export class SandboxesService {
     const doc = await this.findById(id, scope);
 
     try {
-      await MsbSandbox.remove(doc.name);
+      await this.runtime.remove(doc.name);
     } catch (err) {
       this.logger.warn(`Error removing sandbox ${doc.sandboxId}: ${(err as Error).message}`);
     }
@@ -339,7 +330,7 @@ export class SandboxesService {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
-    const maxTtl = this.config.microsandbox.maxTtlSeconds;
+    const maxTtl = this.config.defaults.maxTtlSeconds;
     const elapsed = (Date.now() - new Date((doc as any).createdAt).getTime()) / 1000;
     const totalTtl = elapsed + additionalSeconds;
 

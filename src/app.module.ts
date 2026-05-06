@@ -22,6 +22,7 @@ import { SandboxProfilesModule } from './sandbox-profiles/sandbox-profiles.modul
 import { SnapshotsModule } from './snapshots/snapshots.module';
 import { McpModule } from './mcp/mcp.module';
 import { TerminalModule } from './terminal/terminal.module';
+import { RuntimeModule } from './runtime/runtime.module';
 
 const config = loadConfig();
 
@@ -41,6 +42,7 @@ applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
       { name: McpProfile.name, schema: McpProfileSchema },
       { name: Snapshot.name, schema: SnapshotSchema },
     ]),
+    RuntimeModule,
     SandboxesModule,
     SandboxProfilesModule,
     SnapshotsModule,

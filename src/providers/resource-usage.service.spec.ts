@@ -34,7 +34,7 @@ function buildConfig(limits?: ModuleConfig['resourceLimits']): ModuleConfig {
     server: { port: 3200, basePath: '/api/v1' },
     database: { provider: 'mongodb', uri: 'mongodb://localhost/test' },
     redis: { url: 'redis://localhost' },
-    microsandbox: {
+    defaults: {
       defaultImage: 'node:24',
       defaultCpus: 1,
       defaultMemoryMib: 256,
@@ -42,6 +42,7 @@ function buildConfig(limits?: ModuleConfig['resourceLimits']): ModuleConfig {
       maxTtlSeconds: 7200,
       ttlCheckIntervalMs: 30000,
     },
+    runtime: { type: 'microsandbox' },
     mcp: { enabled: true },
     extensions: { properties: [] },
     auth: { enabled: false, strategy: 'none' },

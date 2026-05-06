@@ -4,15 +4,18 @@ import {
   OnGatewayDisconnect,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger } from '@nestjs/common';
+import { Inject, Logger } from '@nestjs/common';
 import { Server, WebSocket } from 'ws';
-import { Sandbox as MsbSandbox } from 'microsandbox';
-import type { ExecHandle, ExecEvent } from 'microsandbox';
 import { SandboxRegistry } from '../sandboxes/sandbox-registry';
+import {
+  RUNTIME_PROVIDER,
+  RuntimeProvider,
+  ExecStream,
+} from '../runtime/runtime-provider.interface';
 
 interface ClientSession {
   sandboxId: string;
-  handle: ExecHandle | null;
+  activeStream: ExecStream | null;
   alive: boolean;
 }
 
@@ -24,7 +27,10 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
   @WebSocketServer()
   server: Server;
 
-  constructor(private readonly registry: SandboxRegistry) {}
+  constructor(
+    private readonly registry: SandboxRegistry,
+    @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+  ) {}
 
   handleConnection(client: WebSocket) {
     this.logger.log('Terminal client connected');
@@ -35,15 +41,6 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
 
         if (msg.type === 'attach' && msg.sandboxId) {
           await this.attachToSandbox(client, msg.sandboxId);
-        } else if (msg.type === 'input' && msg.data) {
-          // Input to sandbox stdin - handled by the streaming shell
-          // For interactive terminals, each input triggers a new shell command
-          const session = this.sessions.get(client);
-          if (session?.alive) {
-            // We use shell for each input line instead of stdin
-            // since microsandbox shellStream doesn't support stdin writing
-            // The client should send complete commands
-          }
         } else if (msg.type === 'command' && msg.command) {
           await this.executeCommand(client, msg.command);
         }
@@ -60,6 +57,7 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
     const session = this.sessions.get(client);
     if (session) {
       session.alive = false;
+      session.activeStream?.stop().catch(() => undefined);
       this.sessions.delete(client);
       this.logger.log(`Terminal client disconnected (sandbox: ${session.sandboxId})`);
     }
@@ -74,7 +72,7 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
 
     this.sessions.set(client, {
       sandboxId,
-      handle: null,
+      activeStream: null,
       alive: true,
     });
 
@@ -98,24 +96,27 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
     }
 
     try {
-      const handle = await MsbSandbox.get(containerName);
+      const handle = await this.runtime.get(containerName);
+      if (!handle || handle.status !== 'running') {
+        this.send(client, { type: 'error', data: 'Sandbox is not running' });
+        return;
+      }
       const sandbox = await handle.connect();
-      const execHandle = await sandbox.shellStream(command);
+      const stream = await sandbox.execStream(command);
+      session.activeStream = stream;
 
-      let event: ExecEvent | null;
-      while ((event = await execHandle.recv()) !== null) {
-        if (!session.alive) break;
-
-        if (event.eventType === 'stdout' && event.data) {
+      try {
+        for await (const event of stream.events) {
+          if (!session.alive) break;
           this.send(client, {
-            type: 'stdout',
+            type: event.type,
             data: event.data.toString('utf-8'),
           });
-        } else if (event.eventType === 'stderr' && event.data) {
-          this.send(client, {
-            type: 'stderr',
-            data: event.data.toString('utf-8'),
-          });
+        }
+      } finally {
+        await stream.stop().catch(() => undefined);
+        if (session.activeStream === stream) {
+          session.activeStream = null;
         }
       }
 

@@ -13,13 +13,37 @@ database:
 redis:
   url: ${REDIS_URL:-redis://localhost:6379}
 
-microsandbox:
+# Default values applied when create / restore requests omit them.
+# Shared by all runtime backends.
+defaults:
   defaultImage: node:24
   defaultCpus: 1
   defaultMemoryMib: 256
   defaultTtlSeconds: 1800
   maxTtlSeconds: 7200
   ttlCheckIntervalMs: 30000
+
+# Runtime backend that executes sandboxes.
+#
+#   microsandbox  — libkrun microVMs. Strongest isolation. Requires /dev/kvm
+#                   on the host (bare metal or VPS with nested virtualization).
+#
+#   docker        — runs sandboxes as Docker containers. No KVM required.
+#                   Use sysbox-runc on the host for production-grade isolation
+#                   (https://github.com/nestybox/sysbox).
+runtime:
+  type: ${SANDBOX_RUNTIME:-microsandbox}
+
+  docker:
+    socketPath: /var/run/docker.sock
+    runtime: sysbox-runc          # sysbox-runc | runc
+    network: bridge               # used when networkPolicy=allow-all
+    hardening:
+      dropAllCaps: true
+      noNewPrivileges: true
+      readOnlyRootfs: false       # most workloads (apt, npm install) break with this
+      seccompProfile: default
+      pidsLimit: 512
 
 # Hard caps applied module-wide (across all tenants).
 # Omit a field or set it to 0 to disable that specific limit.

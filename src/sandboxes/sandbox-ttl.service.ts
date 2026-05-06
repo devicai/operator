@@ -1,11 +1,14 @@
 import { Injectable, Inject, Logger, forwardRef } from '@nestjs/common';
 import { Interval } from '@nestjs/schedule';
-import { Sandbox as MsbSandbox } from 'microsandbox';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from './sandbox-registry';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
+import {
+  RUNTIME_PROVIDER,
+  RuntimeProvider,
+} from '../runtime/runtime-provider.interface';
 
 @Injectable()
 export class SandboxTtlService {
@@ -18,6 +21,7 @@ export class SandboxTtlService {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     @Inject(forwardRef(() => SnapshotsService))
     private readonly snapshotsService: SnapshotsService,
+    @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
   ) {}
 
   @Interval(30000)
@@ -37,7 +41,6 @@ export class SandboxTtlService {
         );
         if (!claimed) continue;
 
-        // Persist filesystem state to linked snapshot before detaching
         if (doc.snapshotId) {
           await this.snapshotsService.persistToSnapshot(doc);
         }
@@ -45,9 +48,11 @@ export class SandboxTtlService {
         try {
           const containerName = await this.registry.get(doc.sandboxId);
           if (containerName) {
-            const handle = await MsbSandbox.get(containerName);
-            const sandbox = await handle.connect();
-            await sandbox.detach();
+            const handle = await this.runtime.get(containerName);
+            if (handle?.status === 'running') {
+              const sandbox = await handle.connect();
+              await sandbox.detach();
+            }
           }
         } catch (err) {
           this.logger.warn(

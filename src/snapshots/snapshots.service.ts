@@ -5,8 +5,6 @@ import {
   NotFoundException,
   BadRequestException,
 } from '@nestjs/common';
-import { Sandbox as MsbSandbox, Patch } from 'microsandbox';
-import type { SandboxConfig } from 'microsandbox';
 import { nanoid } from 'nanoid';
 import { join } from 'path';
 import { existsSync, mkdirSync, statSync, unlinkSync } from 'fs';
@@ -22,8 +20,13 @@ import { CONFIG } from '../config/config.loader';
 import { CreateSnapshotDto } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ResourceUsageService } from '../providers/resource-usage.service';
+import {
+  RUNTIME_PROVIDER,
+  RuntimeProvider,
+  RuntimeSandbox,
+} from '../runtime/runtime-provider.interface';
 
-const SNAPSHOTS_DIR = join(homedir(), '.microsandbox', 'snapshots');
+const SNAPSHOTS_DIR = join(homedir(), '.devic-sandbox', 'snapshots');
 
 @Injectable()
 export class SnapshotsService {
@@ -35,10 +38,38 @@ export class SnapshotsService {
     private readonly registry: SandboxRegistry,
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly resourceUsage: ResourceUsageService,
+    @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
   ) {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
     }
+  }
+
+  /**
+   * Resolve a stored snapshotPath to its current location.
+   *
+   * Snapshots used to live in ~/.microsandbox/snapshots/. Once the runtime
+   * abstraction landed they moved to ~/.devic-sandbox/snapshots/. To keep
+   * existing instances functional we transparently fall back to the legacy
+   * path when the new one is missing.
+   */
+  private resolveSnapshotPath(stored: string): string {
+    if (existsSync(stored)) return stored;
+    if (stored.includes('/.microsandbox/snapshots/')) {
+      const migrated = stored.replace(
+        '/.microsandbox/snapshots/',
+        '/.devic-sandbox/snapshots/',
+      );
+      if (existsSync(migrated)) return migrated;
+    }
+    if (stored.includes('/.devic-sandbox/snapshots/')) {
+      const legacy = stored.replace(
+        '/.devic-sandbox/snapshots/',
+        '/.microsandbox/snapshots/',
+      );
+      if (existsSync(legacy)) return legacy;
+    }
+    return stored;
   }
 
   async create(
@@ -88,19 +119,16 @@ export class SnapshotsService {
         `Creating snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
       );
 
-      const tarResult = await sandbox.shell(
+      const tarResult = await sandbox.exec(
         `tar czf ${guestTarPath} -C ${sandboxDoc.workdir} .`,
       );
 
       if (tarResult.code !== 0) {
-        throw new Error(`tar failed: ${tarResult.stderr()}`);
+        throw new Error(`tar failed: ${tarResult.stderr}`);
       }
 
-      const fs = sandbox.fs();
-      await fs.copyToHost(guestTarPath, snapshotPath);
-
-      // Clean up tar inside sandbox
-      await sandbox.shell(`rm -f ${guestTarPath}`);
+      await sandbox.copyToHost(guestTarPath, snapshotPath);
+      await sandbox.exec(`rm -f ${guestTarPath}`);
 
       let sizeBytes = 0;
       try {
@@ -148,11 +176,12 @@ export class SnapshotsService {
       );
     }
 
-    if (!existsSync(snapshot.snapshotPath)) {
+    const onDiskPath = this.resolveSnapshotPath(snapshot.snapshotPath);
+    if (!existsSync(onDiskPath)) {
       throw new BadRequestException('Snapshot file not found on disk');
     }
 
-    const defaults = this.config.microsandbox;
+    const defaults = this.config.defaults;
     const sandboxId = nanoid(12);
     const containerName = `sandbox-${sandboxId}`;
     const ttlSeconds = dto.ttlSeconds ?? defaults.defaultTtlSeconds;
@@ -190,41 +219,28 @@ export class SnapshotsService {
     );
 
     try {
-      const msbConfig: SandboxConfig = {
+      const sandbox = await this.runtime.create({
         name: containerName,
         image: snapshot.image,
         workdir: snapshot.workdir,
         cpus: dto.cpus ?? snapshot.cpus,
         memoryMib: dto.memoryMib ?? snapshot.memoryMib,
         env: snapshot.envVars ?? {},
-        patches: [Patch.mkdir(snapshot.workdir)],
-        network: { policy: 'allow-all' as any, tls: { interceptedPorts: [] } },
-        quietLogs: true,
-        replace: true,
-      };
-
-      if (Object.keys(snapshot.ports ?? {}).length > 0) {
-        msbConfig.ports = {};
-        for (const [k, v] of Object.entries(snapshot.ports)) {
-          msbConfig.ports[k] = v;
-        }
-      }
-
-      const msbInstance = await MsbSandbox.create(msbConfig);
+        ports: snapshot.ports ?? {},
+        networkPolicy: 'allow-all',
+      });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
 
-      // Restore snapshot: copy tarball into sandbox and extract
       const guestTarPath = `/tmp/restore-${sandboxId}.tar.gz`;
-      const fs = msbInstance.fs();
-      await fs.copyFromHost(snapshot.snapshotPath, guestTarPath);
+      await sandbox.copyFromHost(onDiskPath, guestTarPath);
 
-      const extractResult = await msbInstance.shell(
+      const extractResult = await sandbox.exec(
         `tar xzf ${guestTarPath} -C ${snapshot.workdir} && rm -f ${guestTarPath}`,
       );
 
       if (extractResult.code !== 0) {
         this.logger.warn(
-          `Snapshot restore extraction warning: ${extractResult.stderr()}`,
+          `Snapshot restore extraction warning: ${extractResult.stderr}`,
         );
       }
 
@@ -276,14 +292,14 @@ export class SnapshotsService {
   async destroy(id: string, scope: ExtensionScope): Promise<void> {
     const doc = await this.findById(id, scope);
 
-    // Remove file from disk
+    const onDiskPath = this.resolveSnapshotPath(doc.snapshotPath);
     try {
-      if (existsSync(doc.snapshotPath)) {
-        unlinkSync(doc.snapshotPath);
+      if (existsSync(onDiskPath)) {
+        unlinkSync(onDiskPath);
       }
     } catch (err) {
       this.logger.warn(
-        `Failed to delete snapshot file ${doc.snapshotPath}: ${(err as Error).message}`,
+        `Failed to delete snapshot file ${onDiskPath}: ${(err as Error).message}`,
       );
     }
 
@@ -322,34 +338,55 @@ export class SnapshotsService {
         `Persisting sandbox ${sandboxDoc.sandboxId} to snapshot ${snapshotDoc.snapshotId}...`,
       );
 
-      // Get a fresh connection to the running sandbox
       const containerName =
         (await this.registry.get(sandboxDoc.sandboxId)) ?? sandboxDoc.name;
-      const handle: any = await MsbSandbox.get(containerName);
-      if (handle.status !== 'running') {
+      const handle = await this.runtime.get(containerName);
+      if (!handle || handle.status !== 'running') {
         this.logger.warn(
-          `Sandbox ${sandboxDoc.sandboxId} not running (status: ${handle.status}), skipping persist`,
+          `Sandbox ${sandboxDoc.sandboxId} not running (status: ${handle?.status ?? 'missing'}), skipping persist`,
         );
         return;
       }
       const sandbox = await handle.connect();
 
-      const tarResult = await sandbox.shell(
+      const tarResult = await sandbox.exec(
         `tar czf ${guestTarPath} -C ${sandboxDoc.workdir} .`,
       );
 
       if (tarResult.code !== 0) {
-        this.logger.error(`Persist tar failed: ${tarResult.stderr()}`);
+        this.logger.error(`Persist tar failed: ${tarResult.stderr}`);
         return;
       }
 
-      const fs = sandbox.fs();
-      await fs.copyToHost(guestTarPath, snapshotDoc.snapshotPath);
-      await sandbox.shell(`rm -f ${guestTarPath}`);
+      // Always write to the canonical (current) location even if the snapshot
+      // was originally created under the legacy path.
+      const targetPath = snapshotDoc.snapshotPath.includes('/.microsandbox/snapshots/')
+        ? snapshotDoc.snapshotPath.replace(
+            '/.microsandbox/snapshots/',
+            '/.devic-sandbox/snapshots/',
+          )
+        : snapshotDoc.snapshotPath;
+
+      if (targetPath !== snapshotDoc.snapshotPath && !existsSync(SNAPSHOTS_DIR)) {
+        mkdirSync(SNAPSHOTS_DIR, { recursive: true });
+      }
+
+      await sandbox.copyToHost(guestTarPath, targetPath);
+      await sandbox.exec(`rm -f ${guestTarPath}`);
+
+      // If we migrated the path, drop the legacy file to avoid drift.
+      if (
+        targetPath !== snapshotDoc.snapshotPath &&
+        existsSync(snapshotDoc.snapshotPath)
+      ) {
+        try {
+          unlinkSync(snapshotDoc.snapshotPath);
+        } catch {}
+      }
 
       let sizeBytes = 0;
       try {
-        sizeBytes = statSync(snapshotDoc.snapshotPath).size;
+        sizeBytes = statSync(targetPath).size;
       } catch {}
 
       await this.snapshotRepo.updateById(
@@ -357,6 +394,7 @@ export class SnapshotsService {
         {
           $set: {
             sizeBytes,
+            snapshotPath: targetPath,
             'metadata.lastPersistedFrom': sandboxDoc.sandboxId,
             'metadata.lastPersistedAt': new Date().toISOString(),
             'metadata.currentCwd': sandboxDoc.currentCwd,
@@ -386,16 +424,20 @@ export class SnapshotsService {
     return doc;
   }
 
-  private async getSandboxInstance(doc: SandboxDocument): Promise<MsbSandbox> {
+  private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
     const containerName = await this.registry.get(doc.sandboxId);
     const name = containerName ?? doc.name;
 
+    const handle = await this.runtime.get(name);
+    if (!handle) {
+      throw new BadRequestException(
+        `Sandbox ${doc.sandboxId} is not reachable: not found`,
+      );
+    }
+
     try {
-      const handle: any = await MsbSandbox.get(name);
-      if (handle.status === 'running') {
-        return await handle.connect();
-      }
-      return await handle.start();
+      if (handle.status === 'running') return handle.connect();
+      return handle.start();
     } catch (err) {
       throw new BadRequestException(
         `Sandbox ${doc.sandboxId} is not reachable: ${(err as Error).message}`,
@@ -403,3 +445,4 @@ export class SnapshotsService {
     }
   }
 }
+
