@@ -2,7 +2,8 @@ export interface ModuleConfig {
   server: ServerConfig;
   database: DatabaseConfig;
   redis: RedisConfig;
-  microsandbox: MicrosandboxConfig;
+  defaults: SandboxDefaultsConfig;
+  runtime: RuntimeConfig;
   mcp: McpConfig;
   extensions: ExtensionsConfig;
   auth: AuthConfig;
@@ -29,13 +30,47 @@ export interface RedisConfig {
   url: string;
 }
 
-export interface MicrosandboxConfig {
+/**
+ * Default values applied when a CreateSandboxDto / restore omits them.
+ * Shared by all runtime backends.
+ */
+export interface SandboxDefaultsConfig {
   defaultImage: string;
   defaultCpus: number;
   defaultMemoryMib: number;
   defaultTtlSeconds: number;
   maxTtlSeconds: number;
   ttlCheckIntervalMs: number;
+}
+
+export type RuntimeType = 'microsandbox' | 'docker';
+
+export interface RuntimeConfig {
+  type: RuntimeType;
+  docker?: DockerRuntimeConfig;
+}
+
+export interface DockerRuntimeConfig {
+  /** Path to the Docker daemon socket. Defaults to /var/run/docker.sock. */
+  socketPath?: string;
+  /** OCI runtime to launch each sandbox container with. */
+  runtime?: 'sysbox-runc' | 'runc';
+  /** Docker network to attach sandboxes to when networkPolicy=allow-all. */
+  network?: string;
+  hardening?: DockerHardeningConfig;
+}
+
+export interface DockerHardeningConfig {
+  /** Drop ALL Linux capabilities at container start. Default: true. */
+  dropAllCaps?: boolean;
+  /** Set --security-opt=no-new-privileges. Default: true. */
+  noNewPrivileges?: boolean;
+  /** Mount rootfs read-only. Many workloads (apt, npm install) break with this. Default: false. */
+  readOnlyRootfs?: boolean;
+  /** Seccomp profile path or 'default' for Docker's default profile. Default: 'default'. */
+  seccompProfile?: string;
+  /** Maximum number of processes inside the container. Default: 512. */
+  pidsLimit?: number;
 }
 
 export interface McpConfig {

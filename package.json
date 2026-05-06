@@ -46,6 +46,7 @@
     "@nestjs/websockets": "^11.0.0",
     "class-transformer": "^0.5.1",
     "class-validator": "^0.14.0",
+    "dockerode": "^5.0.0",
     "ioredis": "^5.6.0",
     "js-yaml": "^4.1.0",
     "microsandbox": "^0.3.11",
@@ -53,16 +54,19 @@
     "nanoid": "^3.3.8",
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.0",
+    "tar-stream": "^3.2.0",
     "zod": "^3.24.0"
   },
   "devDependencies": {
     "@nestjs/cli": "^11.0.0",
     "@nestjs/schematics": "^11.0.0",
     "@nestjs/testing": "^11.0.0",
+    "@types/dockerode": "^4.0.1",
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.0",
     "@types/js-yaml": "^4.0.9",
     "@types/node": "^22.0.0",
+    "@types/tar-stream": "^3.1.4",
     "@types/ws": "^8.5.0",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
@@ -78,7 +82,11 @@
     "typescript": "^5.7.0"
   },
   "jest": {
-    "moduleFileExtensions": ["js", "json", "ts"],
+    "moduleFileExtensions": [
+      "js",
+      "json",
+      "ts"
+    ],
     "rootDir": "src",
     "testRegex": ".*\\.spec\\.ts$",
     "transform": {
