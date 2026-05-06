@@ -179,3 +179,15 @@ export interface RestoreSnapshotDto {
   memoryMib?: number;
   linked?: boolean;
 }
+
+// Resource usage
+export interface UsageSummary {
+  memory: {
+    usedMib: number;
+    limitMib: number | null;
+  };
+  disk: {
+    usedBytes: number;
+    limitBytes: number | null;
+  };
+}

@@ -15,6 +15,7 @@ import type {
   SnapshotDto,
   CreateSnapshotDto,
   RestoreSnapshotDto,
+  UsageSummary,
 } from './types';
 
 const api = axios.create({
@@ -122,6 +123,13 @@ export const snapshotsApi = {
   },
   delete(id: string): Promise<AxiosResponse<void>> {
     return api.delete(`/snapshots/${id}`);
+  },
+};
+
+// Usage
+export const usageApi = {
+  get(): Promise<AxiosResponse<UsageSummary>> {
+    return api.get('/usage');
   },
 };
 

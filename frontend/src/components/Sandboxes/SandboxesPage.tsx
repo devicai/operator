@@ -22,9 +22,11 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
 import { useCreateSnapshot } from '../../hooks/useSnapshots';
+import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
 import CreateSandboxModal from './CreateSandboxModal';
 import TerminalDrawer from './TerminalDrawer';
+import UsagePanel from '../Usage/UsagePanel';
 
 const { Title } = Typography;
 
@@ -52,11 +54,13 @@ const SandboxesPage: React.FC = () => {
   const [terminalSandbox, setTerminalSandbox] = useState<SandboxDto | null>(null);
 
   const { data, isLoading } = useSandboxes({ status: statusFilter });
+  const { data: usage, isLoading: usageLoading } = useUsage();
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
   const createSnapshot = useCreateSnapshot();
 
   const sandboxes = data?.data ?? [];
+  const totalMemoryMib = usage?.memory.usedMib ?? 0;
 
   const columns: ColumnsType<SandboxDto> = [
     {
@@ -95,6 +99,21 @@ const SandboxesPage: React.FC = () => {
           {row.cpus} vCPU / {row.memoryMib} MiB
         </span>
       ),
+    },
+    {
+      title: 'RAM share',
+      key: 'memoryShare',
+      width: 110,
+      align: 'right',
+      render: (_: any, row) => {
+        if (totalMemoryMib <= 0) return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
+        const pct = (row.memoryMib / totalMemoryMib) * 100;
+        return (
+          <Tooltip title={`${row.memoryMib} MiB of ${totalMemoryMib} MiB in use`}>
+            <span style={{ fontSize: 11 }}>{pct.toFixed(1)}%</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: 'TTL',
@@ -205,6 +224,8 @@ const SandboxesPage: React.FC = () => {
           </Button>
         </Space>
       </div>
+
+      <UsagePanel usage={usage} loading={usageLoading} />
 
       <Table
         rowKey="_id"

@@ -82,6 +82,7 @@ All configuration is in `config.yml`. Environment variables are supported via `$
 | `extensions` | Dynamic entity scoping (for multi-tenancy) |
 | `auth` | API key or JWT authentication |
 | `webhooks` | Event-driven HTTP callbacks |
+| `resourceLimits` | Module-wide caps for total RAM and snapshot disk usage |
 
 ### Microsandbox Defaults
 
@@ -94,6 +95,56 @@ microsandbox:
   maxTtlSeconds: 7200        # 2 hours max
   ttlCheckIntervalMs: 30000  # Check every 30s
 ```
+
+### Resource Limits
+
+Module-wide hard caps that protect a single host from being exhausted by runaway sandbox or snapshot creation. Limits are aggregated **globally** across all tenants/extension scopes — they are a host-level guardrail, not per-customer quotas.
+
+```yaml
+resourceLimits:
+  # Sum of memoryMib across sandboxes in pending/creating/running/stopping state.
+  # New sandboxes (and snapshot restores) are rejected with HTTP 400 when the
+  # projected total would exceed this value.
+  maxTotalMemoryMib: 8192            # 8 GiB
+  # Real on-disk usage of snapshot tarballs (measured via fs.stat, not the DB
+  # `sizeBytes` cache). New snapshots are rejected once total usage reaches
+  # this value.
+  maxTotalDiskBytes: 21474836480     # 20 GiB
+```
+
+#### What gets enforced where
+
+| Endpoint | Limit checked | Rejection trigger |
+|----------|---------------|-------------------|
+| `POST /sandboxes` | `maxTotalMemoryMib` | Active RAM + requested `memoryMib` would exceed the limit |
+| `POST /snapshots/:id/restore` | `maxTotalMemoryMib` | Active RAM + requested `memoryMib` (or snapshot default) would exceed the limit |
+| `POST /snapshots` | `maxTotalDiskBytes` | Current on-disk snapshot bytes already meet or exceed the limit |
+
+Rejections are surfaced as `HTTP 400 BadRequestException` with a descriptive message (e.g. `RAM limit exceeded: requested 1024 MiB + in-use 7680 MiB would surpass the configured maximum of 8192 MiB`). The check runs **before** any sandbox or snapshot is created, so a 400 means no side effects took place.
+
+#### Disabling a limit
+
+Each field is independent and optional:
+
+- Omit the field entirely, **or** set it to `0` to disable that specific check.
+- Omit the whole `resourceLimits` block to disable both.
+
+```yaml
+resourceLimits:
+  maxTotalMemoryMib: 8192   # RAM ceiling enforced
+  # maxTotalDiskBytes:      # disk check disabled
+```
+
+#### How each metric is computed
+
+- **RAM (`memory.usedMib`)** — sum of `memoryMib` over `Sandbox` documents whose status is one of `pending`, `creating`, `running`, `stopping`. Treated as a *reservation*: the limit accounts for capacity microsandbox could use, not what the VMs currently allocate from RSS.
+- **Disk (`disk.usedBytes`)** — `fs.stat` over each `Snapshot` document in `ready` status, summed live. The DB's `sizeBytes` field is only refreshed on snapshot creation/persist and drifts while linked sandboxes are running, so it is **not** used for limit accounting. Snapshots whose file is missing on disk count as `0` bytes — they don't block new creations even if the document still reports a size.
+
+The frontend Snapshots page exposes both numbers side by side in the table footer (DB-reported total vs. real on-disk total) so the drift is visible.
+
+#### Reading current usage
+
+Live values are exposed via `GET /api/v1/usage` (see [Usage](#usage) below). The frontend polls this endpoint every 10 s and renders a progress bar above both the Sandboxes and Snapshots tables, plus per-row "RAM share" / "Disk share" columns.
 
 ## API Reference
 
@@ -164,6 +215,23 @@ Connect to `ws://host/ws/terminal` for interactive terminal sessions.
 | GET `/health` | Basic health check |
 | GET `/health/ready` | Readiness (DB + Redis) |
 
+### Usage
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| GET | `/api/v1/usage` | Aggregated RAM and disk usage with configured limits |
+
+Sample response:
+
+```json
+{
+  "memory": { "usedMib": 1280, "limitMib": 8192 },
+  "disk":   { "usedBytes": 524288000, "limitBytes": 21474836480 }
+}
+```
+
+`limitMib` / `limitBytes` are `null` when the corresponding limit is disabled in `config.yml` (omitted or set to `0`). `usedMib` is the live reservation sum across active sandboxes; `usedBytes` is the live `fs.stat` total across ready snapshot tarballs (see [Resource Limits](#resource-limits) for details). The endpoint is unauthenticated when `auth.enabled: false`; otherwise it requires the same credentials as the rest of the API.
+
 ## Architecture
 
 ```
@@ -190,15 +258,17 @@ devic-sandbox/
 
 ## Docker Compose
 
-Infrastructure services use the `infra` profile and are optional:
+Both backend (`./Dockerfile`) and frontend (`./frontend/Dockerfile`) ship as Docker images. The frontend image is a multi-stage Vite build served by nginx, with `/api` and `/ws` proxied to the `app` service. Infrastructure services use the `infra` profile and are optional:
 
 ```bash
-# App only (connect to external Mongo/Redis/microsandbox)
+# App + frontend only (connect to external Mongo/Redis/microsandbox)
 docker compose up
 
-# Everything local
+# Everything local (Mongo, Redis, microsandbox)
 docker compose --profile infra up
 ```
+
+The frontend listens on `${FRONTEND_PORT:-5174}` and proxies API traffic to the `app` container internally.
 
 Connection URIs are configured via environment variables or `config.yml`:
 - `DATABASE_URI` — MongoDB
