@@ -89,7 +89,11 @@ export class SnapshotsService {
     const snapshotId = nanoid(12);
     const snapshotFileName = `${snapshotId}.tar.gz`;
     const snapshotPath = join(SNAPSHOTS_DIR, snapshotFileName);
-    const guestTarPath = `/tmp/snapshot-${snapshotId}.tar.gz`;
+    // Stage the tarball inside workdir: sysbox-runc presents /tmp as a
+    // virtual mount that Docker's archive driver cannot read or write,
+    // so getArchive/putArchive against /tmp/* fails with "no such file".
+    // Workdir is created by Docker (WorkingDir) and is reachable.
+    const guestTarPath = `${sandboxDoc.workdir}/.devic-runtime-snapshot-${snapshotId}.tar.gz`;
 
     const doc = await this.snapshotRepo.create(
       {
@@ -120,7 +124,7 @@ export class SnapshotsService {
       );
 
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
       );
 
       if (tarResult.code !== 0) {
@@ -231,7 +235,9 @@ export class SnapshotsService {
       });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
 
-      const guestTarPath = `/tmp/restore-${sandboxId}.tar.gz`;
+      // Stage inside workdir; /tmp is unreachable via Docker archive APIs
+      // when sysbox-runc is the runtime (see snapshot create for context).
+      const guestTarPath = `${snapshot.workdir}/.devic-runtime-restore-${sandboxId}.tar.gz`;
       await sandbox.copyFromHost(onDiskPath, guestTarPath);
 
       const extractResult = await sandbox.exec(
@@ -331,7 +337,7 @@ export class SnapshotsService {
       return;
     }
 
-    const guestTarPath = `/tmp/persist-${sandboxDoc.sandboxId}.tar.gz`;
+    const guestTarPath = `${sandboxDoc.workdir}/.devic-runtime-persist-${sandboxDoc.sandboxId}.tar.gz`;
 
     try {
       this.logger.log(
@@ -350,7 +356,7 @@ export class SnapshotsService {
       const sandbox = await handle.connect();
 
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
       );
 
       if (tarResult.code !== 0) {
