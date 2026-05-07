@@ -124,10 +124,13 @@ export class SnapshotsService {
       );
 
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --warning=no-file-changed --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
       );
 
-      if (tarResult.code !== 0) {
+      // tar exits 1 when it emits warnings (e.g. directory mtime bumped while
+      // we wrote the staged tarball into it). The archive itself is still
+      // valid; only fatal errors (code >= 2) should abort the snapshot.
+      if (tarResult.code >= 2) {
         throw new Error(`tar failed: ${tarResult.stderr}`);
       }
 
@@ -356,10 +359,10 @@ export class SnapshotsService {
       const sandbox = await handle.connect();
 
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --warning=no-file-changed --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
       );
 
-      if (tarResult.code !== 0) {
+      if (tarResult.code >= 2) {
         this.logger.error(`Persist tar failed: ${tarResult.stderr}`);
         return;
       }

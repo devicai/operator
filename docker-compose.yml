@@ -10,6 +10,7 @@ services:
     environment:
       - DATABASE_URI=${DATABASE_URI:-mongodb://mongo:27017/devic-sandbox}
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
+      - SANDBOX_API_KEY=${SANDBOX_API_KEY:-}
 
   frontend:
     build: ./frontend
