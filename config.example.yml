@@ -56,6 +56,28 @@ resourceLimits:
   # New snapshots are rejected once total disk usage reaches this value.
   maxTotalDiskBytes: 21474836480  # 20 GiB
 
+# Pre-warmed pool of restored sandboxes, ready to be claimed instantly.
+# The pool reserves a slice of `resourceLimits.maxTotalMemoryMib` proportional
+# to `memoryReservePercent`. Reserved capacity (occupied by running hot sandboxes
+# plus any unfilled hot slots) is unavailable for on-demand sandboxes.
+#
+# All values are persisted in MongoDB on first start and can be edited live
+# from the frontend Settings page (changes take effect on the next reconcile).
+hotPool:
+  enabled: false
+  # Snapshot every hot sandbox is restored from.
+  snapshotId: ""
+  # Percentage of maxTotalMemoryMib to reserve (0–100).
+  memoryReservePercent: 25
+  # Resources of each individual hot sandbox.
+  memoryMibPerSandbox: 512
+  cpus: 1
+  # Pool sizing bounds.
+  minSize: 0
+  maxSize: 20
+  # Reconcile cadence (ms).
+  reconcileIntervalMs: 15000
+
 mcp:
   enabled: true
 

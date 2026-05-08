@@ -16,6 +16,9 @@ import type {
   CreateSnapshotDto,
   RestoreSnapshotDto,
   UsageSummary,
+  HotPoolStatus,
+  HotPoolConfig,
+  ClaimHotDto,
 } from './types';
 
 const api = axios.create({
@@ -152,6 +155,22 @@ export const snapshotsApi = {
 export const usageApi = {
   get(): Promise<AxiosResponse<UsageSummary>> {
     return api.get('/usage');
+  },
+};
+
+// Hot Pool
+export const hotPoolApi = {
+  status(): Promise<AxiosResponse<HotPoolStatus>> {
+    return api.get('/hot-pool/status');
+  },
+  updateConfig(dto: Partial<HotPoolConfig>): Promise<AxiosResponse<HotPoolConfig>> {
+    return api.put('/hot-pool/config', dto);
+  },
+  claim(dto: ClaimHotDto = {}): Promise<AxiosResponse<SandboxDto>> {
+    return api.post('/hot-pool/claim', dto);
+  },
+  reconcile(): Promise<AxiosResponse<HotPoolStatus>> {
+    return api.post('/hot-pool/reconcile');
   },
 };
 

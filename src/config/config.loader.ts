@@ -80,6 +80,17 @@ export function loadConfig(configPath?: string): ModuleConfig {
   }
   resolved.mcp = resolved.mcp ?? { enabled: true };
 
+  resolved.hotPool = {
+    enabled: false,
+    memoryReservePercent: 0,
+    memoryMibPerSandbox: resolved.defaults.defaultMemoryMib,
+    cpus: resolved.defaults.defaultCpus,
+    minSize: 0,
+    maxSize: 20,
+    reconcileIntervalMs: 15000,
+    ...(resolved.hotPool ?? {}),
+  };
+
   return resolved;
 }
 

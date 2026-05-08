@@ -21,6 +21,7 @@ import {
   faWandMagicSparkles,
 } from '@fortawesome/free-solid-svg-icons';
 import { usageApi } from '../../api/client';
+import HotPoolSettingsCard from '../HotPool/HotPoolSettingsCard';
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -255,6 +256,8 @@ const SettingsPage: React.FC = () => {
           }
         />
       </Card>
+
+      <HotPoolSettingsCard />
     </div>
   );
 };
