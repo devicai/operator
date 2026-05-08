@@ -12,17 +12,26 @@ export interface AvailableMcpTool {
   parameters: McpToolParameter[];
 }
 
+const SANDBOX_ID_PARAM: McpToolParameter = {
+  name: 'sandboxId',
+  type: 'string',
+  required: false,
+  description:
+    'Optional explicit sandbox id. When provided overrides the session-bound sandbox for this single call.',
+};
+
 export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
   {
     name: 'create_sandbox',
     description:
-      'Create a new sandbox environment. Optionally specify a profile for preconfigured settings, or pass a bindingId to reuse an existing sandbox.',
+      'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass a bindingId for cross-session resolution or force=true to always allocate a fresh sandbox.',
     writeAccess: true,
     parameters: [
       { name: 'profileId', type: 'string', required: false, description: 'Sandbox profile ID for preconfigured settings' },
       { name: 'bindingId', type: 'string', required: false, description: 'External binding ID for implicit resolution' },
       { name: 'image', type: 'string', required: false, description: 'Docker image (default: node:24)' },
       { name: 'ttlSeconds', type: 'number', required: false, description: 'Time to live in seconds (default: 1800)' },
+      { name: 'force', type: 'boolean', required: false, description: 'Create a fresh sandbox even if the session already has one bound' },
     ],
   },
   {
@@ -33,6 +42,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     parameters: [
       { name: 'command', type: 'string', required: true, description: 'Shell command to execute' },
       { name: 'cwd', type: 'string', required: false, description: 'Working directory override' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
@@ -42,6 +52,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     parameters: [
       { name: 'path', type: 'string', required: true, description: 'File path in the sandbox' },
       { name: 'content', type: 'string', required: true, description: 'File content to write' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
@@ -50,13 +61,14 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     writeAccess: true,
     parameters: [
       { name: 'path', type: 'string', required: true, description: 'Directory path to create' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
     name: 'stop_sandbox',
     description: 'Stop the active sandbox. Creates a snapshot for potential restore.',
     writeAccess: true,
-    parameters: [],
+    parameters: [SANDBOX_ID_PARAM],
   },
   {
     name: 'extend_ttl',
@@ -64,6 +76,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     writeAccess: true,
     parameters: [
       { name: 'additionalSeconds', type: 'number', required: true, description: 'Additional seconds to add' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
@@ -73,13 +86,14 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     parameters: [
       { name: 'url', type: 'string', required: true, description: 'Public URL to download from' },
       { name: 'path', type: 'string', required: true, description: 'Destination path in the sandbox' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
     name: 'get_sandbox_status',
     description: 'Get the current status of the sandbox including remaining TTL.',
     writeAccess: false,
-    parameters: [],
+    parameters: [SANDBOX_ID_PARAM],
   },
   {
     name: 'list_files',
@@ -87,6 +101,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     writeAccess: false,
     parameters: [
       { name: 'path', type: 'string', required: false, description: 'Directory path to list (default: current working directory)' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
@@ -95,6 +110,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     writeAccess: false,
     parameters: [
       { name: 'path', type: 'string', required: true, description: 'File path to read' },
+      SANDBOX_ID_PARAM,
     ],
   },
   {
@@ -103,6 +119,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
     writeAccess: false,
     parameters: [
       { name: 'path', type: 'string', required: true, description: 'File path to download' },
+      SANDBOX_ID_PARAM,
     ],
   },
 ];
