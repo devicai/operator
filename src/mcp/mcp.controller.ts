@@ -19,6 +19,7 @@ import { z } from 'zod';
 import { SandboxesService } from '../sandboxes/sandboxes.service';
 import { McpProfilesService } from './profiles/mcp-profiles.service';
 import { McpProfile } from '../schemas/mcp-profile.schema';
+import { SandboxStatus } from '../schemas/sandbox.schema';
 import { CONFIG } from '../config/config.loader';
 import { ModuleConfig } from '../config/config.types';
 import { MCP_TOOL_NAMES } from './available-tools';
@@ -32,6 +33,9 @@ interface SessionEntry {
   transport: StreamableHTTPServerTransport;
   profile: ResolvedProfile | null;
   sandboxId: string | null;
+  // bindingId provided by the client at initialize time, used to re-attach to
+  // a sandbox across reconnects when the MCP session id is not preserved.
+  bindingId: string | null;
 }
 
 @Controller('mcp')
@@ -77,13 +81,72 @@ export class McpController implements OnModuleInit {
     return server;
   }
 
-  private async getOrCreateSessionSandbox(session: SessionEntry): Promise<string> {
+  /**
+   * Resolves the sandbox to use for a tool call.
+   *
+   * Order of precedence:
+   *  1. Explicit `providedSandboxId` argument from the tool call (opt-in).
+   *     Validated; if running it is also adopted as the session's sandbox so
+   *     subsequent calls without an explicit id reuse it.
+   *  2. Session-bound sandbox (`session.sandboxId`), set by `create_sandbox`
+   *     or by a previous tool call in this session.
+   *  3. Sandbox bound by `bindingId` (provided at initialize time): looked up
+   *     fresh on every call so a session that reconnected with a new id can
+   *     still re-attach to the previous sandbox.
+   *  4. Fresh sandbox created on the spot using the session's default profile.
+   */
+  private async resolveSandbox(
+    session: SessionEntry,
+    providedSandboxId: string | undefined,
+    toolName: string,
+  ): Promise<string> {
+    const scope = {};
+
+    if (providedSandboxId) {
+      const doc = await this.sandboxesService.findById(providedSandboxId, scope);
+      if (doc.status !== SandboxStatus.RUNNING) {
+        throw new Error(
+          `Sandbox ${providedSandboxId} is not running (status: ${doc.status})`,
+        );
+      }
+      if (!session.sandboxId) {
+        session.sandboxId = doc.sandboxId;
+        this.logger.debug(
+          `[mcp:${toolName}] adopted explicit sandboxId=${doc.sandboxId} into empty session`,
+        );
+      } else if (session.sandboxId !== doc.sandboxId) {
+        this.logger.debug(
+          `[mcp:${toolName}] using explicit sandboxId=${doc.sandboxId} (session bound to ${session.sandboxId})`,
+        );
+      }
+      return doc.sandboxId;
+    }
+
     if (session.sandboxId) return session.sandboxId;
 
+    if (session.bindingId) {
+      const existing = await this.sandboxesService.findByBinding(
+        session.bindingId,
+        scope,
+      );
+      if (existing && existing.status === SandboxStatus.RUNNING) {
+        session.sandboxId = existing.sandboxId;
+        this.logger.debug(
+          `[mcp:${toolName}] re-attached session to sandbox ${existing.sandboxId} via bindingId=${session.bindingId}`,
+        );
+        return existing.sandboxId;
+      }
+    }
+
     const profileId = session.profile?.profile.defaultSandboxProfileId;
-    const scope = {};
-    const sandbox = await this.sandboxesService.create({ profileId }, scope);
+    const sandbox = await this.sandboxesService.create(
+      { profileId, bindingId: session.bindingId ?? undefined },
+      scope,
+    );
     session.sandboxId = sandbox.sandboxId;
+    this.logger.debug(
+      `[mcp:${toolName}] created sandbox ${sandbox.sandboxId} on first tool call (binding=${session.bindingId ?? '-'})`,
+    );
     return sandbox.sandboxId;
   }
 
@@ -100,17 +163,41 @@ export class McpController implements OnModuleInit {
     if (this.canUseTool(resolved, 'create_sandbox', true)) {
       server.tool(
         'create_sandbox',
-        'Create a new sandbox environment or reuse an existing one via bindingId.',
+        'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass `bindingId` for cross-session resolution or `force: true` to always allocate a fresh sandbox.',
         {
           profileId: z.string().optional().describe('Sandbox profile ID'),
-          bindingId: z.string().optional().describe('External binding ID'),
+          bindingId: z.string().optional().describe('External binding ID — reuses or creates a sandbox keyed by this id'),
           image: z.string().optional().describe('Docker image'),
           ttlSeconds: z.number().optional().describe('TTL in seconds'),
+          force: z.boolean().optional().describe('Create a fresh sandbox even if the session already has one bound'),
         } as any,
-        async ({ profileId, bindingId, image, ttlSeconds }: any) => {
+        async ({ profileId, bindingId, image, ttlSeconds, force }: any) => {
           try {
             const scope = {};
             let sandbox;
+
+            const noOverrides = !bindingId && !image && !ttlSeconds && !profileId;
+            if (!force && noOverrides && session.sandboxId) {
+              const existing = await this.sandboxesService
+                .findById(session.sandboxId, scope)
+                .catch(() => null);
+              if (existing && existing.status === SandboxStatus.RUNNING) {
+                this.logger.debug(
+                  `[mcp:create_sandbox] returning session-bound sandbox ${existing.sandboxId}`,
+                );
+                return {
+                  content: [{ type: 'text' as const, text: JSON.stringify({
+                    sandboxId: existing.sandboxId,
+                    status: existing.status,
+                    image: existing.image,
+                    workdir: existing.workdir,
+                    ttlSeconds: existing.ttlSeconds,
+                    expiresAt: existing.expiresAt,
+                    reused: true,
+                  }, null, 2) }],
+                };
+              }
+            }
 
             if (bindingId) {
               sandbox = await this.sandboxesService.getOrCreateByBinding(
@@ -124,6 +211,7 @@ export class McpController implements OnModuleInit {
                   profileId: profileId ?? session.profile?.profile.defaultSandboxProfileId,
                   image,
                   ttlSeconds,
+                  bindingId: session.bindingId ?? undefined,
                 },
                 scope,
               );
@@ -139,6 +227,7 @@ export class McpController implements OnModuleInit {
                 workdir: sandbox.workdir,
                 ttlSeconds: sandbox.ttlSeconds,
                 expiresAt: sandbox.expiresAt,
+                reused: false,
               }, null, 2) }],
             };
           } catch (error) {
@@ -148,6 +237,9 @@ export class McpController implements OnModuleInit {
       );
     }
 
+    const SANDBOX_ID_DESC =
+      'Optional explicit sandbox id. When provided overrides the session-bound sandbox for this single call.';
+
     if (this.canUseTool(resolved, 'run_command', true)) {
       server.tool(
         'run_command',
@@ -155,12 +247,13 @@ export class McpController implements OnModuleInit {
         {
           command: z.string().describe('Shell command to execute'),
           cwd: z.string().optional().describe('Working directory override'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ command, cwd }: { command: string; cwd?: string }) => {
+        async ({ command, cwd, sandboxId }: { command: string; cwd?: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'run_command');
             const result = await this.sandboxesService.runCommand(
-              sandboxId,
+              id,
               { command, cwd },
               {},
             );
@@ -181,11 +274,12 @@ export class McpController implements OnModuleInit {
         {
           path: z.string().describe('File path'),
           content: z.string().describe('File content'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ path, content }: { path: string; content: string }) => {
+        async ({ path, content, sandboxId }: { path: string; content: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
-            await this.sandboxesService.writeFile(sandboxId, path, content, {});
+            const id = await this.resolveSandbox(session, sandboxId, 'write_file');
+            await this.sandboxesService.writeFile(id, path, content, {});
             return {
               content: [{ type: 'text' as const, text: `File written: ${path}` }],
             };
@@ -202,12 +296,13 @@ export class McpController implements OnModuleInit {
         'Create a directory in the sandbox.',
         {
           path: z.string().describe('Directory path to create'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ path }: { path: string }) => {
+        async ({ path, sandboxId }: { path: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'create_directory');
             await this.sandboxesService.runCommand(
-              sandboxId,
+              id,
               { command: `mkdir -p '${path}'` },
               {},
             );
@@ -225,14 +320,19 @@ export class McpController implements OnModuleInit {
       server.tool(
         'stop_sandbox',
         'Stop the active sandbox. Creates a snapshot for potential restore.',
-        {} as any,
-        async () => {
+        {
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
+        } as any,
+        async ({ sandboxId }: { sandboxId?: string }) => {
           try {
-            if (!session.sandboxId) {
+            const targetId = sandboxId ?? session.sandboxId;
+            if (!targetId) {
               return errorResult('No active sandbox in this session');
             }
-            const result = await this.sandboxesService.stop(session.sandboxId, {});
-            session.sandboxId = null;
+            const result = await this.sandboxesService.stop(targetId, {});
+            if (session.sandboxId === targetId) {
+              session.sandboxId = null;
+            }
             return {
               content: [{ type: 'text' as const, text: JSON.stringify({
                 sandboxId: result.sandboxId,
@@ -253,12 +353,13 @@ export class McpController implements OnModuleInit {
         'Extend the time to live of the active sandbox.',
         {
           additionalSeconds: z.number().describe('Additional seconds to add'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ additionalSeconds }: { additionalSeconds: number }) => {
+        async ({ additionalSeconds, sandboxId }: { additionalSeconds: number; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'extend_ttl');
             const result = await this.sandboxesService.extendTtl(
-              sandboxId,
+              id,
               additionalSeconds,
               {},
             );
@@ -282,12 +383,13 @@ export class McpController implements OnModuleInit {
         {
           url: z.string().describe('Public URL to download from'),
           path: z.string().describe('Destination path in the sandbox'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ url, path }: { url: string; path: string }) => {
+        async ({ url, path, sandboxId }: { url: string; path: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'upload_file');
             await this.sandboxesService.runCommand(
-              sandboxId,
+              id,
               { command: `curl -fsSL -o '${path}' '${url}'` },
               {},
             );
@@ -305,10 +407,13 @@ export class McpController implements OnModuleInit {
       server.tool(
         'get_sandbox_status',
         'Get the current status of the sandbox including remaining TTL.',
-        {} as any,
-        async () => {
+        {
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
+        } as any,
+        async ({ sandboxId }: { sandboxId?: string }) => {
           try {
-            if (!session.sandboxId) {
+            const targetId = sandboxId ?? session.sandboxId;
+            if (!targetId) {
               return {
                 content: [{ type: 'text' as const, text: JSON.stringify({
                   status: 'no_sandbox',
@@ -316,7 +421,7 @@ export class McpController implements OnModuleInit {
                 }, null, 2) }],
               };
             }
-            const status = await this.sandboxesService.getStatus(session.sandboxId, {});
+            const status = await this.sandboxesService.getStatus(targetId, {});
             return {
               content: [{ type: 'text' as const, text: JSON.stringify(status, null, 2) }],
             };
@@ -333,13 +438,14 @@ export class McpController implements OnModuleInit {
         'List files and directories in the sandbox.',
         {
           path: z.string().optional().describe('Directory path (default: current working directory)'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ path }: { path?: string }) => {
+        async ({ path, sandboxId }: { path?: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'list_files');
             const dir = path || '.';
             const result = await this.sandboxesService.runCommand(
-              sandboxId,
+              id,
               { command: `ls -la '${dir}'` },
               {},
             );
@@ -359,12 +465,13 @@ export class McpController implements OnModuleInit {
         'Read the content of a file in the sandbox.',
         {
           path: z.string().describe('File path to read'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ path }: { path: string }) => {
+        async ({ path, sandboxId }: { path: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'read_file');
             const content = await this.sandboxesService.readFile(
-              sandboxId,
+              id,
               path,
               {},
             );
@@ -384,12 +491,13 @@ export class McpController implements OnModuleInit {
         'Get the content of a file from the sandbox encoded in base64.',
         {
           path: z.string().describe('File path to download'),
+          sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
-        async ({ path }: { path: string }) => {
+        async ({ path, sandboxId }: { path: string; sandboxId?: string }) => {
           try {
-            const sandboxId = await this.getOrCreateSessionSandbox(session);
+            const id = await this.resolveSandbox(session, sandboxId, 'download_file');
             const content = await this.sandboxesService.readFile(
-              sandboxId,
+              id,
               path,
               {},
             );
@@ -458,6 +566,9 @@ export class McpController implements OnModuleInit {
     }
 
     const sessionId = req.headers['mcp-session-id'] as string | undefined;
+    const bindingHeader =
+      (req.headers['mcp-binding-id'] as string | undefined) ??
+      (req.headers['x-mcp-binding-id'] as string | undefined);
     let transport: StreamableHTTPServerTransport | undefined;
 
     try {
@@ -485,13 +596,16 @@ export class McpController implements OnModuleInit {
           transport: null as any,
           profile: resolved,
           sandboxId: null,
+          bindingId: bindingHeader ?? null,
         };
 
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: () => randomUUID(),
           onsessioninitialized: (sid) => {
             this.logger.log(
-              `MCP session initialized: ${sid}${resolved ? ` (profile: ${resolved.profile.name})` : ''}`,
+              `MCP session initialized: ${sid}` +
+                (resolved ? ` (profile: ${resolved.profile.name})` : '') +
+                (bindingHeader ? ` (bindingId: ${bindingHeader})` : ''),
             );
             sessionEntry.transport = transport!;
             this.sessions.set(sid, sessionEntry);
