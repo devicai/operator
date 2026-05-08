@@ -7,6 +7,16 @@ import { ModuleConfig } from '../config/config.types';
 import { Sandbox, SandboxDocument, SandboxStatus } from '../schemas/sandbox.schema';
 import { Snapshot, SnapshotDocument, SnapshotStatus } from '../schemas/snapshot.schema';
 
+/**
+ * Hot pool memory accountant. The hot pool service registers itself here at
+ * boot so the resource usage service can deduct unfilled hot slots from the
+ * available capacity when checking new on-demand sandboxes — without dragging
+ * the hot pool module into a circular import.
+ */
+export interface HotPoolMemoryAccountant {
+  getReservedMemoryOverhead(): Promise<number>;
+}
+
 const ACTIVE_SANDBOX_STATUSES: SandboxStatus[] = [
   SandboxStatus.PENDING,
   SandboxStatus.CREATING,
@@ -17,6 +27,7 @@ const ACTIVE_SANDBOX_STATUSES: SandboxStatus[] = [
 @Injectable()
 export class ResourceUsageService {
   private readonly logger = new Logger(ResourceUsageService.name);
+  private hotAccountant: HotPoolMemoryAccountant | null = null;
 
   constructor(
     @InjectModel(Sandbox.name)
@@ -25,6 +36,11 @@ export class ResourceUsageService {
     private readonly snapshotModel: Model<SnapshotDocument>,
     @Inject(CONFIG) private readonly config: ModuleConfig,
   ) {}
+
+  /** Wire the hot pool accountant after construction to avoid a cycle. */
+  registerHotAccountant(accountant: HotPoolMemoryAccountant): void {
+    this.hotAccountant = accountant;
+  }
 
   async getTotalMemoryMib(): Promise<number> {
     const result = await this.sandboxModel.aggregate<{ total: number }>([
@@ -71,16 +87,28 @@ export class ResourceUsageService {
   /**
    * Throws BadRequestException if allocating `additionalMemoryMib` would exceed the
    * configured maxTotalMemoryMib limit. No-op when the limit is not configured.
+   *
+   * Adds the hot pool's *unfilled* reservation to the in-use total so on-demand
+   * sandboxes can't grow into capacity that has been reserved for pre-warmed
+   * pods. Hot sandboxes that are already running are already part of `current`
+   * (their `memoryMib` is summed by `getTotalMemoryMib`), so we only count the
+   * gap (target − current) to avoid double-billing.
    */
   async assertMemoryAvailable(additionalMemoryMib: number): Promise<void> {
     const limit = this.config.resourceLimits?.maxTotalMemoryMib;
     if (!limit || limit <= 0) return;
 
     const current = await this.getTotalMemoryMib();
-    const projected = current + additionalMemoryMib;
+    const hotOverhead = this.hotAccountant
+      ? await this.hotAccountant.getReservedMemoryOverhead()
+      : 0;
+    const projected = current + hotOverhead + additionalMemoryMib;
     if (projected > limit) {
       throw new BadRequestException(
         `RAM limit exceeded: requested ${additionalMemoryMib} MiB + in-use ${current} MiB ` +
+          (hotOverhead > 0
+            ? `+ hot-pool reserve ${hotOverhead} MiB `
+            : '') +
           `would surpass the configured maximum of ${limit} MiB`,
       );
     }
@@ -106,14 +134,18 @@ export class ResourceUsageService {
   }
 
   async getUsageSummary() {
-    const [memoryMib, diskBytes] = await Promise.all([
+    const [memoryMib, diskBytes, hotOverhead] = await Promise.all([
       this.getTotalMemoryMib(),
       this.getTotalSnapshotBytes(),
+      this.hotAccountant
+        ? this.hotAccountant.getReservedMemoryOverhead()
+        : Promise.resolve(0),
     ]);
     return {
       memory: {
         usedMib: memoryMib,
         limitMib: this.config.resourceLimits?.maxTotalMemoryMib ?? null,
+        hotPoolReservedMib: hotOverhead,
       },
       disk: {
         usedBytes: diskBytes,

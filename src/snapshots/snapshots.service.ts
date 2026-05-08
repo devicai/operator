@@ -176,6 +176,46 @@ export class SnapshotsService {
     dto: RestoreSnapshotDto,
     scope: ExtensionScope,
   ): Promise<SandboxDocument> {
+    return this.restoreInternal(snapshotId, dto, scope, {
+      skipMemoryCheck: false,
+      hotReserved: false,
+    });
+  }
+
+  /**
+   * Provision a hot-reserve sandbox from a snapshot, bypassing the standard
+   * memory check (the hot pool service already accounts for the slice it owns).
+   * The sandbox is marked `hotReserved=true` and gets a far-future expiresAt
+   * so the TTL service ignores it. Snapshot link is intentionally dropped —
+   * a hot sandbox that is later claimed must not auto-persist back to the
+   * pool's source snapshot.
+   */
+  async provisionHotReserve(
+    snapshotId: string,
+    overrides: { cpus?: number; memoryMib?: number },
+  ): Promise<SandboxDocument> {
+    return this.restoreInternal(
+      snapshotId,
+      {
+        cpus: overrides.cpus,
+        memoryMib: overrides.memoryMib,
+        ttlSeconds: 60 * 60 * 24 * 365, // 1 year — effectively "no TTL"
+        linked: false,
+      },
+      {},
+      {
+        skipMemoryCheck: true,
+        hotReserved: true,
+      },
+    );
+  }
+
+  private async restoreInternal(
+    snapshotId: string,
+    dto: RestoreSnapshotDto,
+    scope: ExtensionScope,
+    options: { skipMemoryCheck: boolean; hotReserved: boolean },
+  ): Promise<SandboxDocument> {
     const snapshot = await this.findById(snapshotId, scope);
     if (snapshot.status !== SnapshotStatus.READY) {
       throw new BadRequestException(
@@ -195,7 +235,9 @@ export class SnapshotsService {
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
     const restoreMemoryMib = dto.memoryMib ?? snapshot.memoryMib;
 
-    await this.resourceUsage.assertMemoryAvailable(restoreMemoryMib);
+    if (!options.skipMemoryCheck) {
+      await this.resourceUsage.assertMemoryAvailable(restoreMemoryMib);
+    }
 
     const isLinked = dto.linked !== false; // default true
 
@@ -214,12 +256,16 @@ export class SnapshotsService {
         ttlSeconds,
         expiresAt,
         ...(isLinked ? { snapshotId: snapshot.snapshotId } : {}),
+        hotReserved: options.hotReserved,
         commandCount: 0,
         recentCommands: [],
         metadata: {
           restoredFrom: snapshot.snapshotId,
           restoredAt: new Date().toISOString(),
           linked: isLinked,
+          ...(options.hotReserved
+            ? { hotPool: true, hotPoolSnapshotId: snapshot.snapshotId }
+            : {}),
         },
       } as any,
       scope,

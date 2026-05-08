@@ -27,6 +27,7 @@ import CreateSandboxModal from './CreateSandboxModal';
 import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
 import UsagePanel from '../Usage/UsagePanel';
+import HotPoolPanel from '../HotPool/HotPoolPanel';
 
 const { Title } = Typography;
 
@@ -104,6 +105,9 @@ const SandboxesPage: React.FC = () => {
       render: (name: string, row) => (
         <div>
           <code style={{ fontSize: 12 }}>{name}</code>
+          {(row as any).hotReserved && (
+            <Tag color="orange" style={{ fontSize: 10, marginLeft: 6 }}>HOT</Tag>
+          )}
           {row.bindingId && (
             <div><Tag style={{ fontSize: 10, marginTop: 2 }}>binding: {row.bindingId}</Tag></div>
           )}
@@ -254,6 +258,7 @@ const SandboxesPage: React.FC = () => {
       </div>
 
       <UsagePanel usage={usage} loading={usageLoading} />
+      <HotPoolPanel />
 
       <Table
         rowKey="_id"

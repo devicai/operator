@@ -82,6 +82,14 @@ export class Sandbox {
   @Prop({ index: true, sparse: true })
   bindingId: string;
 
+  @ApiProperty({
+    description:
+      'True while this sandbox is sitting in the hot pool, idle and waiting ' +
+      'to be claimed. Cleared the moment the sandbox is handed out to a caller.',
+  })
+  @Prop({ default: false, index: true })
+  hotReserved: boolean;
+
   @ApiProperty()
   @Prop({ type: Object, default: {} })
   metadata: Record<string, any>;

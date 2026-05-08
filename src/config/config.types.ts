@@ -10,6 +10,7 @@ export interface ModuleConfig {
   webhooks?: WebhooksConfig;
   logging: LoggingConfig;
   resourceLimits?: ResourceLimitsConfig;
+  hotPool?: HotPoolConfig;
 }
 
 export interface ServerConfig {
@@ -118,4 +119,41 @@ export interface ResourceLimitsConfig {
   maxTotalMemoryMib?: number;
   /** Maximum total disk usage (bytes) for stored snapshots. 0/undefined disables the limit. */
   maxTotalDiskBytes?: number;
+}
+
+/**
+ * Hot Pool keeps a fleet of pre-warmed sandboxes (restored from a configured
+ * snapshot) ready to be claimed instantly, avoiding the cold-start penalty
+ * of creating + restoring a sandbox on demand.
+ *
+ * The pool reserves a slice of the total memory budget (resourceLimits.maxTotalMemoryMib)
+ * proportional to `memoryReservePercent`. As long as the pool isn't full,
+ * new on-demand sandboxes can't grow into the reserved portion.
+ */
+export interface HotPoolConfig {
+  /** Master switch. */
+  enabled: boolean;
+  /** Snapshot ID used as the source for every hot sandbox. */
+  snapshotId?: string;
+  /**
+   * Percentage (0–100) of `resourceLimits.maxTotalMemoryMib` reserved for
+   * the hot pool. Required when `maxTotalMemoryMib` is set; otherwise the
+   * pool falls back to a fixed `targetSize`.
+   */
+  memoryReservePercent?: number;
+  /** Memory (MiB) of each individual hot sandbox. */
+  memoryMibPerSandbox?: number;
+  /** CPUs of each hot sandbox. */
+  cpus?: number;
+  /** Lower bound for pool size (irrespective of memory budget). */
+  minSize?: number;
+  /** Hard cap on pool size. */
+  maxSize?: number;
+  /**
+   * Optional fixed pool size. Overrides percentage-based sizing when set.
+   * Useful when no `maxTotalMemoryMib` cap is configured.
+   */
+  targetSize?: number;
+  /** Reconcile cadence in milliseconds. */
+  reconcileIntervalMs?: number;
 }

@@ -19,6 +19,7 @@ export interface SandboxDto {
   commandCount: number;
   recentCommands: string[];
   bindingId?: string;
+  hotReserved?: boolean;
   metadata: Record<string, any>;
   createdAt: string;
   updatedAt: string;
@@ -185,9 +186,56 @@ export interface UsageSummary {
   memory: {
     usedMib: number;
     limitMib: number | null;
+    hotPoolReservedMib?: number;
   };
   disk: {
     usedBytes: number;
     limitBytes: number | null;
   };
+}
+
+// Hot Pool
+export interface HotPoolConfig {
+  enabled: boolean;
+  snapshotId?: string;
+  memoryReservePercent?: number;
+  memoryMibPerSandbox?: number;
+  cpus?: number;
+  minSize?: number;
+  maxSize?: number;
+  targetSize?: number;
+  reconcileIntervalMs?: number;
+}
+
+export interface HotPoolSandboxView {
+  sandboxId: string;
+  name: string;
+  memoryMib: number;
+  cpus: number;
+  ageSeconds: number;
+}
+
+export interface HotPoolMetrics {
+  current: number;
+  currentMemoryMib: number;
+  target: number;
+  targetMemoryMib: number;
+  reservedPercent: number | null;
+  reservedMib: number;
+  totalLimitMib: number | null;
+}
+
+export interface HotPoolStatus {
+  config: HotPoolConfig;
+  effective: HotPoolConfig;
+  metrics: HotPoolMetrics;
+  snapshot: { snapshotId: string; name: string } | null;
+  hotSandboxes: HotPoolSandboxView[];
+  lastReconcileAt: string | null;
+  lastError: string | null;
+}
+
+export interface ClaimHotDto {
+  bindingId?: string;
+  ttlSeconds?: number;
 }

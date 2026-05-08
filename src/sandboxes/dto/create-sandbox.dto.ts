@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsOptional, IsNumber, IsObject, Min, Max } from 'class-validator';
+import { IsBoolean, IsString, IsOptional, IsNumber, IsObject, Min, Max } from 'class-validator';
 
 export class CreateSandboxDto {
   @ApiPropertyOptional({ description: 'Sandbox profile ID to use as base configuration' })
@@ -61,4 +61,15 @@ export class CreateSandboxDto {
   @IsOptional()
   @IsString()
   networkPolicy?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'When true, the request first tries to claim a pre-warmed sandbox from ' +
+      'the hot pool. Falls back to a regular create if the pool is empty or ' +
+      'the requested config is incompatible.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  useHotPool?: boolean;
 }

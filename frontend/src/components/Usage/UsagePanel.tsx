@@ -86,6 +86,7 @@ interface UsagePanelProps {
 const UsagePanel: React.FC<UsagePanelProps> = ({ usage, loading }) => {
   const memUsed = usage?.memory.usedMib ?? 0;
   const memLimit = usage?.memory.limitMib ?? null;
+  const hotReserved = usage?.memory.hotPoolReservedMib ?? 0;
   const memPercent = memLimit && memLimit > 0 ? (memUsed / memLimit) * 100 : null;
 
   const diskUsed = usage?.disk.usedBytes ?? 0;
@@ -97,7 +98,11 @@ const UsagePanel: React.FC<UsagePanelProps> = ({ usage, loading }) => {
       <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
         <Metric
           icon={faMemory}
-          label="RAM (running sandboxes)"
+          label={
+            hotReserved > 0
+              ? `RAM (running) — +${hotReserved} MiB hot reserve`
+              : 'RAM (running sandboxes)'
+          }
           used={`${memUsed} MiB`}
           limit={memLimit !== null ? `${memLimit} MiB` : null}
           percent={memPercent}

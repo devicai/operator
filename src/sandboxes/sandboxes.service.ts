@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef, Optional } from '@nestjs/common';
 import { nanoid } from 'nanoid';
 import { SandboxRegistry } from './sandbox-registry';
 import { SandboxRepository } from '../repositories/sandbox.repository';
@@ -11,6 +11,7 @@ import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ResourceUsageService } from '../providers/resource-usage.service';
+import { HotPoolService } from '../hot-pool/hot-pool.service';
 import {
   RUNTIME_PROVIDER,
   RuntimeProvider,
@@ -32,9 +33,29 @@ export class SandboxesService {
     private readonly snapshotsService: SnapshotsService,
     private readonly resourceUsage: ResourceUsageService,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+    @Optional()
+    @Inject(forwardRef(() => HotPoolService))
+    private readonly hotPool?: HotPoolService,
   ) {}
 
   async create(dto: CreateSandboxDto, scope: ExtensionScope): Promise<SandboxDocument> {
+    if (dto.useHotPool && this.hotPool) {
+      try {
+        const claimed = await this.hotPool.claim({
+          bindingId: dto.bindingId,
+          ttlSeconds: dto.ttlSeconds,
+        });
+        this.logger.log(
+          `Sandbox ${claimed.sandboxId} served from hot pool (binding=${dto.bindingId ?? '-'})`,
+        );
+        return claimed;
+      } catch (err) {
+        this.logger.warn(
+          `Hot pool claim failed, falling back to fresh create: ${(err as Error).message}`,
+        );
+      }
+    }
+
     const defaults = this.config.defaults;
 
     let image = dto.image ?? defaults.defaultImage;
