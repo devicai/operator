@@ -102,17 +102,30 @@ const SandboxesPage: React.FC = () => {
       title: 'Name',
       dataIndex: 'name',
       key: 'name',
-      render: (name: string, row) => (
-        <div>
-          <code style={{ fontSize: 12 }}>{name}</code>
-          {(row as any).hotReserved && (
-            <Tag color="orange" style={{ fontSize: 10, marginLeft: 6 }}>HOT</Tag>
-          )}
-          {row.bindingId && (
-            <div><Tag style={{ fontSize: 10, marginTop: 2 }}>binding: {row.bindingId}</Tag></div>
-          )}
-        </div>
-      ),
+      render: (name: string, row) => {
+        const fromHotPool =
+          !row.hotReserved && (row.metadata as any)?.hotPool === true;
+        return (
+          <div>
+            <code style={{ fontSize: 12 }}>{name}</code>
+            {row.hotReserved && (
+              <Tooltip title="Pre-warmed sandbox waiting in the hot pool">
+                <Tag color="orange" style={{ fontSize: 10, marginLeft: 6 }}>HOT</Tag>
+              </Tooltip>
+            )}
+            {fromHotPool && (
+              <Tooltip title="Claimed from the hot pool — no cold-start cost">
+                <Tag color="volcano" style={{ fontSize: 10, marginLeft: 6 }}>
+                  FROM POOL
+                </Tag>
+              </Tooltip>
+            )}
+            {row.bindingId && (
+              <div><Tag style={{ fontSize: 10, marginTop: 2 }}>binding: {row.bindingId}</Tag></div>
+            )}
+          </div>
+        );
+      },
     },
     {
       title: 'Status',

@@ -24,7 +24,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
   {
     name: 'create_sandbox',
     description:
-      'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass a bindingId for cross-session resolution or force=true to always allocate a fresh sandbox.',
+      'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass a bindingId for cross-session resolution or force=true to always allocate a fresh sandbox. Hot pool is used by default when no incompatible override (image/profileId) is present — pass useHotPool=false to skip it.',
     writeAccess: true,
     parameters: [
       { name: 'profileId', type: 'string', required: false, description: 'Sandbox profile ID for preconfigured settings' },
@@ -32,6 +32,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
       { name: 'image', type: 'string', required: false, description: 'Docker image (default: node:24)' },
       { name: 'ttlSeconds', type: 'number', required: false, description: 'Time to live in seconds (default: 1800)' },
       { name: 'force', type: 'boolean', required: false, description: 'Create a fresh sandbox even if the session already has one bound' },
+      { name: 'useHotPool', type: 'boolean', required: false, description: 'Override hot pool resolution: true forces an attempt (falls back to fresh create), false skips it. Defaults to true unless image/profileId would diverge from the pool snapshot.' },
     ],
   },
   {

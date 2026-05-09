@@ -18,6 +18,13 @@ export interface HotPoolMetrics {
   reservedMib: number;
   /** Total memory cap configured for the module. */
   totalLimitMib: number | null;
+  /**
+   * Total successful claims served by this process since boot. Resets when
+   * the service restarts — it's a runtime counter, not a persisted total.
+   */
+  totalClaims: number;
+  /** ISO timestamp of the most recent successful claim, or null. */
+  lastClaimedAt: string | null;
 }
 
 export interface HotPoolSandboxView {

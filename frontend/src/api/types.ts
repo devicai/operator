@@ -223,6 +223,8 @@ export interface HotPoolMetrics {
   reservedPercent: number | null;
   reservedMib: number;
   totalLimitMib: number | null;
+  totalClaims: number;
+  lastClaimedAt: string | null;
 }
 
 export interface HotPoolStatus {

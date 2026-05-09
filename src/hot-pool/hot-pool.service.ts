@@ -53,6 +53,10 @@ export class HotPoolService implements OnModuleInit {
   private lastReconcileAt: Date | null = null;
   private lastError: string | null = null;
 
+  // Runtime claim counters (process-local; reset on restart).
+  private totalClaims = 0;
+  private lastClaimedAt: Date | null = null;
+
   constructor(
     @Inject(CONFIG) private readonly config: ModuleConfig,
     @InjectModel(ModuleSettings.name)
@@ -229,8 +233,11 @@ export class HotPoolService implements OnModuleInit {
       );
     }
 
+    this.totalClaims += 1;
+    this.lastClaimedAt = new Date();
+
     this.logger.log(
-      `Claimed hot sandbox ${claimed.sandboxId} (binding=${dto.bindingId ?? '-'})`,
+      `Claimed hot sandbox ${claimed.sandboxId} (binding=${dto.bindingId ?? '-'}, totalClaims=${this.totalClaims})`,
     );
 
     // Fire-and-forget refill.
@@ -449,6 +456,10 @@ export class HotPoolService implements OnModuleInit {
       reservedPercent,
       reservedMib,
       totalLimitMib: totalLimit,
+      totalClaims: this.totalClaims,
+      lastClaimedAt: this.lastClaimedAt
+        ? this.lastClaimedAt.toISOString()
+        : null,
     };
   }
 

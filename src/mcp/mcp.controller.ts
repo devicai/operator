@@ -139,13 +139,19 @@ export class McpController implements OnModuleInit {
     }
 
     const profileId = session.profile?.profile.defaultSandboxProfileId;
+    // Lazy-create only diverges from the hot pool snapshot when the MCP
+    // profile pins a specific sandbox profile. With no profileId the default
+    // image/cpus/memory line up with the snapshot, so reaching for the pool
+    // is safe — fallback to fresh create is automatic if it's empty.
+    const useHotPool = !profileId;
     const sandbox = await this.sandboxesService.create(
-      { profileId, bindingId: session.bindingId ?? undefined },
+      { profileId, bindingId: session.bindingId ?? undefined, useHotPool },
       scope,
     );
     session.sandboxId = sandbox.sandboxId;
+    const fromHot = (sandbox.metadata as any)?.hotPool === true;
     this.logger.debug(
-      `[mcp:${toolName}] created sandbox ${sandbox.sandboxId} on first tool call (binding=${session.bindingId ?? '-'})`,
+      `[mcp:${toolName}] ${fromHot ? 'claimed hot' : 'created'} sandbox ${sandbox.sandboxId} on first tool call (binding=${session.bindingId ?? '-'})`,
     );
     return sandbox.sandboxId;
   }
@@ -163,15 +169,21 @@ export class McpController implements OnModuleInit {
     if (this.canUseTool(resolved, 'create_sandbox', true)) {
       server.tool(
         'create_sandbox',
-        'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass `bindingId` for cross-session resolution or `force: true` to always allocate a fresh sandbox.',
+        'Create a new sandbox environment or reuse an existing one. Without arguments returns the session-bound sandbox if one already exists; pass `bindingId` for cross-session resolution or `force: true` to always allocate a fresh sandbox. Hot pool is used by default when no incompatible override (image/profileId) is present — pass `useHotPool: false` to skip it.',
         {
           profileId: z.string().optional().describe('Sandbox profile ID'),
           bindingId: z.string().optional().describe('External binding ID — reuses or creates a sandbox keyed by this id'),
           image: z.string().optional().describe('Docker image'),
           ttlSeconds: z.number().optional().describe('TTL in seconds'),
           force: z.boolean().optional().describe('Create a fresh sandbox even if the session already has one bound'),
+          useHotPool: z
+            .boolean()
+            .optional()
+            .describe(
+              'Override hot pool resolution: true forces an attempt (falls back to fresh create), false skips it. Defaults to true unless image/profileId would diverge from the pool snapshot.',
+            ),
         } as any,
-        async ({ profileId, bindingId, image, ttlSeconds, force }: any) => {
+        async ({ profileId, bindingId, image, ttlSeconds, force, useHotPool }: any) => {
           try {
             const scope = {};
             let sandbox;
@@ -199,19 +211,29 @@ export class McpController implements OnModuleInit {
               }
             }
 
+            const effectiveProfileId =
+              profileId ?? session.profile?.profile.defaultSandboxProfileId;
+            // Hot pool only when nothing in the request would diverge from the
+            // snapshot (no custom image, no profile) unless the caller forces it.
+            const wantsHotPool =
+              useHotPool !== undefined
+                ? useHotPool
+                : !image && !effectiveProfileId;
+
             if (bindingId) {
               sandbox = await this.sandboxesService.getOrCreateByBinding(
                 bindingId,
-                profileId ?? session.profile?.profile.defaultSandboxProfileId,
+                effectiveProfileId,
                 scope,
               );
             } else {
               sandbox = await this.sandboxesService.create(
                 {
-                  profileId: profileId ?? session.profile?.profile.defaultSandboxProfileId,
+                  profileId: effectiveProfileId,
                   image,
                   ttlSeconds,
                   bindingId: session.bindingId ?? undefined,
+                  useHotPool: wantsHotPool,
                 },
                 scope,
               );
@@ -219,6 +241,7 @@ export class McpController implements OnModuleInit {
 
             session.sandboxId = sandbox.sandboxId;
 
+            const fromHot = (sandbox.metadata as any)?.hotPool === true;
             return {
               content: [{ type: 'text' as const, text: JSON.stringify({
                 sandboxId: sandbox.sandboxId,
@@ -228,6 +251,7 @@ export class McpController implements OnModuleInit {
                 ttlSeconds: sandbox.ttlSeconds,
                 expiresAt: sandbox.expiresAt,
                 reused: false,
+                fromHotPool: fromHot,
               }, null, 2) }],
             };
           } catch (error) {
