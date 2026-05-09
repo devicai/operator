@@ -14,6 +14,7 @@ import {
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   faArrowsRotate,
+  faBoltLightning,
   faCircleCheck,
   faCircleXmark,
   faFire,
@@ -22,6 +23,18 @@ import {
 import { useHotPoolStatus, useReconcileHotPool } from '../../hooks/useHotPool';
 
 const { Text } = Typography;
+
+function timeAgo(iso: string): string {
+  const ms = Date.now() - new Date(iso).getTime();
+  if (ms < 0) return 'just now';
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${sec}s ago`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${min}m ago`;
+  const h = Math.floor(min / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
 
 const HotPoolPanel: React.FC = () => {
   const { data, isLoading } = useHotPoolStatus();
@@ -112,6 +125,27 @@ const HotPoolPanel: React.FC = () => {
           value={metrics.current}
           suffix={`/ ${metrics.target}`}
           valueStyle={{ fontSize: 22 }}
+        />
+        <Statistic
+          title={
+            <Space size={4}>
+              <FontAwesomeIcon icon={faBoltLightning} />
+              <Tooltip title="Successful claims served by this process since boot. Resets on restart.">
+                <span>Claims served</span>
+              </Tooltip>
+            </Space>
+          }
+          value={metrics.totalClaims}
+          valueStyle={{ fontSize: 22 }}
+          suffix={
+            metrics.lastClaimedAt ? (
+              <Tooltip title={`Last claim: ${new Date(metrics.lastClaimedAt).toLocaleString()}`}>
+                <span style={{ fontSize: 11, opacity: 0.6, marginLeft: 6 }}>
+                  · last {timeAgo(metrics.lastClaimedAt)}
+                </span>
+              </Tooltip>
+            ) : undefined
+          }
         />
         <div style={{ minWidth: 220, flex: 1 }}>
           <Text style={{ fontSize: 12, opacity: 0.7 }}>
