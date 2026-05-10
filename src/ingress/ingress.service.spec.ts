@@ -23,6 +23,8 @@ describe('IngressService', () => {
     get: jest.fn(),
     remove: jest.fn(),
     getAddress: jest.fn(),
+    attachLocal: jest.fn(),
+    detachLocal: jest.fn(),
   };
 
   const buildConfig = (enabled: boolean): ModuleConfig =>
@@ -108,6 +110,32 @@ describe('IngressService', () => {
     const ttl = (registry.publish as jest.Mock).mock.calls[0][2] as number;
     expect(ttl).toBeGreaterThanOrEqual(120);
     expect(ttl).toBeLessThanOrEqual(120 + 60 + 5);
+  });
+
+  it('calls attachLocal before resolving the address on publish', async () => {
+    const order: string[] = [];
+    runtime.attachLocal.mockImplementationOnce(async () => {
+      order.push('attach');
+    });
+    runtime.getAddress.mockImplementationOnce(async () => {
+      order.push('getAddress');
+      return { host: 'h', port: 80 };
+    });
+    await service.publish({
+      sandboxId: 'sbx',
+      name: 'sandbox-sbx',
+      expiresAt: new Date(Date.now() + 1_000),
+    } as any);
+    expect(order).toEqual(['attach', 'getAddress']);
+  });
+
+  it('detaches the local container on unpublish', async () => {
+    await service.unpublish({
+      sandboxId: 'sbx',
+      subdomain: 'sbx',
+      name: 'sandbox-sbx',
+    } as any);
+    expect(runtime.detachLocal).toHaveBeenCalledWith('sandbox-sbx');
   });
 
   it('unpublish is a no-op when ingress is disabled', async () => {

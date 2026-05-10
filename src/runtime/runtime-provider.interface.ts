@@ -105,6 +105,21 @@ export interface RuntimeProvider {
     name: string,
     internalPort: number,
   ): Promise<SandboxAddress | null>;
+
+  /**
+   * Optional: ensure the calling process can reach this sandbox over the
+   * network. For Docker with per-sandbox networks, this connects the local
+   * (self) container to the sandbox's dedicated bridge so the proxy can
+   * route to the bridge IP. No-op for runtimes where reachability is given
+   * (e.g. microsandbox host-port forwarding) or when the calling process
+   * lives on the host directly.
+   */
+  attachLocal?(name: string): Promise<void>;
+
+  /**
+   * Optional: tear down whatever `attachLocal` set up. Idempotent.
+   */
+  detachLocal?(name: string): Promise<void>;
 }
 
 export const RUNTIME_PROVIDER = Symbol('RUNTIME_PROVIDER');

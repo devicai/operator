@@ -76,6 +76,18 @@ export class IngressService {
     if (!this.isEnabled()) return null;
     const cfg = this.requireConfig();
 
+    // Allow the runtime to make the sandbox reachable from this process
+    // (e.g. Docker connects the local container to the per-sandbox bridge).
+    if (this.runtime.attachLocal) {
+      try {
+        await this.runtime.attachLocal(sandbox.name);
+      } catch (err) {
+        this.logger.warn(
+          `attachLocal(${sandbox.name}) failed: ${(err as Error).message}`,
+        );
+      }
+    }
+
     const upstreamPort = sandbox.exposedHttpPort ?? cfg.defaultUpstreamPort;
     const address = await this.runtime.getAddress(sandbox.name, upstreamPort);
     if (!address) {
@@ -105,10 +117,21 @@ export class IngressService {
   }
 
   /** Remove a sandbox's subdomain entry. Idempotent. */
-  async unpublish(sandbox: Pick<SandboxDocument, 'sandboxId' | 'subdomain'>): Promise<void> {
+  async unpublish(
+    sandbox: Pick<SandboxDocument, 'sandboxId' | 'subdomain' | 'name'>,
+  ): Promise<void> {
     if (!this.isEnabled()) return;
     const subdomain = (sandbox.subdomain ?? sandbox.sandboxId).toLowerCase();
     await this.registry.unpublish(subdomain);
+    if (this.runtime.detachLocal && sandbox.name) {
+      try {
+        await this.runtime.detachLocal(sandbox.name);
+      } catch (err) {
+        this.logger.debug(
+          `detachLocal(${sandbox.name}) ignored: ${(err as Error).message}`,
+        );
+      }
+    }
     this.logger.log(`Unpublished sandbox ${sandbox.sandboxId} (${subdomain})`);
   }
 

@@ -7,6 +7,7 @@ import {
   createWriteStream,
   existsSync,
   mkdirSync,
+  readFileSync,
   statSync,
 } from 'fs';
 import { basename, dirname } from 'path';
@@ -24,6 +25,14 @@ import {
   SandboxAddress,
 } from './runtime-provider.interface';
 
+/**
+ * Bridge network name for a per-sandbox isolated network. Used only when the
+ * public ingress feature is enabled, so each sandbox has its own L2 segment
+ * and cannot reach `app`, `mongo`, `redis`, the frontend or other sandboxes.
+ */
+const isolatedNetworkName = (sandboxName: string): string =>
+  `devic-${sandboxName}`;
+
 @Injectable()
 export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly logger = new Logger(DockerRuntimeProvider.name);
@@ -31,6 +40,8 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly runtime: string;
   private readonly defaultNetwork: string;
   private readonly hardening: Required<DockerHardeningConfig>;
+  private readonly ingressEnabled: boolean;
+  private readonly selfContainerId: string | null;
 
   constructor(@Inject(CONFIG) private readonly config: ModuleConfig) {
     const docker = config.runtime.docker;
@@ -46,6 +57,20 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       seccompProfile: docker?.hardening?.seccompProfile ?? 'default',
       pidsLimit: docker?.hardening?.pidsLimit ?? 512,
     };
+    this.ingressEnabled = Boolean(config.ingress?.enabled);
+    this.selfContainerId = detectSelfContainerId(this.logger);
+  }
+
+  /**
+   * Network the sandbox container will be attached to at create time. With
+   * ingress enabled, every allow-all sandbox gets its own bridge network so
+   * sandboxes are isolated from each other and from the rest of the stack.
+   * Without ingress, behaviour matches the previous default (shared bridge).
+   */
+  private networkFor(cfg: RuntimeSandboxConfig): string {
+    if (cfg.networkPolicy === 'deny-all') return 'none';
+    if (this.ingressEnabled) return isolatedNetworkName(cfg.name);
+    return this.defaultNetwork;
   }
 
   async create(cfg: RuntimeSandboxConfig): Promise<RuntimeSandbox> {
@@ -63,8 +88,13 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       }
     }
 
-    const networkMode =
-      cfg.networkPolicy === 'deny-all' ? 'none' : this.defaultNetwork;
+    const networkMode = this.networkFor(cfg);
+    if (
+      this.ingressEnabled &&
+      cfg.networkPolicy !== 'deny-all'
+    ) {
+      await this.ensureIsolatedNetwork(networkMode);
+    }
 
     const securityOpt: string[] = [];
     if (this.hardening.noNewPrivileges) {
@@ -143,8 +173,103 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       const container = this.docker.getContainer(name);
       await container.remove({ force: true, v: true });
     } catch (err: any) {
+      if (err.statusCode !== 404) {
+        this.logger.warn(`docker remove ${name} failed: ${err.message}`);
+      }
+    }
+    if (this.ingressEnabled) {
+      await this.removeIsolatedNetwork(isolatedNetworkName(name));
+    }
+  }
+
+  async attachLocal(name: string): Promise<void> {
+    if (!this.ingressEnabled || !this.selfContainerId) return;
+    const networkName = isolatedNetworkName(name);
+    try {
+      const network = this.docker.getNetwork(networkName);
+      await network.connect({ Container: this.selfContainerId });
+      this.logger.debug(
+        `Connected self container ${this.selfContainerId} to ${networkName}`,
+      );
+    } catch (err: any) {
+      // Status 403 from Docker means already connected — treat as no-op.
+      if (err.statusCode === 403) return;
+      if (err.statusCode === 404) {
+        this.logger.warn(
+          `Cannot attach to ${networkName}: network does not exist`,
+        );
+        return;
+      }
+      this.logger.warn(
+        `attachLocal(${name}) failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  async detachLocal(name: string): Promise<void> {
+    if (!this.ingressEnabled || !this.selfContainerId) return;
+    const networkName = isolatedNetworkName(name);
+    try {
+      const network = this.docker.getNetwork(networkName);
+      await network.disconnect({
+        Container: this.selfContainerId,
+        Force: true,
+      });
+    } catch (err: any) {
       if (err.statusCode === 404) return;
-      this.logger.warn(`docker remove ${name} failed: ${err.message}`);
+      // 403 = not connected; 500 with "is not connected" body — both benign.
+      if (err.statusCode === 403) return;
+      this.logger.debug(
+        `detachLocal(${name}) ignored: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private async ensureIsolatedNetwork(networkName: string): Promise<void> {
+    try {
+      await this.docker.getNetwork(networkName).inspect();
+      return;
+    } catch (err: any) {
+      if (err.statusCode !== 404) throw err;
+    }
+    try {
+      await this.docker.createNetwork({
+        Name: networkName,
+        Driver: 'bridge',
+        CheckDuplicate: true,
+        Internal: false,
+        Labels: {
+          'devic-sandbox.managed': 'true',
+        },
+      });
+    } catch (err: any) {
+      // Race: another concurrent create() raced us. Tolerate.
+      if (err.statusCode === 409) return;
+      throw err;
+    }
+  }
+
+  private async removeIsolatedNetwork(networkName: string): Promise<void> {
+    try {
+      const network = this.docker.getNetwork(networkName);
+      // Make sure no peers (e.g. self container) are still attached, otherwise
+      // the network will refuse to be removed.
+      if (this.selfContainerId) {
+        try {
+          await network.disconnect({
+            Container: this.selfContainerId,
+            Force: true,
+          });
+        } catch {
+          // Either already disconnected (403) or network gone (404). Ignored.
+        }
+      }
+      await network.remove();
+    } catch (err: any) {
+      if (err.statusCode === 404) return;
+      this.logger.debug(
+        `removeIsolatedNetwork(${networkName}) ignored: ${(err as Error).message}`,
+      );
     }
   }
 
@@ -166,7 +291,10 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     // network. The proxy reaches the container directly on its bridge IP, so
     // no host port-publishing is required for the ingress feature to work.
     const networks = info.NetworkSettings?.Networks ?? {};
-    const preferred = networks[this.defaultNetwork];
+    const preferredName = this.ingressEnabled
+      ? isolatedNetworkName(name)
+      : this.defaultNetwork;
+    const preferred = networks[preferredName];
     const ip =
       preferred?.IPAddress ||
       Object.values(networks)
@@ -216,6 +344,33 @@ function mapStatus(s: string): RuntimeStatus {
 
 function shellEscape(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Best-effort detection of the container the devic-sandbox process itself is
+ * running in. Used to attach `app` to a sandbox's isolated bridge so the
+ * embedded ingress proxy can route to it.
+ *
+ * Resolution order:
+ *   1. `DEVIC_SANDBOX_SELF_CONTAINER` env var (operator override).
+ *   2. `/etc/hostname` when its first 12 chars match a Docker short ID.
+ *
+ * Returns null when neither is available — the proxy then falls back to
+ * relying on host-routable bridge IPs (works on bare-metal dev setups).
+ */
+function detectSelfContainerId(logger: Logger): string | null {
+  const envId = process.env.DEVIC_SANDBOX_SELF_CONTAINER;
+  if (envId && envId.trim()) return envId.trim();
+  try {
+    const hostname = readFileSync('/etc/hostname', 'utf-8').trim();
+    if (/^[0-9a-f]{12,64}$/i.test(hostname)) return hostname;
+  } catch {
+    // /etc/hostname unreadable (unusual but harmless on dev hosts).
+  }
+  logger.debug(
+    'Could not detect self container ID; per-sandbox network attach will be skipped',
+  );
+  return null;
 }
 
 class DockerSandbox implements RuntimeSandbox {

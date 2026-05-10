@@ -87,15 +87,23 @@ hotPool:
 # An embedded reverse proxy listens on `proxyPort` and routes by Host header
 # to the sandbox's internal HTTP port (`defaultUpstreamPort`, default 80).
 #
+# Security model:
+#   When ingress is enabled and runtime.type=docker, every sandbox runs on
+#   its own bridge network (`devic-<sandboxName>`) — sandboxes cannot reach
+#   each other, mongo, redis or the api server. The `app` container is
+#   transparently connected to each sandbox's bridge at publish time and
+#   disconnected at unpublish, so only the proxy can route to them.
+#
+#   To do this `app` must be able to identify itself in Docker. By default
+#   it reads `/etc/hostname` (Docker writes the container short ID there).
+#   Override with the env var `DEVIC_SANDBOX_SELF_CONTAINER` if your
+#   deployment changes the hostname (e.g. behind kubernetes).
+#
 # Operator responsibilities:
 #   1. DNS: a wildcard A/AAAA record `*.<wildcardDomain>` pointing to this host.
 #   2. TLS: terminated upstream (Cloudflare / CDN / external LB). The proxy
 #      itself only speaks HTTP — never expose `proxyPort` directly to the
 #      internet without a TLS-terminating reverse proxy in front.
-#   3. Network reachability: when runtime.type=docker, this process must be
-#      able to reach the sandbox containers on their bridge IP. The simplest
-#      setup is to put `app` in `network_mode: bridge` (or share the same
-#      compose network as the sandboxes via runtime.docker.network).
 ingress:
   enabled: false
   wildcardDomain: sandbox.devic.ai
