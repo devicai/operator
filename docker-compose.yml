@@ -3,6 +3,9 @@ services:
     build: .
     ports:
       - "127.0.0.1:${PORT:-3200}:3200"
+      # Public ingress proxy (routes <id>.sandbox.devic.ai to running sandboxes).
+      # Bound to localhost; Caddy on the host terminates TLS and forwards here.
+      - "127.0.0.1:${INGRESS_PORT:-3201}:8080"
     volumes:
       - ./config.yml:/app/config.yml:ro
       - snapshots-data:/root/.devic-sandbox/snapshots

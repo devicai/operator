@@ -97,7 +97,7 @@ export class IngressService {
       return null;
     }
 
-    const subdomain = sandbox.sandboxId.toLowerCase();
+    const subdomain = toDnsLabel(sandbox.sandboxId);
     const entry: IngressEntry = {
       sandboxId: sandbox.sandboxId,
       upstreamHost: address.host,
@@ -121,7 +121,7 @@ export class IngressService {
     sandbox: Pick<SandboxDocument, 'sandboxId' | 'subdomain' | 'name'>,
   ): Promise<void> {
     if (!this.isEnabled()) return;
-    const subdomain = (sandbox.subdomain ?? sandbox.sandboxId).toLowerCase();
+    const subdomain = sandbox.subdomain ?? toDnsLabel(sandbox.sandboxId);
     await this.registry.unpublish(subdomain);
     if (this.runtime.detachLocal && sandbox.name) {
       try {
@@ -160,4 +160,22 @@ export class IngressService {
     if (remainingMs <= 0) return 60;
     return Math.min(maxTtl, Math.ceil(remainingMs / 1000) + 60);
   }
+}
+
+/**
+ * Turn a sandboxId into a valid DNS label. nanoid's URL-safe alphabet
+ * includes `-` and `_`, but RFC 952/1123 forbid labels that start or end
+ * with a hyphen, and most resolvers (libc getaddrinfo, browsers) refuse
+ * such hostnames even if the authoritative DNS would return an answer.
+ *
+ * - Lowercases the id.
+ * - Replaces `_` with `-` (underscore is invalid in hostnames at all).
+ * - Prefixes `s-` if the result would otherwise start with `-`.
+ * - Suffixes `-x` if it would otherwise end with `-`.
+ */
+function toDnsLabel(sandboxId: string): string {
+  let label = sandboxId.toLowerCase().replace(/_/g, '-');
+  if (label.startsWith('-')) label = `s${label}`;
+  if (label.endsWith('-')) label = `${label}x`;
+  return label;
 }

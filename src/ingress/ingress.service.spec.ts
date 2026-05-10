@@ -78,6 +78,23 @@ describe('IngressService', () => {
     );
   });
 
+  it.each([
+    { id: '-pUsem7mCwab', expected: 's-pusem7mcwab' },
+    { id: '_abc123', expected: 's-abc123' },
+    { id: 'foo_bar-baz', expected: 'foo-bar-baz' },
+    { id: 'trailing-', expected: 'trailing-x' },
+  ])('sanitizes sandboxId $id into a valid DNS label ($expected)', async ({ id, expected }) => {
+    runtime.getAddress.mockResolvedValueOnce({ host: '10.0.0.1', port: 80 });
+    const result = await service.publish({
+      sandboxId: id,
+      name: `sandbox-${id}`,
+      exposedHttpPort: undefined,
+      expiresAt: new Date(Date.now() + 60_000),
+    } as any);
+    expect(result?.subdomain).toBe(expected);
+    expect(result?.publicUrl).toBe(`https://${expected}.sandbox.devic.test`);
+  });
+
   it('uses exposedHttpPort when defined', async () => {
     runtime.getAddress.mockResolvedValueOnce({ host: 'h', port: 3000 });
     await service.publish({
