@@ -205,6 +205,7 @@ export class McpController implements OnModuleInit {
                     workdir: existing.workdir,
                     ttlSeconds: existing.ttlSeconds,
                     expiresAt: existing.expiresAt,
+                    publicUrl: existing.publicUrl,
                     reused: true,
                   }, null, 2) }],
                 };
@@ -250,6 +251,7 @@ export class McpController implements OnModuleInit {
                 workdir: sandbox.workdir,
                 ttlSeconds: sandbox.ttlSeconds,
                 expiresAt: sandbox.expiresAt,
+                publicUrl: sandbox.publicUrl,
                 reused: false,
                 fromHotPool: fromHot,
               }, null, 2) }],
