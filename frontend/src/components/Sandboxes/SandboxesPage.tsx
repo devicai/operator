@@ -18,6 +18,7 @@ import {
   faStop,
   faTerminal,
   faTrash,
+  faUpRightFromSquare,
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
@@ -118,6 +119,22 @@ const SandboxesPage: React.FC = () => {
                 <Tag color="volcano" style={{ fontSize: 10, marginLeft: 6 }}>
                   FROM POOL
                 </Tag>
+              </Tooltip>
+            )}
+            {row.publicUrl && row.status === 'running' && (
+              <Tooltip title={`Public URL → forwards to :${row.exposedHttpPort ?? 80} inside the sandbox`}>
+                <a
+                  href={row.publicUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  style={{ marginLeft: 6, fontSize: 11 }}
+                >
+                  <FontAwesomeIcon
+                    icon={faUpRightFromSquare}
+                    style={{ marginRight: 4 }}
+                  />
+                  {row.publicUrl.replace(/^https?:\/\//, '')}
+                </a>
               </Tooltip>
             )}
             {row.bindingId && (

@@ -20,6 +20,10 @@ export interface SandboxDto {
   recentCommands: string[];
   bindingId?: string;
   hotReserved?: boolean;
+  exposedHttpPort?: number;
+  subdomain?: string;
+  publicUrl?: string;
+  internalEndpoint?: string;
   metadata: Record<string, any>;
   createdAt: string;
   updatedAt: string;
