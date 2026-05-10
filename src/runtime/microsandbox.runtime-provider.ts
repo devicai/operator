@@ -14,6 +14,7 @@ import {
   RuntimeSandbox,
   RuntimeSandboxConfig,
   RuntimeStatus,
+  SandboxAddress,
 } from './runtime-provider.interface';
 
 // The microsandbox SDK is loaded lazily so this module can be imported on hosts
@@ -29,6 +30,14 @@ function sdk(): MicrosandboxSdk {
 @Injectable()
 export class MicrosandboxRuntimeProvider implements RuntimeProvider {
   private readonly logger = new Logger(MicrosandboxRuntimeProvider.name);
+
+  /**
+   * In-memory record of the host-port → guest-port forwarding declared at
+   * `create()` time, keyed by sandbox name. The microsandbox SDK does not
+   * expose a way to query this after the fact, so we keep it ourselves to
+   * implement `getAddress`. Cleared on `remove`.
+   */
+  private readonly portMappings = new Map<string, Record<string, number>>();
 
   async create(cfg: RuntimeSandboxConfig): Promise<RuntimeSandbox> {
     const msbConfig: SandboxConfig = {
@@ -52,6 +61,7 @@ export class MicrosandboxRuntimeProvider implements RuntimeProvider {
       for (const [k, v] of Object.entries(cfg.ports)) {
         msbConfig.ports[k] = v;
       }
+      this.portMappings.set(cfg.name, { ...cfg.ports });
     }
 
     const instance = await sdk().Sandbox.create(msbConfig);
@@ -89,7 +99,38 @@ export class MicrosandboxRuntimeProvider implements RuntimeProvider {
       this.logger.warn(
         `microsandbox.remove(${name}) failed: ${(err as Error).message}`,
       );
+    } finally {
+      this.portMappings.delete(name);
     }
+  }
+
+  async getAddress(
+    name: string,
+    internalPort: number,
+  ): Promise<SandboxAddress | null> {
+    const mapping = this.portMappings.get(name);
+    if (!mapping) return null;
+    // microsandbox forwards `hostPort` on the host to `guestPort` inside the
+    // microVM, so we look up which host port (key) maps to the requested
+    // internal/guest port (value).
+    const hostPortStr = Object.entries(mapping).find(
+      ([, guest]) => Number(guest) === internalPort,
+    )?.[0];
+    if (!hostPortStr) return null;
+    const port = Number(hostPortStr);
+    if (!Number.isFinite(port)) return null;
+    return { host: '127.0.0.1', port };
+  }
+
+  /**
+   * Re-register a known host-port → guest-port mapping for an existing
+   * microsandbox instance. Used when `getAddress` is called after the runtime
+   * provider has been restarted (the in-memory mapping is gone) but the
+   * caller still has the original port mapping persisted alongside the
+   * sandbox doc.
+   */
+  rememberPortMapping(name: string, ports: Record<string, number>): void {
+    this.portMappings.set(name, { ...ports });
   }
 }
 

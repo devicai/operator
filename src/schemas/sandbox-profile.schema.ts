@@ -47,6 +47,16 @@ export class SandboxProfile {
   @ApiProperty()
   @Prop({ default: 'allow-all' })
   networkPolicy: string;
+
+  @ApiProperty({
+    description:
+      'Port inside the sandbox that the public ingress reverse proxy forwards ' +
+      'HTTP traffic to. Defaults to ingress.defaultUpstreamPort (typically 80) ' +
+      'when omitted. Ignored when ingress is disabled.',
+    required: false,
+  })
+  @Prop()
+  exposedHttpPort?: number;
 }
 
 export type SandboxProfileDocument = SandboxProfile & Document;
