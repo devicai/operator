@@ -72,4 +72,16 @@ export class CreateSandboxDto {
   @IsOptional()
   @IsBoolean()
   useHotPool?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Port inside the sandbox the public ingress proxy should forward HTTP ' +
+      'traffic to. Only used when ingress is enabled. Defaults to ' +
+      'ingress.defaultUpstreamPort.',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(65535)
+  exposedHttpPort?: number;
 }

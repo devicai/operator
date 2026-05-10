@@ -11,6 +11,7 @@ export interface ModuleConfig {
   logging: LoggingConfig;
   resourceLimits?: ResourceLimitsConfig;
   hotPool?: HotPoolConfig;
+  ingress?: IngressConfig;
 }
 
 export interface ServerConfig {
@@ -156,4 +157,45 @@ export interface HotPoolConfig {
   targetSize?: number;
   /** Reconcile cadence in milliseconds. */
   reconcileIntervalMs?: number;
+}
+
+/**
+ * Public ingress: expose each running sandbox at <sandboxId>.<wildcardDomain>.
+ * The module runs an embedded HTTP reverse proxy that resolves the Host header
+ * to a sandbox upstream and forwards the request. TLS is expected to be
+ * terminated upstream (Cloudflare / CDN / external LB).
+ */
+export interface IngressConfig {
+  /** Master switch. When false, sandboxes are never published. */
+  enabled: boolean;
+  /**
+   * Domain under which sandboxes are exposed. Public URLs become
+   * `<sandboxId>.<wildcardDomain>` (e.g. `abc123.sandbox.devic.ai`).
+   * The operator is responsible for the wildcard DNS record + TLS at the edge.
+   */
+  wildcardDomain: string;
+  /**
+   * Public scheme used to render `publicUrl` for callers. Defaults to `https`
+   * since TLS termination is expected upstream.
+   */
+  publicScheme?: 'http' | 'https';
+  /** Port the embedded reverse proxy listens on. Default 8080. */
+  proxyPort?: number;
+  /** Bind address for the proxy listener. Default '0.0.0.0'. */
+  proxyHost?: string;
+  /**
+   * Default port inside the sandbox to forward HTTP traffic to. Each sandbox
+   * may override this via its own `exposedHttpPort`. Default 80.
+   */
+  defaultUpstreamPort?: number;
+  /**
+   * Per-request upstream timeout (ms). Default 30000.
+   */
+  upstreamTimeoutMs?: number;
+  /**
+   * Max upstream cache TTL (s) for the subdomain → endpoint mapping in Redis.
+   * Refreshed each time a sandbox publishes. Default: derived from sandbox
+   * `expiresAt`, capped at 24h.
+   */
+  registryMaxTtlSeconds?: number;
 }

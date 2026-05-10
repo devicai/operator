@@ -21,6 +21,7 @@ import {
   RuntimeSandbox,
   RuntimeSandboxConfig,
   RuntimeStatus,
+  SandboxAddress,
 } from './runtime-provider.interface';
 
 @Injectable()
@@ -145,6 +146,34 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       if (err.statusCode === 404) return;
       this.logger.warn(`docker remove ${name} failed: ${err.message}`);
     }
+  }
+
+  async getAddress(
+    name: string,
+    internalPort: number,
+  ): Promise<SandboxAddress | null> {
+    const container = this.docker.getContainer(name);
+    let info: Docker.ContainerInspectInfo;
+    try {
+      info = await container.inspect();
+    } catch (err: any) {
+      if (err.statusCode === 404) return null;
+      throw err;
+    }
+    if (info.State.Status !== 'running') return null;
+
+    // Prefer the IP on the configured network, fall back to the first attached
+    // network. The proxy reaches the container directly on its bridge IP, so
+    // no host port-publishing is required for the ingress feature to work.
+    const networks = info.NetworkSettings?.Networks ?? {};
+    const preferred = networks[this.defaultNetwork];
+    const ip =
+      preferred?.IPAddress ||
+      Object.values(networks)
+        .map((n) => n?.IPAddress)
+        .find(Boolean);
+    if (!ip) return null;
+    return { host: ip, port: internalPort };
   }
 
   private async removeIfExists(name: string): Promise<void> {

@@ -90,6 +90,44 @@ export class Sandbox {
   @Prop({ default: false, index: true })
   hotReserved: boolean;
 
+  @ApiProperty({
+    description:
+      'Port inside the sandbox that the ingress proxy forwards HTTP traffic ' +
+      'to. Falls back to ingress.defaultUpstreamPort when not set.',
+    required: false,
+  })
+  @Prop()
+  exposedHttpPort?: number;
+
+  @ApiProperty({
+    description:
+      'Subdomain assigned to the sandbox under ingress.wildcardDomain. ' +
+      'Set only when ingress is enabled and the sandbox is published. ' +
+      'Currently equals sandboxId; reserved as a separate field so future ' +
+      'releases can assign a different label without changing sandboxId.',
+    required: false,
+  })
+  @Prop({ index: true, sparse: true })
+  subdomain?: string;
+
+  @ApiProperty({
+    description:
+      'Public URL at which the sandbox is reachable while it is in the RUNNING ' +
+      'state and ingress is enabled. Cleared on stop / destroy.',
+    required: false,
+  })
+  @Prop()
+  publicUrl?: string;
+
+  @ApiProperty({
+    description:
+      'Internal endpoint (host:port) the proxy uses to reach this sandbox. ' +
+      'Format depends on the runtime (Docker bridge IP, microsandbox host port).',
+    required: false,
+  })
+  @Prop()
+  internalEndpoint?: string;
+
   @ApiProperty()
   @Prop({ type: Object, default: {} })
   metadata: Record<string, any>;

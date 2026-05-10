@@ -75,6 +75,17 @@ export interface RuntimeHandle {
   start(): Promise<RuntimeSandbox>;
 }
 
+/**
+ * Network endpoint at which the calling process can reach a sandbox over TCP.
+ * Returned by `RuntimeProvider.getAddress` and used by the public ingress proxy.
+ */
+export interface SandboxAddress {
+  /** Host or IP reachable from the devic-sandbox process. */
+  host: string;
+  /** TCP port reachable at `host`. */
+  port: number;
+}
+
 export interface RuntimeProvider {
   /** Create + start a new sandbox. The returned object is already running. */
   create(config: RuntimeSandboxConfig): Promise<RuntimeSandbox>;
@@ -84,6 +95,16 @@ export interface RuntimeProvider {
 
   /** Permanently delete a sandbox and reclaim its resources. Idempotent. */
   remove(name: string): Promise<void>;
+
+  /**
+   * Resolve a TCP endpoint reachable from this process for the given sandbox
+   * and an internal port (the port a service inside the sandbox listens on).
+   * Returns null if the sandbox does not exist or the port is not reachable.
+   */
+  getAddress(
+    name: string,
+    internalPort: number,
+  ): Promise<SandboxAddress | null>;
 }
 
 export const RUNTIME_PROVIDER = Symbol('RUNTIME_PROVIDER');

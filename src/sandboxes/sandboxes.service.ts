@@ -1,4 +1,5 @@
 import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef, Optional } from '@nestjs/common';
+import * as net from 'net';
 import { nanoid } from 'nanoid';
 import { SandboxRegistry } from './sandbox-registry';
 import { SandboxRepository } from '../repositories/sandbox.repository';
@@ -12,6 +13,7 @@ import { RunCommandDto } from './dto/run-command.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import { HotPoolService } from '../hot-pool/hot-pool.service';
+import { IngressService } from '../ingress/ingress.service';
 import {
   RUNTIME_PROVIDER,
   RuntimeProvider,
@@ -33,6 +35,7 @@ export class SandboxesService {
     private readonly snapshotsService: SnapshotsService,
     private readonly resourceUsage: ResourceUsageService,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+    @Optional() private readonly ingressService?: IngressService,
     @Optional()
     @Inject(forwardRef(() => HotPoolService))
     private readonly hotPool?: HotPoolService,
@@ -48,7 +51,7 @@ export class SandboxesService {
         this.logger.log(
           `Sandbox ${claimed.sandboxId} served from hot pool (binding=${dto.bindingId ?? '-'})`,
         );
-        return claimed;
+        return await this.publishIfEnabled(claimed, scope);
       } catch (err) {
         this.logger.warn(
           `Hot pool claim failed, falling back to fresh create: ${(err as Error).message}`,
@@ -67,6 +70,7 @@ export class SandboxesService {
     let ports = dto.ports ?? {};
     let ttlSeconds = dto.ttlSeconds ?? defaults.defaultTtlSeconds;
     let networkPolicy = dto.networkPolicy ?? 'allow-all';
+    let exposedHttpPort = dto.exposedHttpPort;
 
     if (dto.profileId) {
       const profile = await this.profileRepo.findById(dto.profileId, scope);
@@ -81,10 +85,31 @@ export class SandboxesService {
       ports = { ...(profile.ports ?? {}), ...(dto.ports ?? {}) };
       ttlSeconds = dto.ttlSeconds ?? profile.ttlSeconds ?? ttlSeconds;
       networkPolicy = dto.networkPolicy ?? profile.networkPolicy ?? networkPolicy;
+      exposedHttpPort =
+        dto.exposedHttpPort ?? profile.exposedHttpPort ?? exposedHttpPort;
     }
 
     if (ttlSeconds > defaults.maxTtlSeconds) {
       ttlSeconds = defaults.maxTtlSeconds;
+    }
+
+    // When ingress is enabled and the runtime is microsandbox, the public
+    // proxy reaches the sandbox over a forwarded host port. Reserve a free
+    // ephemeral port now and add it to the port mapping so the SDK forwards
+    // the upstream HTTP port from the microVM out to localhost.
+    if (
+      this.ingressService?.isEnabled() &&
+      this.config.runtime.type === 'microsandbox'
+    ) {
+      const upstreamPort =
+        exposedHttpPort ?? this.config.ingress?.defaultUpstreamPort ?? 80;
+      const alreadyMapped = Object.values(ports).some(
+        (guest) => Number(guest) === upstreamPort,
+      );
+      if (!alreadyMapped) {
+        const hostPort = await this.findFreeHostPort();
+        ports = { ...ports, [String(hostPort)]: upstreamPort };
+      }
     }
 
     await this.resourceUsage.assertMemoryAvailable(memoryMib);
@@ -109,6 +134,7 @@ export class SandboxesService {
         ttlSeconds,
         expiresAt,
         bindingId: dto.bindingId,
+        exposedHttpPort,
         commandCount: 0,
         recentCommands: [],
         metadata: {},
@@ -153,7 +179,7 @@ export class SandboxesService {
       );
 
       const updated = await this.sandboxRepo.findById((doc as any)._id.toString(), scope);
-      return updated!;
+      return await this.publishIfEnabled(updated!, scope);
     } catch (err) {
       await this.sandboxRepo.updateById(
         (doc as any)._id.toString(),
@@ -329,9 +355,23 @@ export class SandboxesService {
     }
 
     await this.registry.remove(doc.sandboxId);
+
+    if (this.ingressService?.isEnabled()) {
+      try {
+        await this.ingressService.unpublish(doc);
+      } catch (err) {
+        this.logger.warn(
+          `Ingress unpublish failed for ${doc.sandboxId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
-      { $set: { status: SandboxStatus.STOPPED } },
+      {
+        $set: { status: SandboxStatus.STOPPED },
+        $unset: { publicUrl: '', internalEndpoint: '' },
+      },
       scope,
     );
     return updated!;
@@ -344,6 +384,16 @@ export class SandboxesService {
       await this.runtime.remove(doc.name);
     } catch (err) {
       this.logger.warn(`Error removing sandbox ${doc.sandboxId}: ${(err as Error).message}`);
+    }
+
+    if (this.ingressService?.isEnabled()) {
+      try {
+        await this.ingressService.unpublish(doc);
+      } catch (err) {
+        this.logger.warn(
+          `Ingress unpublish failed for ${doc.sandboxId}: ${(err as Error).message}`,
+        );
+      }
     }
 
     await this.registry.remove(doc.sandboxId);
@@ -378,6 +428,17 @@ export class SandboxesService {
       { $set: { expiresAt: newExpiresAt } },
       scope,
     );
+
+    if (this.ingressService?.isEnabled() && updated?.subdomain) {
+      try {
+        await this.ingressService.refreshTtl(updated);
+      } catch (err) {
+        this.logger.warn(
+          `Ingress TTL refresh failed for ${doc.sandboxId}: ${(err as Error).message}`,
+        );
+      }
+    }
+
     return updated!;
   }
 
@@ -395,7 +456,69 @@ export class SandboxesService {
       commandCount: doc.commandCount,
       remainingSeconds: Math.floor(remainingMs / 1000),
       expiresAt: doc.expiresAt,
+      publicUrl: doc.publicUrl,
       createdAt: (doc as any).createdAt,
     };
+  }
+
+  /**
+   * Publish the sandbox under its public subdomain when ingress is enabled,
+   * persist the resulting URL on the doc and return the refreshed document.
+   * No-op (returns the input) when ingress is disabled or publish fails.
+   */
+  private async publishIfEnabled(
+    sandbox: SandboxDocument,
+    scope: ExtensionScope,
+  ): Promise<SandboxDocument> {
+    if (!this.ingressService?.isEnabled()) return sandbox;
+    try {
+      const result = await this.ingressService.publish(sandbox);
+      if (!result) return sandbox;
+      await this.sandboxRepo.updateById(
+        (sandbox as any)._id.toString(),
+        {
+          $set: {
+            subdomain: result.subdomain,
+            publicUrl: result.publicUrl,
+            internalEndpoint: result.internalEndpoint,
+          },
+        },
+        scope,
+      );
+      const refreshed = await this.sandboxRepo.findById(
+        (sandbox as any)._id.toString(),
+        scope,
+      );
+      return refreshed ?? sandbox;
+    } catch (err) {
+      this.logger.warn(
+        `Ingress publish failed for ${sandbox.sandboxId}: ${(err as Error).message}`,
+      );
+      return sandbox;
+    }
+  }
+
+  /**
+   * Bind to port 0 on loopback to let the kernel pick a free TCP port, then
+   * release it. The chosen number can race with another process taking the
+   * same port between this call and the actual bind by the runtime, but in
+   * practice the window is short enough to be acceptable for a dev/staging
+   * sandbox host. Used only to back the microsandbox host-port forwarding.
+   */
+  private async findFreeHostPort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (!addr || typeof addr === 'string') {
+          srv.close(() => reject(new Error('Failed to allocate ephemeral port')));
+          return;
+        }
+        const port = addr.port;
+        srv.close((err) => (err ? reject(err) : resolve(port)));
+      });
+    });
   }
 }

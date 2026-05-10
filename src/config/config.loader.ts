@@ -90,6 +90,24 @@ export function loadConfig(configPath?: string): ModuleConfig {
     ...(resolved.hotPool ?? {}),
   };
 
+  if (resolved.ingress?.enabled) {
+    if (!resolved.ingress.wildcardDomain) {
+      throw new Error(
+        'ingress.enabled=true but ingress.wildcardDomain is missing. ' +
+          'Set it to the wildcard domain you control (e.g. sandbox.devic.ai).',
+      );
+    }
+    resolved.ingress = {
+      publicScheme: 'https',
+      proxyPort: 8080,
+      proxyHost: '0.0.0.0',
+      defaultUpstreamPort: 80,
+      upstreamTimeoutMs: 30000,
+      registryMaxTtlSeconds: 24 * 60 * 60,
+      ...resolved.ingress,
+    };
+  }
+
   return resolved;
 }
 

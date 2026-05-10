@@ -24,6 +24,7 @@ import { McpModule } from './mcp/mcp.module';
 import { TerminalModule } from './terminal/terminal.module';
 import { RuntimeModule } from './runtime/runtime.module';
 import { HotPoolModule } from './hot-pool/hot-pool.module';
+import { IngressModule } from './ingress/ingress.module';
 
 const config = loadConfig();
 
@@ -50,6 +51,7 @@ applyExtensions(SnapshotSchema, 'Snapshot', config.extensions.properties);
     McpModule,
     TerminalModule,
     HotPoolModule,
+    IngressModule,
   ],
   controllers: [HealthController, UsageController],
   providers: [
