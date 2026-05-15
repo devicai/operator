@@ -123,15 +123,23 @@ export class SnapshotsService {
         `Creating snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
       );
 
+      // No `--warning=no-file-changed`: that flag is GNU-only and busybox tar
+      // (alpine et al.) treats it as an unrecognized option, prints usage to
+      // stderr and silently produces no archive — leaving copyToHost to fail
+      // with a confusing "no such file" 404. GNU tar emits the mtime-changed
+      // warning to stderr instead, which is harmless; the archive is still
+      // valid and the code-1 exit it triggers is tolerated below.
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --warning=no-file-changed --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} . && [ -s ${guestTarPath} ]`,
       );
 
-      // tar exits 1 when it emits warnings (e.g. directory mtime bumped while
-      // we wrote the staged tarball into it). The archive itself is still
-      // valid; only fatal errors (code >= 2) should abort the snapshot.
+      // Code 1 is tolerated (GNU tar's "file changed as we read it" warning).
+      // Higher codes mean a real tar failure OR the trailing `[ -s … ]` check
+      // tripped, i.e. tar swallowed an incompatible flag and produced nothing.
       if (tarResult.code >= 2) {
-        throw new Error(`tar failed: ${tarResult.stderr}`);
+        throw new Error(
+          `Snapshot archive not produced (tar code=${tarResult.code}): ${tarResult.stderr || tarResult.stdout}`,
+        );
       }
 
       await sandbox.copyToHost(guestTarPath, snapshotPath);
@@ -404,12 +412,16 @@ export class SnapshotsService {
       }
       const sandbox = await handle.connect();
 
+      // See snapshot create for the rationale on dropping --warning and on
+      // verifying the archive exists post-tar.
       const tarResult = await sandbox.exec(
-        `tar czf ${guestTarPath} --warning=no-file-changed --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} .`,
+        `tar czf ${guestTarPath} --exclude='./.devic-runtime-*' -C ${sandboxDoc.workdir} . && [ -s ${guestTarPath} ]`,
       );
 
       if (tarResult.code >= 2) {
-        this.logger.error(`Persist tar failed: ${tarResult.stderr}`);
+        this.logger.error(
+          `Persist tar failed (code=${tarResult.code}): ${tarResult.stderr || tarResult.stdout}`,
+        );
         return;
       }
 
