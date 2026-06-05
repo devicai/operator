@@ -1,4 +1,7 @@
 import { PassThrough } from 'stream';
+import { mkdtempSync, writeFileSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { Test, TestingModule } from '@nestjs/testing';
 import { CONFIG } from '../config/config.loader';
 import { ModuleConfig } from '../config/config.types';
@@ -9,6 +12,7 @@ const getContainer = jest.fn();
 const getImage = jest.fn();
 const pull = jest.fn();
 const followProgress = jest.fn();
+const info = jest.fn();
 
 jest.mock('dockerode', () => {
   return jest.fn().mockImplementation(() => ({
@@ -16,6 +20,7 @@ jest.mock('dockerode', () => {
     getContainer,
     getImage,
     pull,
+    info,
     modem: { followProgress },
   }));
 });
@@ -90,6 +95,10 @@ describe('DockerRuntimeProvider', () => {
     getImage.mockReset();
     pull.mockReset();
     followProgress.mockReset();
+    info.mockReset();
+    // Default: daemon reports no AppArmor support, so the explicit profile is
+    // skipped unless a test opts in.
+    info.mockResolvedValue({ SecurityOptions: ['name=seccomp'] });
   });
 
   describe('create', () => {
@@ -137,7 +146,7 @@ describe('DockerRuntimeProvider', () => {
       expect(opts.HostConfig.NanoCpus).toBe(2_000_000_000);
       expect(opts.HostConfig.NetworkMode).toBe('bridge');
       expect(opts.HostConfig.PortBindings).toEqual({
-        '3000/tcp': [{ HostPort: '8080' }],
+        '3000/tcp': [{ HostPort: '8080', HostIp: '127.0.0.1' }],
       });
       expect(opts.HostConfig.CapDrop).toEqual(['ALL']);
       expect(opts.HostConfig.SecurityOpt).toContain('no-new-privileges:true');
@@ -181,10 +190,9 @@ describe('DockerRuntimeProvider', () => {
       expect(createContainer.mock.calls[0][0].HostConfig.NetworkMode).toBe('none');
     });
 
-    it('respects hardening.readOnlyRootfs and hardening.seccompProfile', async () => {
-      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+    function execableContainer() {
       const fake = fakeContainer();
-      const containerWithExec: any = {
+      return {
         ...fake,
         exec: jest.fn().mockResolvedValue({
           start: jest.fn().mockResolvedValue({
@@ -198,9 +206,20 @@ describe('DockerRuntimeProvider', () => {
           inspect: jest.fn().mockResolvedValue({ ExitCode: 0 }),
         }),
         modem: { demuxStream: jest.fn() },
-      };
-      createContainer.mockResolvedValue(containerWithExec);
+      } as any;
+    }
+
+    it('respects hardening.readOnlyRootfs and inlines a seccomp profile file', async () => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+      createContainer.mockResolvedValue(execableContainer());
       getContainer.mockReturnValue({ inspect: jest.fn().mockRejectedValue({ statusCode: 404 }) });
+
+      // The Docker API expects the profile's JSON content (not a path), so the
+      // provider reads the file and inlines it.
+      const dir = mkdtempSync(join(tmpdir(), 'seccomp-'));
+      const profilePath = join(dir, 'sec.json');
+      const profileJson = '{"defaultAction":"SCMP_ACT_ERRNO"}';
+      writeFileSync(profilePath, profileJson);
 
       const provider = await buildProvider(
         buildConfig({
@@ -212,7 +231,7 @@ describe('DockerRuntimeProvider', () => {
               dropAllCaps: false,
               noNewPrivileges: true,
               readOnlyRootfs: true,
-              seccompProfile: '/etc/docker/sec.json',
+              seccompProfile: profilePath,
               pidsLimit: 1024,
             },
           },
@@ -233,8 +252,96 @@ describe('DockerRuntimeProvider', () => {
       expect(opts.HostConfig.CapDrop).toBeUndefined();
       expect(opts.HostConfig.ReadonlyRootfs).toBe(true);
       expect(opts.HostConfig.SecurityOpt).toContain('no-new-privileges:true');
-      expect(opts.HostConfig.SecurityOpt).toContain('seccomp=/etc/docker/sec.json');
+      expect(opts.HostConfig.SecurityOpt).toContain(`seccomp=${profileJson}`);
       expect(opts.HostConfig.PidsLimit).toBe(1024);
+    });
+
+    it('applies an AppArmor profile and runAsUser when supported', async () => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+      createContainer.mockResolvedValue(execableContainer());
+      getContainer.mockReturnValue({ inspect: jest.fn().mockRejectedValue({ statusCode: 404 }) });
+      info.mockResolvedValue({ SecurityOptions: ['name=seccomp', 'name=apparmor'] });
+
+      const provider = await buildProvider(
+        buildConfig({
+          type: 'docker',
+          docker: {
+            runtime: 'sysbox-runc',
+            network: 'bridge',
+            hardening: {
+              dropAllCaps: true,
+              noNewPrivileges: true,
+              readOnlyRootfs: false,
+              seccompProfile: 'default',
+              apparmorProfile: 'docker-default',
+              runAsUser: '1000:1000',
+              pidsLimit: 512,
+            },
+          },
+        }),
+      );
+
+      await provider.create({
+        name: 'sandbox-aa',
+        image: 'node:24',
+        workdir: '/workspace',
+        cpus: 1,
+        memoryMib: 256,
+        env: {},
+      });
+
+      const opts = createContainer.mock.calls[0][0];
+      expect(opts.User).toBe('1000:1000');
+      expect(opts.HostConfig.SecurityOpt).toContain('apparmor=docker-default');
+    });
+
+    it('skips the AppArmor profile when the daemon does not support it', async () => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+      createContainer.mockResolvedValue(execableContainer());
+      getContainer.mockReturnValue({ inspect: jest.fn().mockRejectedValue({ statusCode: 404 }) });
+      info.mockResolvedValue({ SecurityOptions: ['name=seccomp'] });
+
+      const provider = await buildProvider();
+      await provider.create({
+        name: 'sandbox-noaa',
+        image: 'node:24',
+        workdir: '/workspace',
+        cpus: 1,
+        memoryMib: 256,
+        env: {},
+      });
+
+      const opts = createContainer.mock.calls[0][0];
+      expect(
+        (opts.HostConfig.SecurityOpt ?? []).some((o: string) =>
+          o.startsWith('apparmor='),
+        ),
+      ).toBe(false);
+    });
+
+    it('rejects an image outside the allowlist', async () => {
+      const provider = await buildProvider(
+        buildConfig({
+          type: 'docker',
+          docker: {
+            runtime: 'runc',
+            network: 'bridge',
+            images: { allowlist: ['node', 'debian'] },
+          },
+        }),
+      );
+
+      await expect(
+        provider.create({
+          name: 'sandbox-bad',
+          image: 'eviluser/miner:latest',
+          workdir: '/workspace',
+          cpus: 1,
+          memoryMib: 256,
+          env: {},
+        }),
+      ).rejects.toThrow(/not permitted/);
+      expect(createContainer).not.toHaveBeenCalled();
     });
 
     it('pulls the image when it is missing locally', async () => {

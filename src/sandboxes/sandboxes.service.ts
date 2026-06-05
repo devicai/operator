@@ -19,6 +19,7 @@ import {
   RuntimeProvider,
   RuntimeSandbox,
 } from '../runtime/runtime-provider.interface';
+import { isImageAllowed, sanitizeHostPorts } from '../runtime/admission.util';
 
 @Injectable()
 export class SandboxesService {
@@ -89,6 +90,29 @@ export class SandboxesService {
 
     if (ttlSeconds > defaults.maxTtlSeconds) {
       ttlSeconds = defaults.maxTtlSeconds;
+    }
+
+    // Image admission + host-port policy (Docker runtime). The provider applies
+    // the same image allowlist as a backstop; rejecting here yields a clean 400
+    // before any side effects. User-supplied host ports are dropped unless host
+    // publishing is explicitly enabled — public exposure uses the ingress proxy.
+    if (this.config.runtime.type === 'docker') {
+      const dockerCfg = this.config.runtime.docker;
+      if (!isImageAllowed(image, dockerCfg?.images?.allowlist)) {
+        throw new BadRequestException(
+          `Image '${image}' is not permitted by the configured allowlist`,
+        );
+      }
+      const sanitized = sanitizeHostPorts(ports, {
+        allow: dockerCfg?.allowHostPortPublishing ?? false,
+      });
+      if (sanitized.rejected.length > 0) {
+        this.logger.warn(
+          `Ignoring host port publishing (${sanitized.rejected.join(', ')}); ` +
+            'set runtime.docker.allowHostPortPublishing=true to enable',
+        );
+      }
+      ports = sanitized.ports;
     }
 
     // When ingress is enabled and the runtime is microsandbox, the public

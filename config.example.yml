@@ -38,12 +38,59 @@ runtime:
     socketPath: /var/run/docker.sock
     runtime: sysbox-runc          # sysbox-runc | runc
     network: bridge               # used when networkPolicy=allow-all
+
+    # Publish a sandbox port directly on the host via the `ports` map.
+    # Disabled by default: public exposure goes through the ingress proxy, which
+    # never needs a host port. Enable only for direct raw-TCP host publishing;
+    # when enabled, host ports are validated (>1024) and bound to 127.0.0.1.
+    allowHostPortPublishing: false
+
+    # Image admission policy. The allowlist below ships populated with the common
+    # Docker Official Images and major public registries. An empty list allows
+    # any image. Entries match by exact repo, `prefix/` (directory) or `prefix*`.
+    images:
+      allowlist:
+        - node
+        - python
+        - debian
+        - ubuntu
+        - alpine
+        - busybox
+        - bash
+        - golang
+        - rust
+        - ruby
+        - php
+        - openjdk
+        - eclipse-temurin
+        - gcc
+        - docker.io/library/*
+        - mcr.microsoft.com/*
+        - ghcr.io/*
+        - gcr.io/*
+        - public.ecr.aws/*
+        - registry.k8s.io/*
+        - quay.io/*
+      # Reject images whose on-disk size exceeds this (bytes). 0 = no limit.
+      maxSizeBytes: 0
+
     hardening:
       dropAllCaps: true
       noNewPrivileges: true
       readOnlyRootfs: false       # most workloads (apt, npm install) break with this
-      seccompProfile: default
       pidsLimit: 512
+      # 'default' (daemon profile) | 'unconfined' | path to a JSON profile.
+      # See security/README.md. The default profile + dropped caps already block
+      # most escapes; disable io_uring on the host for the main residual:
+      #   echo 'kernel.io_uring_disabled = 2' | sudo tee /etc/sysctl.d/99-io_uring.conf
+      seccompProfile: default
+      # AppArmor profile applied to each sandbox. Skipped automatically (with a
+      # warning) on hosts without AppArmor. '' or 'unconfined' to disable.
+      apparmorProfile: docker-default
+      # Run the sandbox as this user[:group] (e.g. '1000:1000'). Empty keeps the
+      # image default (usually root). With sysbox-runc root is already remapped
+      # to an unprivileged host uid; set this mainly for the plain runc fallback.
+      runAsUser: ''
 
 # Hard caps applied module-wide (across all tenants).
 # Omit a field or set it to 0 to disable that specific limit.

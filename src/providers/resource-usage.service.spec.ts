@@ -255,7 +255,7 @@ describe('ResourceUsageService', () => {
       mockedStat.mockResolvedValue({ size: 1024 });
 
       expect(await service.getUsageSummary()).toEqual({
-        memory: { usedMib: 512, limitMib: 1024 },
+        memory: { usedMib: 512, limitMib: 1024, hotPoolReservedMib: 0 },
         disk: { usedBytes: 1024, limitBytes: 4096 },
       });
     });
@@ -266,9 +266,23 @@ describe('ResourceUsageService', () => {
         snapshots: [],
       });
       expect(await service.getUsageSummary()).toEqual({
-        memory: { usedMib: 0, limitMib: null },
+        memory: { usedMib: 0, limitMib: null, hotPoolReservedMib: 0 },
         disk: { usedBytes: 0, limitBytes: null },
       });
+    });
+
+    it('includes the hot pool reserved overhead when an accountant is registered', async () => {
+      const { service } = await buildService({
+        sandboxAgg: [{ total: 512 }],
+        snapshots: [],
+        limits: { maxTotalMemoryMib: 4096 },
+      });
+      service.registerHotAccountant({
+        getReservedMemoryOverhead: async () => 1024,
+      });
+
+      const summary = await service.getUsageSummary();
+      expect(summary.memory.hotPoolReservedMib).toBe(1024);
     });
   });
 });
