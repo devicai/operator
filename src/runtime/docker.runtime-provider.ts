@@ -613,6 +613,27 @@ class DockerSandbox implements RuntimeSandbox {
     // Docker returns the changed paths of the container's writable layer
     // relative to its base image. The body is `null` (not `[]`) when nothing
     // changed, so guard for it. Kind: 0=modified, 1=added, 2=deleted.
+    //
+    // ⚠ sysbox-runc incompatibility (NOT a bug in this code — it's how the
+    // runtime exposes the rootfs). Verified A/B on the same daemon, writing the
+    // same files, only the runtime differs:
+    //
+    //   change                       runc   sysbox-runc
+    //   A /root/zfile                 yes        yes      (regular writable layer)
+    //   A /usr/local/bin/ztool        yes        NO       (sysbox inner mount)
+    //   A /etc/ztest.conf             yes        NO       (sysbox inner mount)
+    //   D /etc/debian_version         yes        NO       (sysbox inner mount)
+    //   total docker-diff entries      9          2
+    //
+    // sysbox mounts /usr, /etc, /lib, /var, ... with its own overlay to support
+    // systemd / inner Docker, so changes there are not in the container's top
+    // writable layer and `container.changes()` cannot see them. Only /root,
+    // /home and the workdir are reported. Consequence: full-filesystem snapshots
+    // (which are built from this diff) capture installed packages and system
+    // configs ONLY under `runc`; under `sysbox-runc` they silently miss them.
+    // A sysbox-complete capture would have to tar the rootfs via `docker exec`
+    // from inside the container (exec sees the merged view) instead of relying
+    // on `docker diff` — see the snapshots service for where that would plug in.
     const changes = (await this.container.changes()) as
       | Array<{ Path: string; Kind: number }>
       | null;

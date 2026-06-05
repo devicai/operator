@@ -92,6 +92,25 @@ runtime:
       # to an unprivileged host uid; set this mainly for the plain runc fallback.
       runAsUser: ''
 
+# Snapshots.
+#   defaultScope: 'full' captures the whole filesystem diff (installed packages,
+#                 /etc configs, /usr/local binaries); 'workdir' captures only the
+#                 workdir. defaultScope is overridable per-request.
+#   compression:  'auto' (gzip) | 'zstd' (smaller, host-side) | 'gzip'.
+#   cleanup:      'conservative' (default) | 'none' | 'aggressive'.
+#
+# ⚠ sysbox-runc + scope 'full': full snapshots are built from `docker diff`,
+# which under sysbox-runc does NOT see changes in sysbox's internally-mounted
+# system dirs (/usr, /etc, /lib, /var). On a sysbox host a 'full' snapshot only
+# captures /root, /home and the workdir — installed packages and system configs
+# are silently missed (no error). Full snapshots are complete only under `runc`.
+# On a sysbox host prefer `defaultScope: workdir` until a sysbox-complete capture
+# (rootfs tar via `docker exec`) lands.
+snapshots:
+  defaultScope: full
+  compression: auto
+  cleanup: conservative
+
 # Hard caps applied module-wide (across all tenants).
 # Omit a field or set it to 0 to disable that specific limit.
 resourceLimits:

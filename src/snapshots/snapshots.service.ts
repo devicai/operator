@@ -651,6 +651,17 @@ export class SnapshotsService {
    * compressed artifact out — metered, no uncompressed staging. For zstd it
    * emits a plain tar, copies it out and compresses host-side. Returns deleted
    * paths (to replay on restore) plus capture stats.
+   *
+   * ⚠ RUNTIME CAVEAT (sysbox-runc): this builds the archive from
+   * `sandbox.diff()` (= `docker diff`). Under `sysbox-runc` that diff does NOT
+   * report changes under sysbox's internally-mounted system dirs (/usr, /etc,
+   * /lib, /var, ...), so a full snapshot taken on a sysbox host captures only
+   * /root, /home and the workdir — installed packages and system configs are
+   * silently missed (it produces a near-empty archive, not an error). This is a
+   * runtime limitation, not a bug here; see DockerSandbox.diff() for the A/B
+   * evidence. Full snapshots are complete only under `runc`. To make them work
+   * under sysbox the capture would need to tar the rootfs via `docker exec`
+   * (which sees the merged view) instead of relying on `docker diff`.
    */
   private async captureFullToHost(
     sandbox: RuntimeSandbox,

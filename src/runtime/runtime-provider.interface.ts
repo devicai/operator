@@ -120,6 +120,17 @@ export interface RuntimeSandbox {
    * List the sandbox filesystem changes relative to its base image (added /
    * changed / deleted paths). Backs full-filesystem snapshots. Runtimes that
    * cannot compute a diff throw an error.
+   *
+   * RUNTIME CAVEAT — fidelity depends on the OCI runtime:
+   *   - `runc`: complete. Every change in the writable layer is reported.
+   *   - `sysbox-runc`: PARTIAL. Sysbox mounts several system directories
+   *     (/usr, /etc, /lib, /var, ...) with its own internal overlay to enable
+   *     systemd / inner Docker, so changes under those paths are NOT part of
+   *     the container's top writable layer and are invisible to the diff. Only
+   *     changes under regular writable paths (/root, /home, the workdir) are
+   *     reported. See DockerSandbox.diff() for the details and the A/B evidence.
+   * As a result, full-filesystem snapshots are complete only under `runc`;
+   * under `sysbox-runc` they will miss installed packages and system configs.
    */
   diff(): Promise<FsChange[]>;
 
