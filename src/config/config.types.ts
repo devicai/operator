@@ -61,6 +61,16 @@ export interface DockerRuntimeConfig {
   /** Docker network to attach sandboxes to when networkPolicy=allow-all. */
   network?: string;
   hardening?: DockerHardeningConfig;
+  /** Image admission policy (allowlist + size cap). */
+  images?: ImagePolicyConfig;
+  /**
+   * Allow callers to publish a sandbox port directly on the host via the
+   * `ports` map. Disabled by default: user-supplied host ports are ignored,
+   * since public exposure goes through the ingress proxy (which never needs a
+   * host port). Enable only for direct raw-TCP host publishing. When enabled,
+   * host ports are validated (>1024) and always bound to 127.0.0.1.
+   */
+  allowHostPortPublishing?: boolean;
 }
 
 export interface DockerHardeningConfig {
@@ -70,10 +80,48 @@ export interface DockerHardeningConfig {
   noNewPrivileges?: boolean;
   /** Mount rootfs read-only. Many workloads (apt, npm install) break with this. Default: false. */
   readOnlyRootfs?: boolean;
-  /** Seccomp profile path or 'default' for Docker's default profile. Default: 'default'. */
+  /**
+   * Seccomp profile for each sandbox. One of:
+   *   'default'    — Docker daemon's built-in profile (no SecurityOpt added).
+   *   'unconfined' — no syscall filtering (NOT recommended).
+   *   <path.json>  — path to a profile file; its JSON content is read and
+   *                  passed inline to the daemon.
+   * Default: 'default'.
+   */
   seccompProfile?: string;
+  /**
+   * AppArmor profile name applied to each sandbox (e.g. 'docker-default' or a
+   * custom loaded profile). Empty string disables explicit assignment. The
+   * profile is only applied when the daemon reports AppArmor support; on hosts
+   * without AppArmor it is skipped with a warning instead of failing the
+   * create. Default: 'docker-default'.
+   */
+  apparmorProfile?: string;
+  /**
+   * User the sandbox process runs as, in Docker's `user[:group]` form
+   * (e.g. '1000:1000'). Empty string keeps the image's default user (usually
+   * root). With sysbox-runc, root is already remapped to an unprivileged host
+   * uid, so root is safe; set this only for the plain `runc` fallback or
+   * defence-in-depth. Default: '' (image default).
+   */
+  runAsUser?: string;
   /** Maximum number of processes inside the container. Default: 512. */
   pidsLimit?: number;
+}
+
+export interface ImagePolicyConfig {
+  /**
+   * Allowed image references. An entry matches when the requested image equals
+   * it, or — when the entry ends in `/` or `*` — when the image starts with the
+   * entry's prefix. Tags are ignored for matching. An empty list allows any
+   * image (back-compat); a populated list rejects anything outside it.
+   */
+  allowlist?: string[];
+  /**
+   * Maximum on-disk size (bytes) of a pulled image. Images larger than this are
+   * removed after pull and the create is rejected. 0 disables the check.
+   */
+  maxSizeBytes?: number;
 }
 
 export interface McpConfig {

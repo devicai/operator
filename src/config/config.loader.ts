@@ -2,6 +2,7 @@ import { readFileSync, existsSync } from 'fs';
 import { join } from 'path';
 import * as yaml from 'js-yaml';
 import { ModuleConfig } from './config.types';
+import { DEFAULT_IMAGE_ALLOWLIST } from '../runtime/admission.util';
 
 const ENV_VAR_PATTERN = /\$\{([^}:-]+)(?::-(.*?))?\}/g;
 
@@ -67,14 +68,22 @@ export function loadConfig(configPath?: string): ModuleConfig {
       socketPath: '/var/run/docker.sock',
       runtime: 'sysbox-runc',
       network: 'bridge',
+      allowHostPortPublishing: false,
       ...resolved.runtime.docker,
       hardening: {
         dropAllCaps: true,
         noNewPrivileges: true,
         readOnlyRootfs: false,
         seccompProfile: 'default',
+        apparmorProfile: 'docker-default',
+        runAsUser: '',
         pidsLimit: 512,
         ...resolved.runtime.docker?.hardening,
+      },
+      images: {
+        allowlist: DEFAULT_IMAGE_ALLOWLIST,
+        maxSizeBytes: 0,
+        ...resolved.runtime.docker?.images,
       },
     };
   }

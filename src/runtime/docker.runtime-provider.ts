@@ -11,9 +11,10 @@ import {
   readFileSync,
   statSync,
 } from 'fs';
-import { basename, dirname } from 'path';
+import { basename, dirname, isAbsolute, resolve } from 'path';
 import { CONFIG } from '../config/config.loader';
 import { DockerHardeningConfig, ModuleConfig } from '../config/config.types';
+import { isImageAllowed } from './admission.util';
 import {
   ExecResult,
   ExecStream,
@@ -51,6 +52,12 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly runtime: string;
   private readonly defaultNetwork: string;
   private readonly hardening: Required<DockerHardeningConfig>;
+  private readonly imagesPolicy: { allowlist: string[]; maxSizeBytes: number };
+  private readonly allowHostPortPublishing: boolean;
+  /** Resolved `seccomp=<value>` SecurityOpt, or null to use the daemon default. */
+  private readonly seccompOpt: string | null;
+  /** Whether the daemon supports AppArmor (lazily probed on first create). */
+  private apparmorSupported: boolean | null = null;
   private readonly ingressEnabled: boolean;
   private readonly selfContainerId: string | null;
   /**
@@ -73,10 +80,69 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       noNewPrivileges: docker?.hardening?.noNewPrivileges ?? true,
       readOnlyRootfs: docker?.hardening?.readOnlyRootfs ?? false,
       seccompProfile: docker?.hardening?.seccompProfile ?? 'default',
+      apparmorProfile: docker?.hardening?.apparmorProfile ?? 'docker-default',
+      runAsUser: docker?.hardening?.runAsUser ?? '',
       pidsLimit: docker?.hardening?.pidsLimit ?? 512,
     };
+    this.imagesPolicy = {
+      allowlist: docker?.images?.allowlist ?? [],
+      maxSizeBytes: docker?.images?.maxSizeBytes ?? 0,
+    };
+    this.allowHostPortPublishing = docker?.allowHostPortPublishing ?? false;
+    this.seccompOpt = this.resolveSeccompOpt(this.hardening.seccompProfile);
     this.ingressEnabled = Boolean(config.ingress?.enabled);
     this.selfContainerId = detectSelfContainerId(this.logger);
+  }
+
+  /**
+   * Resolve the configured seccomp profile into a SecurityOpt value. The Docker
+   * Engine API expects the profile's JSON *content* (not a path) in
+   * `seccomp=<...>`, so a path is read and inlined here. Returns null for the
+   * daemon default (no SecurityOpt added).
+   */
+  private resolveSeccompOpt(profile: string): string | null {
+    const p = (profile ?? 'default').trim();
+    if (!p || p === 'default') return null;
+    if (p === 'unconfined') return 'seccomp=unconfined';
+    try {
+      const abs = isAbsolute(p) ? p : resolve(process.cwd(), p);
+      const json = readFileSync(abs, 'utf-8');
+      JSON.parse(json); // fail fast on a malformed profile
+      return `seccomp=${json}`;
+    } catch (err) {
+      this.logger.warn(
+        `seccompProfile '${p}' could not be loaded (${(err as Error).message}); ` +
+          'falling back to the daemon default profile',
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Probe the daemon once for AppArmor support. Applying an AppArmor profile on
+   * a host without AppArmor fails the container create, so we detect support up
+   * front and skip the profile (with a warning) where it is unavailable.
+   */
+  private async ensureDaemonInfo(): Promise<void> {
+    if (this.apparmorSupported !== null) return;
+    try {
+      const info = (await this.docker.info()) as { SecurityOptions?: string[] };
+      this.apparmorSupported = (info.SecurityOptions ?? []).some((o) =>
+        o.includes('name=apparmor'),
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not query daemon security options: ${(err as Error).message}`,
+      );
+      this.apparmorSupported = false;
+    }
+    const aa = this.hardening.apparmorProfile?.trim();
+    if (aa && aa !== 'unconfined' && !this.apparmorSupported) {
+      this.logger.warn(
+        `AppArmor profile '${aa}' requested but the daemon does not support ` +
+          'AppArmor; sandboxes will run without an explicit AppArmor profile',
+      );
+    }
   }
 
   /**
@@ -92,17 +158,23 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   }
 
   async create(cfg: RuntimeSandboxConfig): Promise<RuntimeSandbox> {
+    await this.ensureDaemonInfo();
     await this.ensureImage(cfg.image);
     await this.removeIfExists(cfg.name);
 
     const env = Object.entries(cfg.env).map(([k, v]) => `${k}=${v}`);
     const exposed: Record<string, {}> = {};
-    const portBindings: Record<string, Array<{ HostPort: string }>> = {};
+    const portBindings: Record<
+      string,
+      Array<{ HostPort: string; HostIp?: string }>
+    > = {};
     if (cfg.ports) {
       for (const [hostPort, guestPort] of Object.entries(cfg.ports)) {
         const key = `${guestPort}/tcp`;
         exposed[key] = {};
-        portBindings[key] = [{ HostPort: String(hostPort) }];
+        // Bind to loopback only: host publishing is an opt-in escape hatch and
+        // must never expose a sandbox port on all interfaces.
+        portBindings[key] = [{ HostPort: String(hostPort), HostIp: '127.0.0.1' }];
       }
     }
 
@@ -118,18 +190,22 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     if (this.hardening.noNewPrivileges) {
       securityOpt.push('no-new-privileges:true');
     }
-    if (
-      this.hardening.seccompProfile &&
-      this.hardening.seccompProfile !== 'default'
-    ) {
-      securityOpt.push(`seccomp=${this.hardening.seccompProfile}`);
+    if (this.seccompOpt) {
+      securityOpt.push(this.seccompOpt);
     }
+    const apparmor = this.hardening.apparmorProfile?.trim();
+    if (apparmor && apparmor !== 'unconfined' && this.apparmorSupported) {
+      securityOpt.push(`apparmor=${apparmor}`);
+    }
+
+    const runAsUser = this.hardening.runAsUser?.trim();
 
     const container = await this.docker.createContainer({
       name: cfg.name,
       Image: cfg.image,
       Env: env,
       WorkingDir: cfg.workdir,
+      User: runAsUser || undefined,
       Cmd: ['/bin/sh', '-c', 'sleep infinity'],
       Tty: false,
       ExposedPorts: exposed,
@@ -369,8 +445,16 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   }
 
   private async ensureImage(image: string): Promise<void> {
+    // Admission backstop: every create/restore/hot-pool path funnels through
+    // here, so an unlisted image is rejected before it is ever pulled or run.
+    if (!isImageAllowed(image, this.imagesPolicy.allowlist)) {
+      throw new Error(
+        `Image '${image}' is not permitted by runtime.docker.images.allowlist`,
+      );
+    }
     try {
       await this.docker.getImage(image).inspect();
+      await this.assertImageSize(image);
       return;
     } catch (err: any) {
       if (err.statusCode !== 404) throw err;
@@ -382,6 +466,30 @@ export class DockerRuntimeProvider implements RuntimeProvider {
         err ? reject(err) : resolve(),
       );
     });
+    await this.assertImageSize(image);
+  }
+
+  /**
+   * Reject images larger than the configured cap. Non-destructive: the pulled
+   * image is left in place (it may be shared by other sandboxes) and only the
+   * create is refused. Disabled when maxSizeBytes is 0.
+   */
+  private async assertImageSize(image: string): Promise<void> {
+    const cap = this.imagesPolicy.maxSizeBytes;
+    if (!cap || cap <= 0) return;
+    let size = 0;
+    try {
+      const info = await this.docker.getImage(image).inspect();
+      size = info.Size ?? 0;
+    } catch {
+      return; // size unknown — don't block on an inspect hiccup
+    }
+    if (size > cap) {
+      throw new Error(
+        `Image '${image}' (${size} bytes) exceeds ` +
+          `runtime.docker.images.maxSizeBytes (${cap})`,
+      );
+    }
   }
 }
 
