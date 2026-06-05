@@ -4,6 +4,16 @@ import { ExtensionProperty } from '../config/config.types';
 import { ExtensionScope, PaginatedResponse } from '../interfaces';
 import { EXTENSIONS_TOKEN } from '../providers/extensions.provider';
 
+/**
+ * Canonical string form of a Mongo ObjectId (24 hex chars). Our public ids are
+ * nanoids, never ObjectIds, so anything that isn't 24-hex cannot match an `_id`.
+ * We must not hand such a value to Mongoose: under mongoose 8 / bson 6 casting a
+ * non-24-hex string to ObjectId throws a CastError, which surfaces as a 500
+ * instead of the intended 404. (Note: `mongoose.isValidObjectId` is too lenient
+ * here — it accepts any 12-char string — so we match the hex form explicitly.)
+ */
+const OBJECT_ID_RE = /^[a-fA-F0-9]{24}$/;
+
 @Injectable()
 export abstract class BaseRepository<T> {
   constructor(
@@ -67,6 +77,11 @@ export abstract class BaseRepository<T> {
   }
 
   async findById(id: string, scope: ExtensionScope): Promise<T | null> {
+    // A nanoid (or any non-ObjectId string) can never match an `_id`; return
+    // null rather than letting Mongoose throw a CastError. Callers that look up
+    // by a public id first try `findOne({ <publicId>: id })` and fall back here,
+    // so a non-existent id must resolve to "not found", not an error.
+    if (!OBJECT_ID_RE.test(id)) return null;
     return this.findOne({ _id: id } as FilterQuery<T>, scope);
   }
 
