@@ -27,26 +27,35 @@ services:
   mongo:
     image: mongo:7
     profiles: [infra]
+    # `mongod` runs as PID 1 and is not an init: it never reap()s the orphaned
+    # `mongosh` processes the healthcheck spawns, so each one lingers as a
+    # <defunct> zombie (one every interval, 1000+ observed) — churning CPU and
+    # filling the host PID table, which makes sysbox sandbox creation flaky.
+    # `init: true` runs tini as PID 1 to reap them. interval 30s also cuts churn.
+    init: true
     ports:
       - "127.0.0.1:27017:27017"
     volumes:
       - mongo-data:/data/db
     healthcheck:
       test: echo 'db.runCommand("ping").ok' | mongosh --quiet
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
 
   redis:
     image: redis:7-alpine
     profiles: [infra]
+    # Same orphan->zombie pattern as mongo: `redis-server` is PID 1 and the
+    # `redis-cli` healthcheck processes reparent to it without being reaped.
+    init: true
     ports:
       - "127.0.0.1:6379:6379"
     volumes:
       - redis-data:/data
     healthcheck:
       test: redis-cli ping
-      interval: 10s
+      interval: 30s
       timeout: 5s
       retries: 5
 
