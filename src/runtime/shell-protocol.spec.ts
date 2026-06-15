@@ -85,6 +85,15 @@ describe('buildWrappedCommand', () => {
     expect(wrapped).not.toContain('cd ');
     expect(wrapped).toContain('eval "$__DEVIC_CMD"');
   });
+
+  it('redirects the command stdin from /dev/null so stdin reads do not wedge the shell', () => {
+    expect(buildWrappedCommand('cat', MARKER)).toContain(
+      'eval "$__DEVIC_CMD" < /dev/null',
+    );
+    expect(buildWrappedCommand('cat', MARKER, { cwd: '/srv/x' })).toContain(
+      'eval "$__DEVIC_CMD"; } < /dev/null',
+    );
+  });
 });
 
 describe('MarkerProcessor', () => {

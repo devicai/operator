@@ -318,6 +318,20 @@ export class SandboxesService {
           cwd,
         };
       }
+      // The shell was torn down out from under this command — e.g. a concurrent
+      // command on the same sandbox timed out and reset the shared shell. The
+      // command didn't fail on its own merits, so surface a clean, retryable
+      // result (exit 124) instead of a 500.
+      const message = (err as Error)?.message ?? '';
+      if (/shell (session is closed|stream closed)/i.test(message)) {
+        return {
+          code: 124,
+          stdout: '',
+          stderr:
+            'the sandbox shell was reset while this command was running; retry the command',
+          cwd,
+        };
+      }
       throw err;
     }
 
