@@ -44,6 +44,19 @@ export interface SandboxDefaultsConfig {
   defaultTtlSeconds: number;
   maxTtlSeconds: number;
   ttlCheckIntervalMs: number;
+  /**
+   * Per-command wall-clock budget for the persistent shell, in ms. A single
+   * shell backs every command for a sandbox (REST exec + WebSocket terminal),
+   * and commands are serialized — so a command that never returns (an
+   * interactive prompt waiting on stdin, a foreground server, a hung build)
+   * would otherwise wedge the shell forever and make every later command hang
+   * (surfacing as a gateway 504). When a command exceeds this budget it is
+   * aborted and the shell is torn down + transparently reopened, so the next
+   * command gets a clean shell instead of queuing behind the stuck one. A
+   * per-request override may lower it; 0 disables the timeout. Default 300000
+   * (5 min).
+   */
+  commandTimeoutMs?: number;
 }
 
 export type RuntimeType = 'microsandbox' | 'docker';

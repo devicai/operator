@@ -22,6 +22,10 @@ defaults:
   defaultTtlSeconds: 1800
   maxTtlSeconds: 7200
   ttlCheckIntervalMs: 30000
+  # Per-command budget for the persistent shell (ms). A stuck/interactive command
+  # is aborted and the shell is reset so later commands don't queue behind it
+  # forever (which would surface as a gateway 504). 0 disables. Default 300000.
+  commandTimeoutMs: 300000
 
 # Runtime backend that executes sandboxes.
 #

@@ -31,6 +31,7 @@ import {
   RuntimeSandboxConfig,
   RuntimeStatus,
   SandboxAddress,
+  ShellCommandTimeoutError,
   ShellRunOptions,
   ShellRunResult,
   ShellRunStream,
@@ -59,6 +60,8 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly hardening: Required<DockerHardeningConfig>;
   private readonly imagesPolicy: { allowlist: string[]; maxSizeBytes: number };
   private readonly allowHostPortPublishing: boolean;
+  /** Per-command shell timeout (ms) handed to each sandbox's persistent shell. */
+  private readonly commandTimeoutMs: number;
   /** Resolved `seccomp=<value>` SecurityOpt, or null to use the daemon default. */
   private readonly seccompOpt: string | null;
   /** Whether the daemon supports AppArmor (lazily probed on first create). */
@@ -104,6 +107,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       maxSizeBytes: docker?.images?.maxSizeBytes ?? 0,
     };
     this.allowHostPortPublishing = docker?.allowHostPortPublishing ?? false;
+    this.commandTimeoutMs = config.defaults?.commandTimeoutMs ?? 300000;
     this.seccompOpt = this.resolveSeccompOpt(this.hardening.seccompProfile);
     this.ingressEnabled = Boolean(config.ingress?.enabled);
     this.selfContainerId = detectSelfContainerId(this.logger);
@@ -261,6 +265,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     if (cached) return cached;
     const fresh = new DockerSandbox(name, container, {
       runtime: this.runtime,
+      commandTimeoutMs: this.commandTimeoutMs,
       getBaseManifest: (image) => this.getBaseManifest(image),
     });
     this.sandboxCache.set(name, fresh);
@@ -609,6 +614,8 @@ function detectSelfContainerId(logger: Logger): string | null {
  */
 interface DockerSandboxContext {
   runtime: string;
+  /** Default per-command time budget (ms) for this sandbox's persistent shell. */
+  commandTimeoutMs: number;
   getBaseManifest(image: string): Promise<Map<string, number>>;
 }
 
@@ -632,7 +639,11 @@ class DockerSandbox implements RuntimeSandbox {
     // Coalesce concurrent openers.
     if (this.shellOpening) return this.shellOpening;
     this.shellOpening = (async () => {
-      const session = await DockerShellSession.open(this.container, initialCwd);
+      const session = await DockerShellSession.open(
+        this.container,
+        initialCwd,
+        this.ctx.commandTimeoutMs,
+      );
       session.onClose(() => {
         if (this.shell === session) this.shell = null;
       });
@@ -976,6 +987,8 @@ class DockerShellSession implements ShellSession {
     private readonly exec: Docker.Exec,
     private readonly stream: NodeJS.ReadWriteStream,
     container: Docker.Container,
+    /** Default per-command time budget (ms); 0 disables. */
+    private readonly defaultTimeoutMs: number = 0,
   ) {
     container.modem.demuxStream(stream, this.stdoutSink, this.stderrSink);
 
@@ -995,6 +1008,7 @@ class DockerShellSession implements ShellSession {
   static async open(
     container: Docker.Container,
     initialCwd?: string,
+    defaultTimeoutMs = 0,
   ): Promise<DockerShellSession> {
     const exec = await container.exec({
       Cmd: ['/bin/sh'],
@@ -1007,7 +1021,12 @@ class DockerShellSession implements ShellSession {
       hijack: true,
       stdin: true,
     })) as unknown as NodeJS.ReadWriteStream;
-    const session = new DockerShellSession(exec, stream, container);
+    const session = new DockerShellSession(
+      exec,
+      stream,
+      container,
+      defaultTimeoutMs,
+    );
     if (initialCwd && initialCwd.trim()) {
       // Best-effort: position the shell at the requested cwd before any
       // caller-issued command. Failures here surface on the first run().
@@ -1121,10 +1140,26 @@ class DockerShellSession implements ShellSession {
       },
     );
 
+    // Per-command timeout. A command that never emits its end marker (an
+    // interactive prompt waiting on stdin, a foreground server, a hung build)
+    // would otherwise wedge this shell forever — and since the shell is shared
+    // and serialized, every later command (over REST or the WebSocket terminal)
+    // would queue behind it and hang too. On expiry we fail this command AND
+    // tear the session down, so the next caller transparently gets a fresh
+    // shell instead of inheriting the stuck one.
+    let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearTimer = () => {
+      if (timeoutTimer) {
+        clearTimeout(timeoutTimer);
+        timeoutTimer = null;
+      }
+    };
+
     const tryComplete = () => {
       if (stdoutMeta === null || stderrMeta === null) return;
       // stdoutMeta has the form ":CODE:CWD"; stderrMeta is the bare line (empty).
       const parsed = parseStdoutMeta(stdoutMeta);
+      clearTimer();
       finishIterable();
       this.currentStdout = null;
       this.currentStderr = null;
@@ -1139,6 +1174,7 @@ class DockerShellSession implements ShellSession {
     };
 
     const failWith = (err: Error) => {
+      clearTimer();
       streamError = err;
       finishIterable();
       this.currentStdout = null;
@@ -1180,6 +1216,22 @@ class DockerShellSession implements ShellSession {
     } catch (err) {
       failWith(err as Error);
       throw err;
+    }
+
+    // Arm the per-command timeout now that the command is on the wire. A
+    // per-call override of 0 disables it even when a session default is set.
+    const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
+    if (timeoutMs && timeoutMs > 0) {
+      timeoutTimer = setTimeout(() => {
+        timeoutTimer = null;
+        if (this._closed) return;
+        // Abort this command, then tear down the wedged shell. markClosed()
+        // fires onClose, which clears the provider's cached session so the next
+        // openShell() spins up a clean one. The stuck foreground process is
+        // left orphaned inside the (resource-capped, TTL-bounded) container.
+        failWith(new ShellCommandTimeoutError(timeoutMs));
+        void this.close();
+      }, timeoutMs);
     }
 
     const events: AsyncIterable<ExecStreamEvent> = {

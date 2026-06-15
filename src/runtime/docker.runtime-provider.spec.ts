@@ -653,6 +653,51 @@ describe('DockerRuntimeProvider', () => {
       const s2 = await h.sandbox.openShell();
       expect(s1).toBe(s2);
     });
+
+    it('aborts a command that blows its time budget and tears down the shell', async () => {
+      const h = await buildShellHarness();
+      const shell = await h.sandbox.openShell();
+      // Never drive the streams: the command emits no end marker, simulating an
+      // interactive/hung foreground command.
+      const runPromise = shell.run('sleep 999', { timeoutMs: 20 });
+
+      await expect(runPromise).rejects.toMatchObject({
+        name: 'ShellCommandTimeoutError',
+        timeoutMs: 20,
+      });
+      // The wedged shell must be discarded so it cannot poison later commands.
+      expect(shell.closed).toBe(true);
+    });
+
+    it('hands out a fresh shell after a timeout reset', async () => {
+      const h = await buildShellHarness();
+      const stuck = await h.sandbox.openShell();
+      await expect(
+        stuck.run('hang', { timeoutMs: 20 }),
+      ).rejects.toMatchObject({ name: 'ShellCommandTimeoutError' });
+
+      const next = await h.sandbox.openShell();
+      expect(next).not.toBe(stuck);
+      expect(next.closed).toBe(false);
+    });
+
+    it('does not arm a timeout when the per-call budget is 0', async () => {
+      const h = await buildShellHarness();
+      const shell = await h.sandbox.openShell();
+      const runPromise = shell.run('echo hi', { timeoutMs: 0 });
+
+      // Give a real timer ample time to (wrongly) fire, then complete normally.
+      await new Promise((r) => setTimeout(r, 30));
+      const marker = markerFromStdin(h.shellStdin);
+      const { stdoutSink, stderrSink } = h.getSinks();
+      stdoutSink.write(Buffer.from('hi\n'));
+      stdoutSink.write(Buffer.from(`${marker}:0:/workspace\n`));
+      stderrSink.write(Buffer.from(`${marker}\n`));
+
+      const result = await runPromise;
+      expect(result.code).toBe(0);
+      expect(shell.closed).toBe(false);
+    });
   });
 
   describe('remove', () => {

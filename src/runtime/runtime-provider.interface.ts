@@ -90,6 +90,25 @@ export interface ShellRunOptions {
    * value to persist across calls.
    */
   env?: Record<string, string>;
+  /**
+   * Per-command wall-clock budget in ms. When the command does not finish in
+   * time it is aborted with a {@link ShellCommandTimeoutError} and the session
+   * is torn down (so the shared shell is not left wedged). Falls back to the
+   * session default when omitted; 0 disables the timeout for this command.
+   */
+  timeoutMs?: number;
+}
+
+/**
+ * Raised by a {@link ShellSession} when a command exceeds its time budget. The
+ * session aborts the command and tears itself down; callers should surface a
+ * timeout to the user rather than retry on the same (now-closed) session.
+ */
+export class ShellCommandTimeoutError extends Error {
+  constructor(readonly timeoutMs: number) {
+    super(`command exceeded its ${timeoutMs}ms time budget and was aborted`);
+    this.name = 'ShellCommandTimeoutError';
+  }
 }
 
 export interface ShellRunResult {

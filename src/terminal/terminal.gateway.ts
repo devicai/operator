@@ -19,10 +19,19 @@ interface ClientSession {
   alive: boolean;
 }
 
+/**
+ * Interval between server-initiated WebSocket pings. A long-running command can
+ * produce no output for minutes; without traffic, an upstream proxy (Cloudflare,
+ * etc.) closes the idle socket and the in-flight command is lost. A periodic
+ * ping keeps the connection registered as active without touching the shell.
+ */
+const KEEPALIVE_INTERVAL_MS = 30000;
+
 @WebSocketGateway({ path: '/ws/terminal' })
 export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect {
   private readonly logger = new Logger(TerminalGateway.name);
   private readonly sessions = new Map<WebSocket, ClientSession>();
+  private readonly keepalive = new Map<WebSocket, ReturnType<typeof setInterval>>();
 
   @WebSocketServer()
   server: Server;
@@ -34,6 +43,18 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
 
   handleConnection(client: WebSocket) {
     this.logger.log('Terminal client connected');
+
+    const timer = setInterval(() => {
+      if (client.readyState === WebSocket.OPEN) {
+        try {
+          client.ping();
+        } catch {
+          // A failing ping just means the socket is going away; the close
+          // handler will clean up.
+        }
+      }
+    }, KEEPALIVE_INTERVAL_MS);
+    this.keepalive.set(client, timer);
 
     client.on('message', async (raw: Buffer | string) => {
       try {
@@ -54,6 +75,11 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
   }
 
   handleDisconnect(client: WebSocket) {
+    const timer = this.keepalive.get(client);
+    if (timer) {
+      clearInterval(timer);
+      this.keepalive.delete(client);
+    }
     const session = this.sessions.get(client);
     if (session) {
       session.alive = false;
