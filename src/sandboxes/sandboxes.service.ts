@@ -18,6 +18,7 @@ import {
   RUNTIME_PROVIDER,
   RuntimeProvider,
   RuntimeSandbox,
+  ShellCommandTimeoutError,
 } from '../runtime/runtime-provider.interface';
 import { isImageAllowed, sanitizeHostPorts } from '../runtime/admission.util';
 
@@ -290,10 +291,27 @@ export class SandboxesService {
     // cwd to whatever the caller asked for (or what we last recorded) so the
     // shell's own drift doesn't surprise the agent.
     const shell = await sandbox.openShell(cwd);
-    const result = await shell.run(command, {
-      cwd,
-      env: dto.env,
-    });
+    const timeoutMs =
+      dto.timeoutSeconds === undefined ? undefined : dto.timeoutSeconds * 1000;
+    let result;
+    try {
+      result = await shell.run(command, { cwd, env: dto.env, timeoutMs });
+    } catch (err) {
+      if (err instanceof ShellCommandTimeoutError) {
+        // The command blew its time budget; the shell has been reset so later
+        // commands start clean. Report it as a timeout (exit 124, the GNU
+        // `timeout` convention) instead of failing the HTTP request, so callers
+        // get an actionable result rather than a hung connection / 504.
+        const seconds = Math.round(err.timeoutMs / 1000);
+        return {
+          code: 124,
+          stdout: '',
+          stderr: `command timed out after ${seconds}s and was aborted; the sandbox shell was reset`,
+          cwd,
+        };
+      }
+      throw err;
+    }
 
     const newCwd = result.cwd || cwd;
 

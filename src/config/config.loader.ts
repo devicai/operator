@@ -61,6 +61,7 @@ export function loadConfig(configPath?: string): ModuleConfig {
     defaultTtlSeconds: 1800,
     maxTtlSeconds: 7200,
     ttlCheckIntervalMs: 30000,
+    commandTimeoutMs: 300000,
   };
   resolved.runtime = resolved.runtime ?? { type: 'microsandbox' };
   if (resolved.runtime.type === 'docker') {
