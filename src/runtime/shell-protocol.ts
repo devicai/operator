@@ -58,12 +58,18 @@ export function buildWrappedCommand(
     }
   }
   parts.push(`__DEVIC_CMD=$(printf '%s' '${b64}' | base64 -d)`);
+  // Redirect the command's stdin from /dev/null. The persistent shell's own
+  // stdin IS the pipe we feed commands through, so a command that reads stdin
+  // (an interactive CLI prompt, `cat`, a tool reading variadic input) would
+  // otherwise block forever waiting on it — wedging the shell. With /dev/null
+  // such a command gets EOF immediately and returns instead of hanging. A
+  // command that wants real input still provides its own via a pipe or heredoc.
   if (opts?.cwd) {
     parts.push(
-      `{ cd ${shellEscape(opts.cwd)} && eval "$__DEVIC_CMD"; }`,
+      `{ cd ${shellEscape(opts.cwd)} && eval "$__DEVIC_CMD"; } < /dev/null`,
     );
   } else {
-    parts.push(`eval "$__DEVIC_CMD"`);
+    parts.push(`eval "$__DEVIC_CMD" < /dev/null`);
   }
   parts.push(`__DEVIC_EC=$?`);
   parts.push(`printf '${marker}:%d:%s\\n' "$__DEVIC_EC" "$(pwd)"`);
