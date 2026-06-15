@@ -291,8 +291,16 @@ export class SandboxesService {
     // cwd to whatever the caller asked for (or what we last recorded) so the
     // shell's own drift doesn't surprise the agent.
     const shell = await sandbox.openShell(cwd);
+    // This REST endpoint is synchronous and sits behind a gateway that cuts the
+    // origin request at ~60s. Default the per-command budget BELOW that (and
+    // bound the queue wait, see DockerShellSession.runStream) so a stuck command
+    // returns a clean exit-124 + shell reset instead of a 504. An explicit
+    // `timeoutSeconds` overrides it (0 disables).
+    const restDefaultMs = this.config.defaults?.restCommandTimeoutMs ?? 45000;
     const timeoutMs =
-      dto.timeoutSeconds === undefined ? undefined : dto.timeoutSeconds * 1000;
+      dto.timeoutSeconds !== undefined
+        ? dto.timeoutSeconds * 1000
+        : restDefaultMs;
     let result;
     try {
       result = await shell.run(command, { cwd, env: dto.env, timeoutMs });

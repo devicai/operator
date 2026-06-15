@@ -148,6 +148,9 @@ export class TerminalGateway implements OnGatewayConnection, OnGatewayDisconnect
 
     try {
       const stream = await session.shell.runStream(command);
+      // If the iterator rejects (e.g. a timeout), the for-await throws before we
+      // await `done`; observe it up front to avoid an unhandled rejection.
+      stream.done.catch(() => undefined);
 
       try {
         for await (const event of stream.events) {

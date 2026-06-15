@@ -681,6 +681,25 @@ describe('DockerRuntimeProvider', () => {
       expect(next.closed).toBe(false);
     });
 
+    it('times out a command queued behind a wedged one on its own budget', async () => {
+      const h = await buildShellHarness();
+      const shell = await h.sandbox.openShell();
+      // A wedges the shell with a long budget and never completes.
+      const a = shell.run('wedge', { timeoutMs: 10000 });
+      // B is queued behind A with a short budget. It must expire on its own
+      // budget instead of waiting out A's — the whole point of bounding the
+      // queue wait, not just execution.
+      const b = shell.run('queued', { timeoutMs: 80 });
+
+      await expect(b).rejects.toMatchObject({
+        name: 'ShellCommandTimeoutError',
+        timeoutMs: 80,
+      });
+      // Tearing the shell down to unblock the queue also aborts the wedged A.
+      await expect(a).rejects.toBeDefined();
+      expect(shell.closed).toBe(true);
+    });
+
     it('does not arm a timeout when the per-call budget is 0', async () => {
       const h = await buildShellHarness();
       const shell = await h.sandbox.openShell();
