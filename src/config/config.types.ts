@@ -57,6 +57,16 @@ export interface SandboxDefaultsConfig {
    * (5 min).
    */
   commandTimeoutMs?: number;
+  /**
+   * Default per-command budget (ms) for the synchronous REST exec endpoint
+   * (`POST /sandboxes/:id/command`), used when the request omits an explicit
+   * `timeoutSeconds`. Kept BELOW the upstream gateway timeout (Cloudflare cuts
+   * an origin request at ~60s) so a stuck command returns a clean exit-124 +
+   * shell reset instead of a 504. Long-running work should use the WebSocket
+   * terminal (kept on `commandTimeoutMs`, which a keepalive protects from the
+   * idle cut). 0 disables. Default 45000 (45s).
+   */
+  restCommandTimeoutMs?: number;
 }
 
 export type RuntimeType = 'microsandbox' | 'docker';

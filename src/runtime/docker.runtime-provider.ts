@@ -1066,6 +1066,10 @@ class DockerShellSession implements ShellSession {
 
   async run(command: string, opts?: ShellRunOptions): Promise<ShellRunResult> {
     const s = await this.runStream(command, opts);
+    // `events` and `done` settle from the same source; if the iterator rejects
+    // (e.g. a timeout) the for-await below throws before we await `done`, so
+    // observe `done` up front to avoid an unhandled rejection.
+    s.done.catch(() => undefined);
     let stdout = '';
     let stderr = '';
     for await (const evt of s.events) {
@@ -1091,17 +1095,11 @@ class DockerShellSession implements ShellSession {
       releaseLock = res;
     });
     this.queue = lock;
-    await previous.catch(() => undefined);
 
-    if (this._closed) {
-      releaseLock();
-      throw new Error('Shell session is closed');
-    }
-
-    const uuid = randomUUID().replace(/-/g, '');
-    const marker = `__DEVIC_END_${uuid}__`;
-    const wrapped = buildWrappedCommand(command, marker, opts);
-
+    // Event plumbing + completion are wired up BEFORE we wait for our turn so
+    // the per-command timeout can bound the queue wait, not just execution. A
+    // command stuck behind a wedged one must be able to time out on its own
+    // budget instead of waiting out the wedged command's full budget.
     const queue: ExecStreamEvent[] = [];
     let pendingResolve:
       | ((v: IteratorResult<ExecStreamEvent>) => void)
@@ -1140,13 +1138,14 @@ class DockerShellSession implements ShellSession {
       },
     );
 
-    // Per-command timeout. A command that never emits its end marker (an
-    // interactive prompt waiting on stdin, a foreground server, a hung build)
-    // would otherwise wedge this shell forever — and since the shell is shared
-    // and serialized, every later command (over REST or the WebSocket terminal)
-    // would queue behind it and hang too. On expiry we fail this command AND
-    // tear the session down, so the next caller transparently gets a fresh
-    // shell instead of inheriting the stuck one.
+    // `settled` makes completion/failure idempotent — the timeout, a stream
+    // close, and the end markers all race to finish the command exactly once.
+    // `sent` tracks whether this command reached the head of the queue and owns
+    // the shared `currentStdout/currentStderr` processors: a command still
+    // queued behind a wedged one must not null out the head command's
+    // processors when it times out (that would stop close() from aborting it).
+    let settled = false;
+    let sent = false;
     let timeoutTimer: ReturnType<typeof setTimeout> | null = null;
     const clearTimer = () => {
       if (timeoutTimer) {
@@ -1156,13 +1155,17 @@ class DockerShellSession implements ShellSession {
     };
 
     const tryComplete = () => {
+      if (settled) return;
       if (stdoutMeta === null || stderrMeta === null) return;
+      settled = true;
       // stdoutMeta has the form ":CODE:CWD"; stderrMeta is the bare line (empty).
       const parsed = parseStdoutMeta(stdoutMeta);
       clearTimer();
       finishIterable();
-      this.currentStdout = null;
-      this.currentStderr = null;
+      if (sent) {
+        this.currentStdout = null;
+        this.currentStderr = null;
+      }
       releaseLock();
       if (!parsed) {
         rejectDone(
@@ -1174,61 +1177,34 @@ class DockerShellSession implements ShellSession {
     };
 
     const failWith = (err: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimer();
       streamError = err;
       finishIterable();
-      this.currentStdout = null;
-      this.currentStderr = null;
+      if (sent) {
+        this.currentStdout = null;
+        this.currentStderr = null;
+      }
       releaseLock();
       rejectDone(err);
     };
 
-    this.currentStdout = new MarkerProcessor(
-      marker,
-      (chunk) =>
-        pushEvent({ type: 'stdout', data: Buffer.from(chunk) }),
-      (meta) => {
-        stdoutMeta = meta;
-        tryComplete();
-      },
-      failWith,
-    );
-    this.currentStderr = new MarkerProcessor(
-      marker,
-      (chunk) =>
-        pushEvent({ type: 'stderr', data: Buffer.from(chunk) }),
-      (meta) => {
-        stderrMeta = meta;
-        tryComplete();
-      },
-      failWith,
-    );
-
-    // Send the wrapped command into the shell. We append a newline so the
-    // shell parses the last statement.
-    try {
-      const ok = (this.stream as any).write(wrapped + '\n');
-      if (ok === false) {
-        await new Promise<void>((res) =>
-          (this.stream as any).once('drain', res),
-        );
-      }
-    } catch (err) {
-      failWith(err as Error);
-      throw err;
-    }
-
-    // Arm the per-command timeout now that the command is on the wire. A
-    // per-call override of 0 disables it even when a session default is set.
+    // Arm the per-command timeout up front so it bounds queue wait + execution.
+    // A command that never emits its end marker (an interactive prompt waiting
+    // on stdin, a foreground server, a hung build) would otherwise wedge this
+    // shared, serialized shell forever — making every later command (over REST
+    // or the WebSocket terminal) hang too. A per-call override of 0 disables it
+    // even when a session default is set.
     const timeoutMs = opts?.timeoutMs ?? this.defaultTimeoutMs;
     if (timeoutMs && timeoutMs > 0) {
       timeoutTimer = setTimeout(() => {
-        timeoutTimer = null;
-        if (this._closed) return;
-        // Abort this command, then tear down the wedged shell. markClosed()
-        // fires onClose, which clears the provider's cached session so the next
-        // openShell() spins up a clean one. The stuck foreground process is
-        // left orphaned inside the (resource-capped, TTL-bounded) container.
+        // Abort this command and tear down the (possibly wedged) shell so
+        // neither this caller nor anything queued behind it waits longer.
+        // markClosed() fires onClose, which clears the provider's cached
+        // session so the next openShell() spins up a clean one. A stuck
+        // foreground process is left orphaned inside the resource-capped,
+        // TTL-bounded container.
         failWith(new ShellCommandTimeoutError(timeoutMs));
         void this.close();
       }, timeoutMs);
@@ -1252,6 +1228,57 @@ class DockerShellSession implements ShellSession {
         };
       },
     };
+
+    // Wait for our turn. If we timed out (or the session died) while queued,
+    // the command is never sent — surface the already-settled done/events.
+    await previous.catch(() => undefined);
+    if (settled) {
+      return { events, done: donePromise };
+    }
+    if (this._closed) {
+      failWith(new Error('Shell session is closed'));
+      return { events, done: donePromise };
+    }
+
+    const uuid = randomUUID().replace(/-/g, '');
+    const marker = `__DEVIC_END_${uuid}__`;
+    const wrapped = buildWrappedCommand(command, marker, opts);
+
+    this.currentStdout = new MarkerProcessor(
+      marker,
+      (chunk) =>
+        pushEvent({ type: 'stdout', data: Buffer.from(chunk) }),
+      (meta) => {
+        stdoutMeta = meta;
+        tryComplete();
+      },
+      failWith,
+    );
+    this.currentStderr = new MarkerProcessor(
+      marker,
+      (chunk) =>
+        pushEvent({ type: 'stderr', data: Buffer.from(chunk) }),
+      (meta) => {
+        stderrMeta = meta;
+        tryComplete();
+      },
+      failWith,
+    );
+    // From here on this command owns the shared processors.
+    sent = true;
+
+    // Send the wrapped command into the shell. We append a newline so the
+    // shell parses the last statement.
+    try {
+      const ok = (this.stream as any).write(wrapped + '\n');
+      if (ok === false) {
+        await new Promise<void>((res) =>
+          (this.stream as any).once('drain', res),
+        );
+      }
+    } catch (err) {
+      failWith(err as Error);
+    }
 
     return { events, done: donePromise };
   }
