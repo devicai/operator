@@ -156,6 +156,21 @@ export class McpController implements OnModuleInit {
     return sandbox.sandboxId;
   }
 
+  /**
+   * Resolve a caller-supplied path against the target sandbox's workspace and
+   * assert it stays inside it. Used by the shell-backed write tools
+   * (create_directory, upload_file) so they enforce the same confinement as
+   * write_file. Throws a descriptive error when the path escapes the workspace.
+   */
+  private async confinePath(
+    id: string,
+    path: string,
+    op: 'write' | 'create directory' | 'upload',
+  ): Promise<string> {
+    const doc = await this.sandboxesService.findById(id, {});
+    return this.sandboxesService.resolveWorkspacePath(path, doc.workdir, op);
+  }
+
   private registerTools(
     server: McpServer,
     resolved: ResolvedProfile | null,
@@ -296,7 +311,7 @@ export class McpController implements OnModuleInit {
     if (this.canUseTool(resolved, 'write_file', true)) {
       server.tool(
         'write_file',
-        'Write content to a file in the sandbox.',
+        'Write content to a file in the sandbox workspace (/workspace), the persistent working directory. Paths are relative to the workspace; parent directories are created automatically. Writing outside the workspace is not allowed.',
         {
           path: z.string().describe('File path'),
           content: z.string().describe('File content'),
@@ -319,21 +334,22 @@ export class McpController implements OnModuleInit {
     if (this.canUseTool(resolved, 'create_directory', true)) {
       server.tool(
         'create_directory',
-        'Create a directory in the sandbox.',
+        'Create a directory in the sandbox workspace (/workspace). Paths are relative to the workspace; creating directories outside it is not allowed.',
         {
-          path: z.string().describe('Directory path to create'),
+          path: z.string().describe('Directory path to create, relative to the workspace (/workspace)'),
           sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
         async ({ path, sandboxId }: { path: string; sandboxId?: string }) => {
           try {
             const id = await this.resolveSandbox(session, sandboxId, 'create_directory');
+            const safePath = await this.confinePath(id, path, 'create directory');
             await this.sandboxesService.runCommand(
               id,
-              { command: `mkdir -p '${path}'` },
+              { command: `mkdir -p '${safePath.replace(/'/g, `'\\''`)}'` },
               {},
             );
             return {
-              content: [{ type: 'text' as const, text: `Directory created: ${path}` }],
+              content: [{ type: 'text' as const, text: `Directory created: ${safePath}` }],
             };
           } catch (error) {
             return errorResult((error as Error).message);
@@ -405,22 +421,25 @@ export class McpController implements OnModuleInit {
     if (this.canUseTool(resolved, 'upload_file', true)) {
       server.tool(
         'upload_file',
-        'Download a file from a URL and save it to the sandbox.',
+        'Download a file from a URL and save it into the sandbox workspace (/workspace). The destination is relative to the workspace; saving outside it is not allowed.',
         {
           url: z.string().describe('Public URL to download from'),
-          path: z.string().describe('Destination path in the sandbox'),
+          path: z.string().describe('Destination path, relative to the workspace (/workspace)'),
           sandboxId: z.string().optional().describe(SANDBOX_ID_DESC),
         } as any,
         async ({ url, path, sandboxId }: { url: string; path: string; sandboxId?: string }) => {
           try {
             const id = await this.resolveSandbox(session, sandboxId, 'upload_file');
+            const safePath = await this.confinePath(id, path, 'upload');
+            const escapedPath = safePath.replace(/'/g, `'\\''`);
+            const escapedUrl = url.replace(/'/g, `'\\''`);
             await this.sandboxesService.runCommand(
               id,
-              { command: `curl -fsSL -o '${path}' '${url}'` },
+              { command: `mkdir -p "$(dirname '${escapedPath}')" && curl -fsSL -o '${escapedPath}' '${escapedUrl}'` },
               {},
             );
             return {
-              content: [{ type: 'text' as const, text: `File downloaded to: ${path}` }],
+              content: [{ type: 'text' as const, text: `File downloaded to: ${safePath}` }],
             };
           } catch (error) {
             return errorResult((error as Error).message);

@@ -1,5 +1,6 @@
 import { Injectable, Logger } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import { posix } from 'path';
 import type {
   Sandbox as MsbSandbox,
   SandboxConfig,
@@ -205,6 +206,13 @@ class MicrosandboxSandbox implements RuntimeSandbox {
   }
 
   async writeFile(path: string, content: Buffer): Promise<void> {
+    // Ensure the parent directory exists before writing, matching the Docker
+    // provider. Without this, writing to a not-yet-created sub-path of the
+    // workspace fails with a low-level "path not found" error.
+    const dir = posix.dirname(path);
+    if (dir && dir !== '.' && dir !== '/') {
+      await this.exec(`mkdir -p '${dir.replace(/'/g, `'\\''`)}'`);
+    }
     await this.inst.fs().write(path, content);
   }
 

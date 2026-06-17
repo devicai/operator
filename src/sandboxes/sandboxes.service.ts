@@ -21,6 +21,11 @@ import {
   ShellCommandTimeoutError,
 } from '../runtime/runtime-provider.interface';
 import { isImageAllowed, sanitizeHostPorts } from '../runtime/admission.util';
+import {
+  resolveWithinWorkspace,
+  describeRuntimeFsError,
+  WorkspaceConfinementError,
+} from '../runtime/workspace-path.util';
 
 @Injectable()
 export class SandboxesService {
@@ -362,8 +367,16 @@ export class SandboxesService {
     scope: ExtensionScope,
   ): Promise<void> {
     const doc = await this.findById(id, scope);
+    // Writes are confined to the sandbox workspace. Anything resolving outside
+    // it (e.g. /tmp, ../etc) is refused with an actionable message instead of
+    // being attempted and failing with a leaky runtime error.
+    const safePath = this.confineToWorkspace(filePath, doc.workdir, 'write');
     const sandbox = await this.getSandboxInstance(doc);
-    await sandbox.writeFile(filePath, Buffer.from(content));
+    try {
+      await sandbox.writeFile(safePath, Buffer.from(content));
+    } catch (err) {
+      throw this.translateFsError(err, safePath, 'write');
+    }
   }
 
   async readFile(
@@ -373,8 +386,55 @@ export class SandboxesService {
   ): Promise<string> {
     const doc = await this.findById(id, scope);
     const sandbox = await this.getSandboxInstance(doc);
-    const data = await sandbox.readFile(filePath);
-    return data.toString('utf-8');
+    try {
+      const data = await sandbox.readFile(filePath);
+      return data.toString('utf-8');
+    } catch (err) {
+      throw this.translateFsError(err, filePath, 'read');
+    }
+  }
+
+  /**
+   * Resolve `filePath` against the sandbox workspace and assert it stays inside
+   * it, returning the normalized absolute path. Throws a clean 400 (not a leaky
+   * runtime error) when the target is outside the workspace. Shared by the REST
+   * and MCP write paths so the rule is enforced once, regardless of entry point.
+   */
+  resolveWorkspacePath(
+    filePath: string,
+    workdir: string,
+    op: 'write' | 'create directory' | 'upload' = 'write',
+  ): string {
+    return this.confineToWorkspace(filePath, workdir, op);
+  }
+
+  private confineToWorkspace(
+    filePath: string,
+    workdir: string,
+    op: 'write' | 'create directory' | 'upload',
+  ): string {
+    try {
+      return resolveWithinWorkspace(filePath, workdir, op);
+    } catch (err) {
+      if (err instanceof WorkspaceConfinementError) {
+        throw new BadRequestException(err.message);
+      }
+      throw err;
+    }
+  }
+
+  private translateFsError(
+    err: unknown,
+    path: string,
+    op: 'read' | 'write',
+  ): Error {
+    const friendly = describeRuntimeFsError(err, { path, op });
+    if (friendly) {
+      return op === 'read'
+        ? new NotFoundException(friendly)
+        : new BadRequestException(friendly);
+    }
+    return err as Error;
   }
 
   async stop(id: string, scope: ExtensionScope): Promise<SandboxDocument> {

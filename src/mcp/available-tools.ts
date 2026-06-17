@@ -48,20 +48,21 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
   },
   {
     name: 'write_file',
-    description: 'Write content to a file in the sandbox.',
+    description:
+      'Write content to a file in the sandbox workspace (/workspace), the persistent working directory. Paths are relative to the workspace; parent directories are created automatically. Writing outside the workspace is not allowed.',
     writeAccess: true,
     parameters: [
-      { name: 'path', type: 'string', required: true, description: 'File path in the sandbox' },
+      { name: 'path', type: 'string', required: true, description: 'File path, relative to the workspace (/workspace). Paths outside the workspace are rejected.' },
       { name: 'content', type: 'string', required: true, description: 'File content to write' },
       SANDBOX_ID_PARAM,
     ],
   },
   {
     name: 'create_directory',
-    description: 'Create a directory in the sandbox.',
+    description: 'Create a directory in the sandbox workspace (/workspace). Paths are relative to the workspace; creating directories outside it is not allowed.',
     writeAccess: true,
     parameters: [
-      { name: 'path', type: 'string', required: true, description: 'Directory path to create' },
+      { name: 'path', type: 'string', required: true, description: 'Directory path to create, relative to the workspace (/workspace).' },
       SANDBOX_ID_PARAM,
     ],
   },
@@ -82,11 +83,11 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
   },
   {
     name: 'upload_file',
-    description: 'Download a file from a URL and save it to the sandbox.',
+    description: 'Download a file from a URL and save it into the sandbox workspace (/workspace). The destination is relative to the workspace; saving outside it is not allowed.',
     writeAccess: true,
     parameters: [
       { name: 'url', type: 'string', required: true, description: 'Public URL to download from' },
-      { name: 'path', type: 'string', required: true, description: 'Destination path in the sandbox' },
+      { name: 'path', type: 'string', required: true, description: 'Destination path, relative to the workspace (/workspace). Paths outside the workspace are rejected.' },
       SANDBOX_ID_PARAM,
     ],
   },
