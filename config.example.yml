@@ -19,6 +19,13 @@ defaults:
   defaultImage: node:24
   defaultCpus: 1
   defaultMemoryMib: 256
+  # Memory floor (MiB) for sandboxes restored from a snapshot via the user-facing
+  # restore endpoint. Restores back persistent environments that install CLIs
+  # (`npm i …`), which swap and time out at 256 MiB. A restore never drops below
+  # this floor; an explicit `memoryMib` or a higher value recorded in the snapshot
+  # still wins. The on-demand hot pool is exempt (see hotPool.memoryMibPerSandbox).
+  # Default 512.
+  snapshotMemoryMib: 512
   defaultTtlSeconds: 1800
   maxTtlSeconds: 7200
   ttlCheckIntervalMs: 30000

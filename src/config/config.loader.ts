@@ -58,6 +58,7 @@ export function loadConfig(configPath?: string): ModuleConfig {
     defaultImage: 'node:24',
     defaultCpus: 1,
     defaultMemoryMib: 256,
+    snapshotMemoryMib: 512,
     defaultTtlSeconds: 1800,
     maxTtlSeconds: 7200,
     ttlCheckIntervalMs: 30000,
