@@ -28,6 +28,7 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSnapshotDto, SnapshotScope } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
+import { resolveRestoreMemoryMib } from './restore-resources.util';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import {
   RUNTIME_PROVIDER,
@@ -325,7 +326,19 @@ export class SnapshotsService {
     const containerName = `sandbox-${sandboxId}`;
     const ttlSeconds = dto.ttlSeconds ?? defaults.defaultTtlSeconds;
     const expiresAt = new Date(Date.now() + ttlSeconds * 1000);
-    const restoreMemoryMib = dto.memoryMib ?? snapshot.memoryMib;
+
+    // User restores back interactive / persistent environments that install
+    // CLIs (`npm i …`), which swap and blow the 45s REST budget at the 256 MiB
+    // hot slice. resolveRestoreMemoryMib applies a floor so a restored sandbox
+    // doesn't inherit it; hot-reserve provisioning is exempt. See the util.
+    const restoreMemoryMib = resolveRestoreMemoryMib({
+      requestedMemoryMib: dto.memoryMib,
+      snapshotMemoryMib: snapshot.memoryMib,
+      defaultMemoryMib: defaults.defaultMemoryMib,
+      snapshotFloorMib: defaults.snapshotMemoryMib ?? 512,
+      hotReserved: options.hotReserved,
+    });
+    const restoreCpus = dto.cpus ?? snapshot.cpus;
 
     if (!options.skipMemoryCheck) {
       await this.resourceUsage.assertMemoryAvailable(restoreMemoryMib);
@@ -341,8 +354,8 @@ export class SnapshotsService {
         image: snapshot.image,
         workdir: snapshot.workdir,
         currentCwd: snapshot.metadata?.currentCwd ?? snapshot.workdir,
-        cpus: dto.cpus ?? snapshot.cpus,
-        memoryMib: dto.memoryMib ?? snapshot.memoryMib,
+        cpus: restoreCpus,
+        memoryMib: restoreMemoryMib,
         envVars: snapshot.envVars ?? {},
         ports: snapshot.ports ?? {},
         ttlSeconds,
@@ -368,8 +381,8 @@ export class SnapshotsService {
         name: containerName,
         image: snapshot.image,
         workdir: snapshot.workdir,
-        cpus: dto.cpus ?? snapshot.cpus,
-        memoryMib: dto.memoryMib ?? snapshot.memoryMib,
+        cpus: restoreCpus,
+        memoryMib: restoreMemoryMib,
         env: snapshot.envVars ?? {},
         ports: snapshot.ports ?? {},
         networkPolicy: 'allow-all',

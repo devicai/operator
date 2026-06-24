@@ -41,6 +41,18 @@ export interface SandboxDefaultsConfig {
   defaultImage: string;
   defaultCpus: number;
   defaultMemoryMib: number;
+  /**
+   * Memory floor (MiB) applied to sandboxes restored from a snapshot via the
+   * user-facing restore endpoint. Restores back interactive / persistent
+   * environments that install CLIs (`npm i …`), which need more RAM than the
+   * lightweight on-demand hot-pool slices — at 256 MiB npm swaps and a single
+   * `npm i` can blow the 45s REST budget (exit 124 + shell reset). A restored
+   * sandbox never drops below this floor; it still keeps a higher value if the
+   * snapshot recorded one, and an explicit `memoryMib` in the restore request
+   * always wins. Hot-reserve provisioning (the on-demand pool) is exempt and
+   * stays on `hotPool.memoryMibPerSandbox`. Default 512.
+   */
+  snapshotMemoryMib?: number;
   defaultTtlSeconds: number;
   maxTtlSeconds: number;
   ttlCheckIntervalMs: number;
