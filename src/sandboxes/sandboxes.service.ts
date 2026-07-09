@@ -21,6 +21,16 @@ import {
   ShellCommandTimeoutError,
 } from '../runtime/runtime-provider.interface';
 import { isImageAllowed, sanitizeHostPorts } from '../runtime/admission.util';
+import {
+  buildListDirScript,
+  parseListDirOutput,
+  SandboxFileEntry,
+} from './sandbox-ls.util';
+import { join } from 'path';
+import * as posixPath from 'path/posix';
+import { tmpdir } from 'os';
+import { createReadStream, statSync, existsSync, unlinkSync, rm } from 'fs';
+import { Readable } from 'stream';
 
 @Injectable()
 export class SandboxesService {
@@ -375,6 +385,129 @@ export class SandboxesService {
     const sandbox = await this.getSandboxInstance(doc);
     const data = await sandbox.readFile(filePath);
     return data.toString('utf-8');
+  }
+
+  // ---------------------------------------------------------------------------
+  // File explorer
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Structured listing of a directory's direct children. Defaults to the
+   * sandbox's current working directory when no path is given.
+   */
+  async listFiles(
+    id: string,
+    dirPath: string | undefined,
+    scope: ExtensionScope,
+  ): Promise<{ path: string; entries: SandboxFileEntry[] }> {
+    const doc = await this.findById(id, scope);
+    if (doc.status !== SandboxStatus.RUNNING) {
+      throw new BadRequestException(
+        `Sandbox is not running (status: ${doc.status})`,
+      );
+    }
+    const sandbox = await this.getSandboxInstance(doc);
+    const target = dirPath || doc.currentCwd || doc.workdir;
+
+    const result = await sandbox.exec(buildListDirScript(target));
+    const parsed = parseListDirOutput(result.stdout);
+    if ('error' in parsed) {
+      throw new BadRequestException(
+        parsed.error === 'missing'
+          ? `Path not found: ${target}`
+          : `Not a directory: ${target}`,
+      );
+    }
+    return { path: target, entries: parsed.entries };
+  }
+
+  /**
+   * Stream a file out of the sandbox. The runtime copies it to a host temp
+   * file (streamed, binary-safe on both runtimes) which is unlinked once the
+   * response stream closes.
+   */
+  async downloadFile(
+    id: string,
+    filePath: string,
+    scope: ExtensionScope,
+  ): Promise<{ stream: Readable; filename: string; sizeBytes?: number }> {
+    if (!filePath) throw new BadRequestException('path is required');
+    const doc = await this.findById(id, scope);
+    if (doc.status !== SandboxStatus.RUNNING) {
+      throw new BadRequestException(
+        `Sandbox is not running (status: ${doc.status})`,
+      );
+    }
+    const sandbox = await this.getSandboxInstance(doc);
+
+    const hostTmp = join(tmpdir(), `operator-dl-${nanoid(10)}`);
+    try {
+      await sandbox.copyToHost(filePath, hostTmp);
+    } catch (err) {
+      throw new BadRequestException(
+        `Could not read ${filePath}: ${(err as Error).message}`,
+      );
+    }
+
+    let sizeBytes: number | undefined;
+    try {
+      sizeBytes = statSync(hostTmp).size;
+    } catch {}
+
+    const stream = createReadStream(hostTmp);
+    stream.on('close', () => rm(hostTmp, { force: true }, () => {}));
+    return { stream, filename: posixPath.basename(filePath), sizeBytes };
+  }
+
+  /**
+   * Upload a file into the sandbox. Destinations ending in `/` get the
+   * original filename appended. Writes are confined to the workspace.
+   */
+  async uploadFile(
+    id: string,
+    destPath: string,
+    file: Express.Multer.File,
+    scope: ExtensionScope,
+  ): Promise<{ path: string; sizeBytes: number }> {
+    if (!file) {
+      throw new BadRequestException("multipart field 'file' is required");
+    }
+    try {
+      const doc = await this.findById(id, scope);
+      if (doc.status !== SandboxStatus.RUNNING) {
+        throw new BadRequestException(
+          `Sandbox is not running (status: ${doc.status})`,
+        );
+      }
+      const sandbox = await this.getSandboxInstance(doc);
+
+      let target = destPath || `${doc.workdir}/`;
+      if (target.endsWith('/')) target = target + file.originalname;
+      const safePath = this.confineUploadToWorkspace(target, doc.workdir);
+
+      await sandbox.copyFromHost(file.path, safePath);
+      return { path: safePath, sizeBytes: file.size };
+    } finally {
+      try {
+        if (file?.path && existsSync(file.path)) unlinkSync(file.path);
+      } catch {}
+    }
+  }
+
+  /**
+   * Resolve an upload destination and require it to stay inside the sandbox
+   * workspace. Relative paths resolve against the workdir.
+   */
+  private confineUploadToWorkspace(p: string, workdir: string): string {
+    const absolute = p.startsWith('/') ? p : posixPath.join(workdir, p);
+    const normalized = posixPath.normalize(absolute);
+    const root = workdir.endsWith('/') ? workdir : `${workdir}/`;
+    if (normalized !== workdir && !normalized.startsWith(root)) {
+      throw new BadRequestException(
+        `Uploads are restricted to the workspace (${workdir})`,
+      );
+    }
+    return normalized;
   }
 
   async stop(id: string, scope: ExtensionScope): Promise<SandboxDocument> {

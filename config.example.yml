@@ -118,6 +118,12 @@ snapshots:
   compression: auto
   cleanup: conservative
 
+# Size limits (MiB) for multipart uploads. Keep aligned with the reverse
+# proxy's client_max_body_size (see frontend/nginx.conf).
+uploads:
+  maxSnapshotZipMb: 512
+  maxFileMb: 100
+
 # Hard caps applied module-wide (across all tenants).
 # Omit a field or set it to 0 to disable that specific limit.
 resourceLimits:

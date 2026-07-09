@@ -15,6 +15,8 @@ import type {
   SnapshotDto,
   CreateSnapshotDto,
   RestoreSnapshotDto,
+  ImportSnapshotDto,
+  ListFilesResult,
   UsageSummary,
   HotPoolStatus,
   HotPoolConfig,
@@ -89,6 +91,23 @@ export const sandboxesApi = {
   writeFile(id: string, path: string, content: string): Promise<AxiosResponse<void>> {
     return api.post(`/sandboxes/${id}/files`, { path, content });
   },
+  listFiles(id: string, path?: string): Promise<AxiosResponse<ListFilesResult>> {
+    return api.get(`/sandboxes/${id}/files/list`, { params: path ? { path } : {} });
+  },
+  downloadFile(id: string, path: string): Promise<AxiosResponse<Blob>> {
+    return api.get(`/sandboxes/${id}/files/download`, {
+      params: { path },
+      responseType: 'blob',
+    });
+  },
+  uploadFile(id: string, path: string, file: File): Promise<AxiosResponse<{ path: string; sizeBytes: number }>> {
+    const formData = new FormData();
+    formData.append('file', file);
+    formData.append('path', path);
+    return api.post(`/sandboxes/${id}/files/upload`, formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+    });
+  },
 };
 
 // Sandbox Profiles
@@ -148,6 +167,29 @@ export const snapshotsApi = {
   },
   delete(id: string): Promise<AxiosResponse<void>> {
     return api.delete(`/snapshots/${id}`);
+  },
+  download(id: string): Promise<AxiosResponse<Blob>> {
+    return api.get(`/snapshots/${id}/download`, { responseType: 'blob' });
+  },
+  import(
+    file: File,
+    dto: ImportSnapshotDto = {},
+    onUploadProgress?: (percent: number) => void,
+  ): Promise<AxiosResponse<SnapshotDto>> {
+    const formData = new FormData();
+    formData.append('file', file);
+    if (dto.name) formData.append('name', dto.name);
+    if (dto.description) formData.append('description', dto.description);
+    if (dto.workdir) formData.append('workdir', dto.workdir);
+    if (dto.image) formData.append('image', dto.image);
+    return api.post('/snapshots/import', formData, {
+      headers: { 'Content-Type': 'multipart/form-data' },
+      onUploadProgress: (e) => {
+        if (onUploadProgress && e.total) {
+          onUploadProgress(Math.round((e.loaded / e.total) * 100));
+        }
+      },
+    });
   },
 };
 

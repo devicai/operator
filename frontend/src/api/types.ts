@@ -185,6 +185,27 @@ export interface RestoreSnapshotDto {
   linked?: boolean;
 }
 
+export interface ImportSnapshotDto {
+  name?: string;
+  description?: string;
+  workdir?: string;
+  image?: string;
+}
+
+// File explorer
+export interface FileEntryDto {
+  name: string;
+  type: 'file' | 'dir' | 'symlink' | 'other';
+  sizeBytes: number;
+  mtime: string | null;
+  target?: string;
+}
+
+export interface ListFilesResult {
+  path: string;
+  entries: FileEntryDto[];
+}
+
 // Resource usage
 export interface UsageSummary {
   memory: {

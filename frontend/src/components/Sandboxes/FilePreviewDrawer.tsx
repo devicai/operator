@@ -30,8 +30,11 @@ function getExt(fileName: string): string {
   return dot >= 0 ? fileName.slice(dot).toLowerCase() : '';
 }
 
-export function triggerDownload(content: string, fileName: string) {
-  const blob = new Blob([content], { type: 'application/octet-stream' });
+export function triggerDownload(content: string | Blob, fileName: string) {
+  const blob =
+    content instanceof Blob
+      ? content
+      : new Blob([content], { type: 'application/octet-stream' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
   a.href = url;

@@ -17,14 +17,20 @@ import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
   faCamera,
   faCodeBranch,
+  faFileArrowDown,
+  faFileArrowUp,
   faPlay,
   faTrash,
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSnapshots, useRestoreSnapshot, useDeleteSnapshot } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
+import { snapshotsApi } from '../../api/client';
 import type { SnapshotDto } from '../../api/types';
 import UsagePanel from '../Usage/UsagePanel';
+import ImportSnapshotModal from './ImportSnapshotModal';
+import { triggerDownload } from '../Sandboxes/FilePreviewDrawer';
+import { formatDateTime, formatRelative } from '../../utils/date';
 
 const { Title, Text } = Typography;
 
@@ -42,14 +48,12 @@ function formatSize(bytes: number): string {
   return `${(bytes / Math.pow(1024, i)).toFixed(1)} ${units[i]}`;
 }
 
-function formatDate(iso: string): string {
-  return new Date(iso).toLocaleString();
-}
-
 const SnapshotsPage: React.FC = () => {
   const [modalOpen, setModalOpen] = useState(false);
   const [modalMode, setModalMode] = useState<'restore' | 'fork'>('restore');
   const [selectedSnapshot, setSelectedSnapshot] = useState<SnapshotDto | null>(null);
+  const [importOpen, setImportOpen] = useState(false);
+  const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
   const [form] = Form.useForm();
 
   const { data, isLoading } = useSnapshots();
@@ -73,6 +77,32 @@ const SnapshotsPage: React.FC = () => {
       memoryMib: snapshot.memoryMib,
     });
     setModalOpen(true);
+  };
+
+  const handleDownloadZip = async (row: SnapshotDto) => {
+    setDownloadingIds((prev) => new Set(prev).add(row.snapshotId));
+    try {
+      const res = await snapshotsApi.download(row.snapshotId);
+      const disposition = res.headers?.['content-disposition'] as string | undefined;
+      const match = disposition?.match(/filename="([^"]+)"/);
+      const fileName = match?.[1] ?? `${row.name}-${row.snapshotId}.zip`;
+      triggerDownload(res.data, fileName);
+      message.success(`Downloaded ${fileName}`);
+    } catch (e: any) {
+      // Blob error responses need decoding before we can show the message
+      let msg = e?.message ?? 'Download failed';
+      try {
+        const text = await (e?.response?.data as Blob)?.text?.();
+        if (text) msg = JSON.parse(text)?.message ?? msg;
+      } catch {}
+      message.error(msg);
+    } finally {
+      setDownloadingIds((prev) => {
+        const next = new Set(prev);
+        next.delete(row.snapshotId);
+        return next;
+      });
+    }
   };
 
   const handleSubmit = async () => {
@@ -105,6 +135,11 @@ const SnapshotsPage: React.FC = () => {
       render: (name: string, row) => (
         <div>
           <code style={{ fontSize: 12 }}>{name}</code>
+          {row.metadata?.importedFromZip && (
+            <Tag color="purple" style={{ fontSize: 10, marginLeft: 6 }}>
+              imported
+            </Tag>
+          )}
           {row.description && (
             <div style={{ fontSize: 11, color: '#888', marginTop: 2 }}>{row.description}</div>
           )}
@@ -161,13 +196,30 @@ const SnapshotsPage: React.FC = () => {
       title: 'Created',
       dataIndex: 'createdAt',
       key: 'createdAt',
-      width: 160,
-      render: (d: string) => <span style={{ fontSize: 11 }}>{formatDate(d)}</span>,
+      width: 130,
+      render: (d: string) => (
+        <Tooltip title={formatRelative(d)}>
+          <span style={{ fontSize: 11 }}>{formatDateTime(d)}</span>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Last saved',
+      key: 'lastSaved',
+      width: 130,
+      render: (_: any, row) => {
+        const lastSaved = (row.metadata?.lastPersistedAt as string) ?? row.updatedAt;
+        return (
+          <Tooltip title={formatRelative(lastSaved)}>
+            <span style={{ fontSize: 11 }}>{formatDateTime(lastSaved)}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: '',
       key: 'actions',
-      width: 130,
+      width: 160,
       align: 'right',
       render: (_: any, row) => (
         <Space size={4}>
@@ -185,6 +237,14 @@ const SnapshotsPage: React.FC = () => {
                   size="small"
                   icon={<FontAwesomeIcon icon={faCodeBranch} />}
                   onClick={() => openModal(row, 'fork')}
+                />
+              </Tooltip>
+              <Tooltip title="Download ZIP">
+                <Button
+                  size="small"
+                  icon={<FontAwesomeIcon icon={faFileArrowDown} />}
+                  loading={downloadingIds.has(row.snapshotId)}
+                  onClick={() => handleDownloadZip(row)}
                 />
               </Tooltip>
             </>
@@ -216,6 +276,12 @@ const SnapshotsPage: React.FC = () => {
           <FontAwesomeIcon icon={faCamera} style={{ marginRight: 8 }} />
           Snapshots
         </Title>
+        <Button
+          icon={<FontAwesomeIcon icon={faFileArrowUp} />}
+          onClick={() => setImportOpen(true)}
+        >
+          Import ZIP
+        </Button>
       </div>
 
       <UsagePanel usage={usage} loading={usageLoading} />
@@ -262,7 +328,7 @@ const SnapshotsPage: React.FC = () => {
                     </span>
                   </Tooltip>
                 </Table.Summary.Cell>
-                <Table.Summary.Cell index={6} colSpan={2} />
+                <Table.Summary.Cell index={6} colSpan={3} />
               </Table.Summary.Row>
             </Table.Summary>
           ) : null
@@ -304,6 +370,8 @@ const SnapshotsPage: React.FC = () => {
           </Form.Item>
         </Form>
       </Modal>
+
+      <ImportSnapshotModal open={importOpen} onClose={() => setImportOpen(false)} />
     </div>
   );
 };

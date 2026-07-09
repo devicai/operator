@@ -56,6 +56,8 @@
     "reflect-metadata": "^0.2.0",
     "rxjs": "^7.8.0",
     "tar-stream": "^3.2.0",
+    "yauzl": "^3.4.0",
+    "yazl": "^3.3.1",
     "zod": "^3.24.0"
   },
   "devDependencies": {
@@ -66,9 +68,12 @@
     "@types/express": "^5.0.0",
     "@types/jest": "^29.5.0",
     "@types/js-yaml": "^4.0.9",
+    "@types/multer": "^2.2.0",
     "@types/node": "^22.0.0",
     "@types/tar-stream": "^3.1.4",
     "@types/ws": "^8.5.0",
+    "@types/yauzl": "^3.4.0",
+    "@types/yazl": "^3.3.1",
     "@typescript-eslint/eslint-plugin": "^8.0.0",
     "@typescript-eslint/parser": "^8.0.0",
     "eslint": "^9.0.0",

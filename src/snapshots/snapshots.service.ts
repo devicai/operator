@@ -28,6 +28,9 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSnapshotDto, SnapshotScope } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
+import { ImportSnapshotDto } from './dto/import-snapshot.dto';
+import { tarballToZipStream, zipToTarGz } from './snapshot-zip.util';
+import { Readable } from 'stream';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import {
   RUNTIME_PROVIDER,
@@ -455,6 +458,136 @@ export class SnapshotsService {
 
     await this.snapshotRepo.deleteById((doc as any)._id.toString(), scope);
     this.logger.log(`Snapshot ${doc.snapshotId} destroyed`);
+  }
+
+  // ---------------------------------------------------------------------------
+  // ZIP export / import
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Stream the snapshot contents as a ZIP archive. The on-disk tarball is
+   * converted entry by entry, so memory stays flat for large snapshots.
+   * Symlinks/devices have no ZIP representation and are skipped (logged).
+   */
+  async downloadAsZip(
+    id: string,
+    scope: ExtensionScope,
+  ): Promise<{ stream: Readable; filename: string }> {
+    const doc = await this.findById(id, scope);
+    if (doc.status !== SnapshotStatus.READY) {
+      throw new BadRequestException(
+        `Snapshot is not ready (status: ${doc.status})`,
+      );
+    }
+
+    const onDisk = this.resolveSnapshotPath(doc.snapshotPath);
+    if (!existsSync(onDisk)) {
+      throw new NotFoundException(
+        `Snapshot ${doc.snapshotId} artifact not found on disk`,
+      );
+    }
+
+    const codec: Codec = doc.compression === 'zstd' ? 'zstd' : 'gzip';
+    if (
+      codec === 'zstd' &&
+      typeof (zlib as any).createZstdDecompress !== 'function'
+    ) {
+      throw new BadRequestException(
+        'This snapshot is zstd-compressed but the server Node build has no zstd support',
+      );
+    }
+
+    const { outputStream, done } = tarballToZipStream(onDisk, codec);
+    done
+      .then(({ files, skipped }) => {
+        if (skipped > 0) {
+          this.logger.warn(
+            `ZIP export of snapshot ${doc.snapshotId}: ${skipped} non-file entries (symlinks/devices) were skipped (${files} files exported)`,
+          );
+        }
+      })
+      .catch((err) =>
+        this.logger.error(
+          `ZIP export of snapshot ${doc.snapshotId} failed mid-stream: ${(err as Error).message}`,
+        ),
+      );
+
+    const safeName = (doc.name || 'snapshot').replace(/[^\w.-]+/g, '_');
+    return { stream: outputStream, filename: `${safeName}-${doc.snapshotId}.zip` };
+  }
+
+  /**
+   * Create a workdir-scope snapshot from an uploaded ZIP of files: the archive
+   * is repacked into the tar.gz layout restore expects, so its entries land in
+   * the working directory of any sandbox restored from it. The document
+   * self-references `sandboxId` (there is no source sandbox) and is flagged
+   * with `metadata.importedFromZip`.
+   */
+  async importFromZip(
+    file: Express.Multer.File,
+    dto: ImportSnapshotDto,
+    scope: ExtensionScope,
+  ): Promise<SnapshotDocument> {
+    if (!file) {
+      throw new BadRequestException("multipart field 'file' is required");
+    }
+
+    await this.resourceUsage.assertDiskAvailable();
+
+    const snapshotId = nanoid(12);
+    const snapshotPath = join(SNAPSHOTS_DIR, `${snapshotId}.tar.gz`);
+
+    try {
+      const { files } = await zipToTarGz(file.path, snapshotPath);
+
+      let sizeBytes = 0;
+      try {
+        sizeBytes = statSync(snapshotPath).size;
+      } catch {}
+
+      const doc = await this.snapshotRepo.create(
+        {
+          snapshotId,
+          sandboxId: snapshotId,
+          name: dto.name || `imported-${snapshotId}`,
+          description: dto.description || '',
+          status: SnapshotStatus.READY,
+          image: dto.image || this.config.defaults.defaultImage,
+          workdir: dto.workdir || '/workspace',
+          scope: 'workdir',
+          compression: 'gzip',
+          cpus: this.config.defaults.defaultCpus,
+          memoryMib: this.config.defaults.defaultMemoryMib,
+          envVars: {},
+          ports: {},
+          snapshotPath,
+          sizeBytes,
+          metadata: {
+            importedFromZip: true,
+            originalFilename: file.originalname,
+            fileCount: files,
+          },
+        } as any,
+        scope,
+      );
+
+      this.logger.log(
+        `Snapshot ${snapshotId} imported from ZIP '${file.originalname}' (${files} files, ${sizeBytes} bytes)`,
+      );
+      return doc;
+    } catch (err) {
+      try {
+        if (existsSync(snapshotPath)) unlinkSync(snapshotPath);
+      } catch {}
+      if (err instanceof BadRequestException) throw err;
+      throw new BadRequestException(
+        `Could not import ZIP: ${(err as Error).message}`,
+      );
+    } finally {
+      try {
+        if (file?.path && existsSync(file.path)) unlinkSync(file.path);
+      } catch {}
+    }
   }
 
   /**
