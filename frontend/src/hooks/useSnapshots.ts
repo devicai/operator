@@ -1,6 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { snapshotsApi } from '../api/client';
-import type { CreateSnapshotDto, RestoreSnapshotDto } from '../api/types';
+import type {
+  CreateSnapshotDto,
+  RestoreSnapshotDto,
+  ImportSnapshotDto,
+} from '../api/types';
 
 const SNAPSHOTS_KEY = 'snapshots';
 const SANDBOXES_KEY = 'sandboxes';
@@ -32,6 +36,23 @@ export function useRestoreSnapshot() {
       queryClient.invalidateQueries({ queryKey: [SNAPSHOTS_KEY] });
       queryClient.invalidateQueries({ queryKey: [SANDBOXES_KEY] });
     },
+  });
+}
+
+export function useImportSnapshot() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({
+      file,
+      dto,
+      onProgress,
+    }: {
+      file: File;
+      dto?: ImportSnapshotDto;
+      onProgress?: (percent: number) => void;
+    }) => snapshotsApi.import(file, dto, onProgress).then((res) => res.data),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: [SNAPSHOTS_KEY] }),
   });
 }
 

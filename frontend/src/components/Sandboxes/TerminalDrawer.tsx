@@ -1,11 +1,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { Button, Drawer, Spin, Tooltip, Typography, message } from 'antd';
+import { Button, Drawer, Spin, Tabs, Tooltip, Typography, message } from 'antd';
 import { LoadingOutlined, UploadOutlined } from '@ant-design/icons';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
-import { faCircle, faDownload } from '@fortawesome/free-solid-svg-icons';
+import { faCircle, faDownload, faFolderTree, faTerminal } from '@fortawesome/free-solid-svg-icons';
 import { sandboxesApi } from '../../api/client';
 import type { SandboxDto } from '../../api/types';
 import FilePreviewDrawer, { isPreviewable, triggerDownload } from './FilePreviewDrawer';
+import FileExplorer from './FileExplorer';
 
 const { Text } = Typography;
 
@@ -210,6 +211,7 @@ const TerminalDrawer: React.FC<Props> = ({ sandbox, onClose }) => {
   const [currentCwd, setCurrentCwd] = useState('~');
   const [previewFile, setPreviewFile] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
+  const [activeTab, setActiveTab] = useState<'terminal' | 'files'>('terminal');
   const terminalRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -223,6 +225,7 @@ const TerminalDrawer: React.FC<Props> = ({ sandbox, onClose }) => {
       ]);
       setInputValue('');
       setPreviewFile(null);
+      setActiveTab('terminal');
     } else {
       setLines([]);
       setCurrentCwd('~');
@@ -277,8 +280,7 @@ const TerminalDrawer: React.FC<Props> = ({ sandbox, onClose }) => {
       const destPath = `${cwd}${file.name}`;
 
       try {
-        const content = await file.text();
-        await sandboxesApi.writeFile(sandbox.sandboxId, destPath, content);
+        await sandboxesApi.uploadFile(sandbox.sandboxId, destPath, file);
         setLines((prev) => [
           ...prev,
           { type: 'system', content: `Uploaded ${file.name} → ${destPath} (${(file.size / 1024).toFixed(1)} KB)` },
@@ -362,6 +364,32 @@ const TerminalDrawer: React.FC<Props> = ({ sandbox, onClose }) => {
           body: { padding: 0, backgroundColor: '#1a1a2e' },
         }}
       >
+        <style>{`
+          .sandbox-drawer-tabs { height: 100%; display: flex; flex-direction: column; }
+          .sandbox-drawer-tabs .ant-tabs-content-holder { flex: 1; overflow: hidden; }
+          .sandbox-drawer-tabs .ant-tabs-content { height: 100%; }
+          .sandbox-drawer-tabs .ant-tabs-tabpane { height: 100%; }
+        `}</style>
+        <Tabs
+          className="sandbox-drawer-tabs"
+          activeKey={activeTab}
+          onChange={(key) => setActiveTab(key as 'terminal' | 'files')}
+          tabBarStyle={{
+            margin: 0,
+            padding: '0 16px',
+            backgroundColor: '#1a1a2e',
+            borderBottom: '1px solid rgba(255,255,255,0.08)',
+          }}
+          items={[
+            {
+              key: 'terminal',
+              label: (
+                <span>
+                  <FontAwesomeIcon icon={faTerminal} style={{ marginRight: 6, fontSize: 11 }} />
+                  Terminal
+                </span>
+              ),
+              children: (
         <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
           <div
             ref={terminalRef}
@@ -463,6 +491,27 @@ const TerminalDrawer: React.FC<Props> = ({ sandbox, onClose }) => {
             />
           </div>
         </div>
+              ),
+            },
+            {
+              key: 'files',
+              label: (
+                <span>
+                  <FontAwesomeIcon icon={faFolderTree} style={{ marginRight: 6, fontSize: 11 }} />
+                  Files
+                </span>
+              ),
+              children: sandbox ? (
+                <FileExplorer
+                  key={sandbox.sandboxId}
+                  sandbox={sandbox}
+                  active={activeTab === 'files'}
+                  onPreviewFile={(fullPath) => setPreviewFile(fullPath)}
+                />
+              ) : null,
+            },
+          ]}
+        />
       </Drawer>
 
       {sandbox && (

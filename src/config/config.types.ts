@@ -13,6 +13,15 @@ export interface ModuleConfig {
   hotPool?: HotPoolConfig;
   ingress?: IngressConfig;
   snapshots?: SnapshotsConfig;
+  uploads?: UploadsConfig;
+}
+
+/** Size limits for multipart uploads (snapshot ZIP import, file uploads). */
+export interface UploadsConfig {
+  /** Max snapshot ZIP size in MiB. Default 512. */
+  maxSnapshotZipMb?: number;
+  /** Max single-file upload size in MiB. Default 100. */
+  maxFileMb?: number;
 }
 
 export interface ServerConfig {

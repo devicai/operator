@@ -7,13 +7,22 @@ import {
   Param,
   Query,
   Req,
+  Res,
   HttpCode,
+  StreamableFile,
+  UseInterceptors,
+  UploadedFile,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiConsumes } from '@nestjs/swagger';
+import { FileInterceptor } from '@nestjs/platform-express';
+import { diskStorage } from 'multer';
+import { tmpdir } from 'os';
+import type { Response } from 'express';
 import { SandboxesService } from './sandboxes.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
 import { WriteFileDto } from './dto/write-file.dto';
+import { uploadLimits } from '../config/upload-limits';
 
 @ApiTags('Sandboxes')
 @Controller('sandboxes')
@@ -98,6 +107,73 @@ export class SandboxesController {
     @Req() req: any,
   ) {
     return this.service.extendTtl(id, additionalSeconds, req.extensionScope ?? {});
+  }
+
+  @Get(':id/files/list')
+  @ApiOperation({
+    summary: 'List directory contents (structured)',
+    description:
+      'Returns the direct children of a directory with type, size and mtime. ' +
+      'Defaults to the current working directory when path is omitted.',
+  })
+  listFiles(
+    @Param('id') id: string,
+    @Query('path') dirPath: string | undefined,
+    @Req() req: any,
+  ) {
+    return this.service.listFiles(id, dirPath, req.extensionScope ?? {});
+  }
+
+  @Get(':id/files/download')
+  @ApiOperation({ summary: 'Download a file from the sandbox (binary-safe)' })
+  async downloadFile(
+    @Param('id') id: string,
+    @Query('path') filePath: string,
+    @Req() req: any,
+    @Res({ passthrough: true }) res: Response,
+  ): Promise<StreamableFile> {
+    const { stream, filename, sizeBytes } = await this.service.downloadFile(
+      id,
+      filePath,
+      req.extensionScope ?? {},
+    );
+    const asciiName = filename.replace(/[^\x20-\x7e]+/g, '_').replace(/"/g, "'");
+    res.set({
+      'Content-Type': 'application/octet-stream',
+      'Content-Disposition': `attachment; filename="${asciiName}"; filename*=UTF-8''${encodeURIComponent(filename)}`,
+      ...(sizeBytes !== undefined
+        ? { 'Content-Length': String(sizeBytes) }
+        : {}),
+    });
+    return new StreamableFile(stream);
+  }
+
+  @Post(':id/files/upload')
+  @ApiOperation({
+    summary: 'Upload a file into the sandbox (binary-safe)',
+    description:
+      "Multipart upload. 'path' is the destination; a trailing slash appends " +
+      'the original filename. Writes are confined to the workspace.',
+  })
+  @ApiConsumes('multipart/form-data')
+  @UseInterceptors(
+    FileInterceptor('file', {
+      storage: diskStorage({ destination: tmpdir() }),
+      limits: { fileSize: uploadLimits().maxFileMb * 1024 * 1024 },
+    }),
+  )
+  uploadFile(
+    @Param('id') id: string,
+    @UploadedFile() file: Express.Multer.File,
+    @Body('path') destPath: string | undefined,
+    @Req() req: any,
+  ) {
+    return this.service.uploadFile(
+      id,
+      destPath ?? '',
+      file,
+      req.extensionScope ?? {},
+    );
   }
 
   @Get(':id/files')

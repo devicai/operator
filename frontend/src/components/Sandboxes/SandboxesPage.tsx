@@ -29,6 +29,7 @@ import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
 import UsagePanel from '../Usage/UsagePanel';
 import HotPoolPanel from '../HotPool/HotPoolPanel';
+import { formatDateTime, formatDuration, formatRelative } from '../../utils/date';
 
 const { Title } = Typography;
 
@@ -184,15 +185,56 @@ const SandboxesPage: React.FC = () => {
       },
     },
     {
+      title: 'Created',
+      dataIndex: 'createdAt',
+      key: 'createdAt',
+      width: 125,
+      render: (d: string) => (
+        <Tooltip title={formatRelative(d)}>
+          <span style={{ fontSize: 11 }}>{formatDateTime(d)}</span>
+        </Tooltip>
+      ),
+    },
+    {
+      title: 'Expires',
+      dataIndex: 'expiresAt',
+      key: 'expiresAt',
+      width: 125,
+      render: (d: string, row) => {
+        if (!d) return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
+        return (
+          <Tooltip title={row.status === 'running' ? formatRelative(d) : 'Not running'}>
+            <span style={{ fontSize: 11, opacity: row.status === 'running' ? 1 : 0.5 }}>
+              {formatDateTime(d)}
+            </span>
+          </Tooltip>
+        );
+      },
+    },
+    {
       title: 'TTL',
       key: 'ttl',
-      width: 100,
+      width: 130,
       render: (_: any, row) => {
-        if (row.status !== 'running') return '-';
+        const duration = (
+          <Tooltip title="Configured lifetime">
+            <span style={{ fontSize: 11, opacity: 0.75 }}>
+              {formatDuration(row.ttlSeconds)}
+            </span>
+          </Tooltip>
+        );
+        if (row.status !== 'running') return duration;
         const remaining = formatRemaining(row.expiresAt);
         const ms = new Date(row.expiresAt).getTime() - Date.now();
         const color = ms > 600000 ? 'green' : ms > 300000 ? 'orange' : 'red';
-        return <Tag color={color}>{remaining}</Tag>;
+        return (
+          <Space size={4}>
+            <Tooltip title="Time remaining">
+              <Tag color={color} style={{ marginRight: 0 }}>{remaining}</Tag>
+            </Tooltip>
+            {duration}
+          </Space>
+        );
       },
     },
     {
