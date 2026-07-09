@@ -55,6 +55,15 @@ export class Snapshot {
   @Prop({ type: Object, default: {} })
   ports: Record<string, number>;
 
+  @ApiProperty({
+    description:
+      'HTTP port the source sandbox exposed through the public ingress; ' +
+      'restores default to it.',
+    required: false,
+  })
+  @Prop()
+  exposedHttpPort?: number;
+
   @ApiProperty()
   @Prop({ required: true })
   snapshotPath: string;

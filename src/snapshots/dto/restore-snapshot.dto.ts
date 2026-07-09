@@ -36,4 +36,16 @@ export class RestoreSnapshotDto {
   @IsOptional()
   @IsBoolean()
   linked?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Port inside the restored sandbox the public ingress proxy should ' +
+      'forward HTTP traffic to. Defaults to the port captured in the ' +
+      'snapshot, then to ingress.defaultUpstreamPort.',
+  })
+  @IsOptional()
+  @IsNumber()
+  @Min(1)
+  @Max(65535)
+  exposedHttpPort?: number;
 }

@@ -4,8 +4,10 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  Optional,
 } from '@nestjs/common';
 import { nanoid } from 'nanoid';
+import * as net from 'net';
 import { join } from 'path';
 import {
   existsSync,
@@ -21,6 +23,7 @@ import { pipeline } from 'stream/promises';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from '../sandboxes/sandbox-registry';
+import { IngressService } from '../ingress/ingress.service';
 import { SnapshotDocument, SnapshotStatus } from '../schemas/snapshot.schema';
 import { SandboxDocument, SandboxStatus } from '../schemas/sandbox.schema';
 import { ExtensionScope, PaginatedResponse } from '../interfaces';
@@ -70,6 +73,7 @@ export class SnapshotsService {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly resourceUsage: ResourceUsageService,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+    @Optional() private readonly ingressService?: IngressService,
   ) {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
@@ -175,6 +179,7 @@ export class SnapshotsService {
         memoryMib: sandboxDoc.memoryMib,
         envVars: sandboxDoc.envVars ?? {},
         ports: sandboxDoc.ports ?? {},
+        exposedHttpPort: sandboxDoc.exposedHttpPort,
         snapshotPath,
         sizeBytes: 0,
         metadata: {
@@ -335,6 +340,27 @@ export class SnapshotsService {
     }
 
     const isLinked = dto.linked !== false; // default true
+    const exposedHttpPort = dto.exposedHttpPort ?? snapshot.exposedHttpPort;
+
+    // When ingress is enabled and the runtime is microsandbox, the public
+    // proxy reaches the sandbox over a forwarded host port — same reservation
+    // logic as a fresh create.
+    let ports = snapshot.ports ?? {};
+    if (
+      !options.hotReserved &&
+      this.ingressService?.isEnabled() &&
+      this.config.runtime.type === 'microsandbox'
+    ) {
+      const upstreamPort =
+        exposedHttpPort ?? this.config.ingress?.defaultUpstreamPort ?? 80;
+      const alreadyMapped = Object.values(ports).some(
+        (guest) => Number(guest) === upstreamPort,
+      );
+      if (!alreadyMapped) {
+        const hostPort = await this.findFreeHostPort();
+        ports = { ...ports, [String(hostPort)]: upstreamPort };
+      }
+    }
 
     const sandboxDoc = await this.sandboxRepo.create(
       {
@@ -347,7 +373,8 @@ export class SnapshotsService {
         cpus: dto.cpus ?? snapshot.cpus,
         memoryMib: dto.memoryMib ?? snapshot.memoryMib,
         envVars: snapshot.envVars ?? {},
-        ports: snapshot.ports ?? {},
+        ports,
+        exposedHttpPort,
         ttlSeconds,
         expiresAt,
         ...(isLinked ? { snapshotId: snapshot.snapshotId } : {}),
@@ -374,7 +401,7 @@ export class SnapshotsService {
         cpus: dto.cpus ?? snapshot.cpus,
         memoryMib: dto.memoryMib ?? snapshot.memoryMib,
         env: snapshot.envVars ?? {},
-        ports: snapshot.ports ?? {},
+        ports,
         networkPolicy: 'allow-all',
       });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
@@ -411,7 +438,11 @@ export class SnapshotsService {
         (sandboxDoc as any)._id.toString(),
         scope,
       );
-      return updated!;
+      // Hot-reserve sandboxes stay unpublished until they are claimed — the
+      // claim path publishes them, and idle pool entries must not hold
+      // public subdomains.
+      if (options.hotReserved) return updated!;
+      return await this.publishIfEnabled(updated!, scope);
     } catch (err) {
       await this.sandboxRepo.updateById(
         (sandboxDoc as any)._id.toString(),
@@ -420,6 +451,60 @@ export class SnapshotsService {
       );
       throw err;
     }
+  }
+
+  /**
+   * Publish the restored sandbox under its public subdomain when ingress is
+   * enabled, persisting subdomain/publicUrl/internalEndpoint on the document.
+   * No-op (returns the input) when ingress is disabled or publish fails.
+   */
+  private async publishIfEnabled(
+    sandbox: SandboxDocument,
+    scope: ExtensionScope,
+  ): Promise<SandboxDocument> {
+    if (!this.ingressService?.isEnabled()) return sandbox;
+    try {
+      const result = await this.ingressService.publish(sandbox);
+      if (!result) return sandbox;
+      await this.sandboxRepo.updateById(
+        (sandbox as any)._id.toString(),
+        {
+          $set: {
+            subdomain: result.subdomain,
+            publicUrl: result.publicUrl,
+            internalEndpoint: result.internalEndpoint,
+          },
+        },
+        scope,
+      );
+      const refreshed = await this.sandboxRepo.findById(
+        (sandbox as any)._id.toString(),
+        scope,
+      );
+      return refreshed ?? sandbox;
+    } catch (err) {
+      this.logger.warn(
+        `Ingress publish failed for ${sandbox.sandboxId}: ${(err as Error).message}`,
+      );
+      return sandbox;
+    }
+  }
+
+  private async findFreeHostPort(): Promise<number> {
+    return new Promise((resolve, reject) => {
+      const srv = net.createServer();
+      srv.unref();
+      srv.on('error', reject);
+      srv.listen(0, '127.0.0.1', () => {
+        const addr = srv.address();
+        if (!addr || typeof addr === 'string') {
+          srv.close(() => reject(new Error('Failed to allocate ephemeral port')));
+          return;
+        }
+        const port = addr.port;
+        srv.close((err) => (err ? reject(err) : resolve(port)));
+      });
+    });
   }
 
   async findAll(
