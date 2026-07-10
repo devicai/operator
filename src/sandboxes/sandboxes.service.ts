@@ -589,9 +589,16 @@ export class SandboxesService {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
+    // Additive semantics: additionalSeconds extends the CURRENT expiry, it is
+    // not the new remaining time. Anchoring on Date.now() instead silently
+    // SHORTENS the lifetime whenever the remaining time exceeds the extension,
+    // desynchronizing clients that track expiresAt += additionalSeconds.
+    const currentExpiresAtMs = new Date(doc.expiresAt).getTime();
+    const newExpiresAtMs = currentExpiresAtMs + additionalSeconds * 1000;
+
     const maxTtl = this.config.defaults.maxTtlSeconds;
-    const elapsed = (Date.now() - new Date((doc as any).createdAt).getTime()) / 1000;
-    const totalTtl = elapsed + additionalSeconds;
+    const totalTtl =
+      (newExpiresAtMs - new Date((doc as any).createdAt).getTime()) / 1000;
 
     if (totalTtl > maxTtl) {
       throw new BadRequestException(
@@ -599,8 +606,12 @@ export class SandboxesService {
       );
     }
 
-    const newExpiresAt = new Date(Date.now() + additionalSeconds * 1000);
-    await this.registry.extendTtl(doc.sandboxId, additionalSeconds);
+    const newExpiresAt = new Date(newExpiresAtMs);
+    // Registry TTL is "seconds remaining from now" (redis EXPIRE), so convert.
+    await this.registry.extendTtl(
+      doc.sandboxId,
+      Math.max(1, Math.ceil((newExpiresAtMs - Date.now()) / 1000)),
+    );
 
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
