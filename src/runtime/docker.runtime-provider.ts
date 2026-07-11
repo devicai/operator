@@ -668,14 +668,39 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async exec(command: string): Promise<ExecResult> {
+    const { code, stdout, stderr } = await this.execRaw(command);
+    return {
+      code,
+      stdout: stdout.toString('utf-8'),
+      stderr: stderr.toString('utf-8'),
+    };
+  }
+
+  /**
+   * One-shot `docker exec` returning RAW stdout/stderr buffers (so binary file
+   * reads survive) and, optionally, feeding a buffer to the command's stdin.
+   *
+   * This is the shared primitive behind exec(), readFile() and writeFile(): by
+   * running INSIDE the container's mount namespace it stays coherent with the
+   * interactive shell's view of the filesystem — unlike getArchive/putArchive,
+   * which write the rootfs from the host and, under sysbox-runc (userns + id
+   * shifting), leave the overlay's dentry cache stale (`Stale file handle`
+   * ESTALE on later mv/rm) and files owned by `nobody:nogroup`.
+   */
+  private async execRaw(
+    command: string,
+    opts: { input?: Buffer } = {},
+  ): Promise<{ code: number; stdout: Buffer; stderr: Buffer }> {
+    const withStdin = opts.input !== undefined;
     const exec = await this.container.exec({
       Cmd: ['/bin/sh', '-c', command],
+      AttachStdin: withStdin,
       AttachStdout: true,
       AttachStderr: true,
       Tty: false,
     });
 
-    const stream = await exec.start({ hijack: true, stdin: false });
+    const stream = await exec.start({ hijack: true, stdin: withStdin });
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
 
@@ -685,6 +710,14 @@ class DockerSandbox implements RuntimeSandbox {
     stderrStream.on('data', (c: Buffer) => stderrChunks.push(c));
 
     this.container.modem.demuxStream(stream, stdoutStream, stderrStream);
+
+    // Feed stdin (if any) and half-close our write side so the command sees EOF.
+    // `.end()` only closes the writable half of the hijacked socket; stdout keeps
+    // streaming back until the daemon closes it when the exec exits.
+    if (withStdin) {
+      stream.write(opts.input);
+      stream.end();
+    }
 
     await new Promise<void>((resolve, reject) => {
       const done = () => resolve();
@@ -696,8 +729,8 @@ class DockerSandbox implements RuntimeSandbox {
     const inspect = await exec.inspect();
     return {
       code: inspect.ExitCode ?? 0,
-      stdout: Buffer.concat(stdoutChunks).toString('utf-8'),
-      stderr: Buffer.concat(stderrChunks).toString('utf-8'),
+      stdout: Buffer.concat(stdoutChunks),
+      stderr: Buffer.concat(stderrChunks),
     };
   }
 
@@ -831,20 +864,37 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async readFile(path: string): Promise<Buffer> {
-    const stream = await this.container.getArchive({ path });
-    return await extractFirstFile(stream as any as NodeJS.ReadableStream);
+    // Read from INSIDE the container (via exec/`cat`) rather than getArchive so
+    // we observe the same filesystem view as the interactive shell — see the
+    // note on execRaw for why the host-side archive path is unsafe under sysbox.
+    const { code, stdout, stderr } = await this.execRaw(
+      `cat -- ${shellEscape(path)}`,
+    );
+    if (code !== 0) {
+      throw new Error(
+        `readFile ${path} failed (exit ${code}): ${stderr.toString('utf-8').trim()}`,
+      );
+    }
+    return stdout;
   }
 
   async writeFile(filePath: string, content: Buffer): Promise<void> {
+    // Write from INSIDE the container (via exec, streaming the bytes over the
+    // command's stdin into `cat >`) rather than putArchive. `cat > file`
+    // truncates/creates the file through the container's own VFS, so the shell
+    // sees it immediately, ownership is correct, and there is no out-of-band
+    // rootfs mutation to leave the overlay's dentry cache stale (the root cause
+    // of `Stale file handle` / phantom files under sysbox-runc).
     const dir = dirname(filePath) || '/';
-    const name = basename(filePath);
-    await this.exec(`mkdir -p ${shellEscape(dir)}`);
-
-    const pack = tar.pack();
-    pack.entry({ name, size: content.length, mode: 0o644 }, content);
-    pack.finalize();
-
-    await this.container.putArchive(pack as any, { path: dir });
+    const { code, stderr } = await this.execRaw(
+      `mkdir -p ${shellEscape(dir)} && cat > ${shellEscape(filePath)}`,
+      { input: content },
+    );
+    if (code !== 0) {
+      throw new Error(
+        `writeFile ${filePath} failed (exit ${code}): ${stderr.toString('utf-8').trim()}`,
+      );
+    }
   }
 
   async copyToHost(guestPath: string, hostPath: string): Promise<void> {
@@ -895,37 +945,6 @@ class DockerSandbox implements RuntimeSandbox {
       throw err;
     }
   }
-}
-
-async function extractFirstFile(stream: NodeJS.ReadableStream): Promise<Buffer> {
-  const extract = tar.extract();
-  const chunks: Buffer[] = [];
-  let resolveResult: (b: Buffer) => void;
-  let rejectResult: (e: Error) => void;
-  const done = new Promise<Buffer>((resolve, reject) => {
-    resolveResult = resolve;
-    rejectResult = reject;
-  });
-
-  extract.on('entry', (header, fileStream, next) => {
-    if (header.type !== 'file') {
-      fileStream.resume();
-      fileStream.on('end', next);
-      return;
-    }
-    fileStream.on('data', (c: Buffer) => chunks.push(c));
-    fileStream.on('end', () => {
-      resolveResult(Buffer.concat(chunks));
-      next();
-    });
-  });
-  extract.on('finish', () => {
-    if (chunks.length === 0) resolveResult(Buffer.alloc(0));
-  });
-  extract.on('error', (e) => rejectResult(e));
-
-  (stream as Readable).pipe(extract);
-  return done;
 }
 
 async function extractFirstFileToDisk(
