@@ -719,6 +719,146 @@ describe('DockerRuntimeProvider', () => {
     });
   });
 
+  describe('readFile / writeFile', () => {
+    /**
+     * Stand up a connected sandbox whose `container.exec` is driven by
+     * `handler(cmd)` → { code, stdout?, stderr? }. Each exec captures whatever
+     * is written to its stdin, so tests can assert writeFile streams the bytes
+     * in via `cat >` instead of the host-side putArchive. `putArchive` /
+     * `getArchive` are jest.fn()s so a regression back to the archive path is
+     * caught by an unexpected call.
+     */
+    async function buildFsSandbox(
+      handler: (cmd: string) => {
+        code: number;
+        stdout?: Buffer;
+        stderr?: Buffer;
+      },
+    ) {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+
+      const execCalls: Array<{ opts: any; stdin: Buffer[] }> = [];
+      const putArchive = jest.fn().mockResolvedValue(undefined);
+      const getArchive = jest.fn().mockResolvedValue(undefined);
+
+      const exec = jest.fn(async (opts: any) => {
+        const cmd: string = opts.Cmd[2];
+        const stdin: Buffer[] = [];
+        execCalls.push({ opts, stdin });
+        let result = { code: 0 } as {
+          code: number;
+          stdout?: Buffer;
+          stderr?: Buffer;
+        };
+        const stream: any = {
+          write: (c: any) => {
+            stdin.push(Buffer.from(c));
+            return true;
+          },
+          end: jest.fn(),
+          once: (e: string, cb: any) => {
+            if (e === 'end' || e === 'close') setImmediate(cb);
+          },
+        };
+        return {
+          start: jest.fn(async () => {
+            // Resolve the command's result once (before demux/inspect run) so
+            // both the demux sinks and the exit code stay consistent.
+            result = handler(cmd);
+            (stream as any).__result = result;
+            return stream;
+          }),
+          inspect: jest.fn(async () => ({ ExitCode: result.code })),
+        };
+      });
+
+      const modem = {
+        demuxStream: jest.fn(
+          (s: any, out: PassThrough, err: PassThrough) => {
+            const r = s.__result ?? {};
+            if (r.stdout?.length) out.write(r.stdout);
+            if (r.stderr?.length) err.write(r.stderr);
+          },
+        ),
+      };
+
+      const fake = fakeContainer();
+      const container: any = { ...fake, exec, modem, putArchive, getArchive };
+      createContainer.mockResolvedValue(container);
+      getContainer.mockReturnValue({
+        inspect: jest.fn().mockRejectedValue({ statusCode: 404 }),
+      });
+
+      const provider = await buildProvider();
+      const sandbox = await provider.create({
+        name: 'sandbox-fs',
+        image: 'node:24',
+        workdir: '/workspace',
+        cpus: 1,
+        memoryMib: 256,
+        env: {},
+      });
+
+      return { sandbox, exec, execCalls, putArchive, getArchive };
+    }
+
+    it('writeFile streams bytes into the container via `cat >`, not putArchive', async () => {
+      const h = await buildFsSandbox(() => ({ code: 0 }));
+      const content = Buffer.from([0x00, 0xff, 0x10, 0x68, 0x69]);
+
+      await h.sandbox.writeFile('/workspace/memory/memory.md', content);
+
+      const call = h.execCalls.find((c) =>
+        c.opts.Cmd[2].includes('cat > '),
+      );
+      expect(call).toBeDefined();
+      expect(call!.opts.AttachStdin).toBe(true);
+      expect(call!.opts.Cmd[2]).toContain("mkdir -p '/workspace/memory'");
+      expect(call!.opts.Cmd[2]).toContain("cat > '/workspace/memory/memory.md'");
+      // The exact bytes reached stdin, binary-safe.
+      expect(Buffer.concat(call!.stdin)).toEqual(content);
+      // The host-side archive path must never be used.
+      expect(h.putArchive).not.toHaveBeenCalled();
+    });
+
+    it('writeFile throws with stderr when the command exits non-zero', async () => {
+      const h = await buildFsSandbox(() => ({
+        code: 1,
+        stderr: Buffer.from('cat: permission denied\n'),
+      }));
+
+      await expect(
+        h.sandbox.writeFile('/workspace/x', Buffer.from('hi')),
+      ).rejects.toThrow(/writeFile \/workspace\/x failed \(exit 1\): cat: permission denied/);
+    });
+
+    it('readFile reads through the container via `cat --`, binary-safe', async () => {
+      const bytes = Buffer.from([0x00, 0x01, 0xfe, 0xff, 0x7f]);
+      const h = await buildFsSandbox((cmd) =>
+        cmd.startsWith('cat -- ') ? { code: 0, stdout: bytes } : { code: 0 },
+      );
+
+      const out = await h.sandbox.readFile('/workspace/blob.bin');
+
+      expect(out).toEqual(bytes);
+      const call = h.execCalls.find((c) => c.opts.Cmd[2].startsWith('cat -- '));
+      expect(call!.opts.Cmd[2]).toBe("cat -- '/workspace/blob.bin'");
+      expect(h.getArchive).not.toHaveBeenCalled();
+    });
+
+    it('readFile throws when the file is missing (non-zero exit)', async () => {
+      const h = await buildFsSandbox((cmd) =>
+        cmd.startsWith('cat -- ')
+          ? { code: 1, stderr: Buffer.from('cat: /nope: No such file or directory\n') }
+          : { code: 0 },
+      );
+
+      await expect(h.sandbox.readFile('/nope')).rejects.toThrow(
+        /readFile \/nope failed \(exit 1\): cat: \/nope: No such file or directory/,
+      );
+    });
+  });
+
   describe('remove', () => {
     it('is idempotent on missing containers (404)', async () => {
       const err: any = new Error('not found');
