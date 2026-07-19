@@ -228,6 +228,24 @@ export interface RuntimeProvider {
    * Optional: tear down whatever `attachLocal` set up. Idempotent.
    */
   detachLocal?(name: string): Promise<void>;
+
+  /**
+   * Optional: reclaim per-sandbox network resources that were leaked by
+   * sandboxes which no longer exist. With the ingress feature each allow-all
+   * sandbox gets its own bridge network, and each bridge consumes one subnet
+   * from the daemon's address pool. When a sandbox container is gone but its
+   * network was not torn down (a failed `remove`, a crashed container, an
+   * out-of-band deletion), the network lingers and keeps holding its subnet;
+   * once the pool is exhausted no new sandbox can be created.
+   *
+   * This sweeps managed networks that have no sandbox container attached and
+   * removes them. It is safe to call opportunistically — networks of running or
+   * stopped (restartable) sandboxes still have their container attached and are
+   * left untouched, and freshly-created networks are protected by a grace
+   * window so an in-flight `create` is never swept. Returns the number of
+   * networks reclaimed. No-op for runtimes without per-sandbox networks.
+   */
+  sweepOrphanedNetworks?(): Promise<number>;
 }
 
 export const RUNTIME_PROVIDER = Symbol('RUNTIME_PROVIDER');

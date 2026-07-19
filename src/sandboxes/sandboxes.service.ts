@@ -553,6 +553,17 @@ export class SandboxesService {
       },
       scope,
     );
+
+    // Opportunistic cleanup: reclaim any per-sandbox networks left behind by
+    // sandboxes that no longer exist, so the daemon's address pool does not
+    // exhaust. Piggybacks on stop events instead of a dedicated cron. Never
+    // let a sweep failure surface as a failed stop.
+    await this.runtime.sweepOrphanedNetworks?.().catch((err) => {
+      this.logger.warn(
+        `Network sweep after stopping ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    });
+
     return updated!;
   }
 
