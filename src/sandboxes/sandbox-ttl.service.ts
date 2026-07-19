@@ -63,6 +63,15 @@ export class SandboxTtlService {
         await this.registry.remove(doc.sandboxId);
         this.logger.log(`Sandbox ${doc.sandboxId} expired and detached`);
       }
+
+      // After reaping expired sandboxes, reclaim any per-sandbox networks that
+      // were orphaned by sandboxes which no longer exist, so the daemon's
+      // address pool does not exhaust and block new sandbox creation.
+      await this.runtime.sweepOrphanedNetworks?.().catch((err) => {
+        this.logger.warn(
+          `Network sweep after TTL reap failed: ${(err as Error).message}`,
+        );
+      });
     } catch (err) {
       this.logger.error(`TTL check error: ${(err as Error).message}`);
     } finally {

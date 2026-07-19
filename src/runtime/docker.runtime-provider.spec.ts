@@ -13,6 +13,8 @@ const getImage = jest.fn();
 const pull = jest.fn();
 const followProgress = jest.fn();
 const info = jest.fn();
+const getNetwork = jest.fn();
+const listNetworks = jest.fn();
 
 jest.mock('dockerode', () => {
   return jest.fn().mockImplementation(() => ({
@@ -21,6 +23,8 @@ jest.mock('dockerode', () => {
     getImage,
     pull,
     info,
+    getNetwork,
+    listNetworks,
     modem: { followProgress },
   }));
 });
@@ -96,6 +100,8 @@ describe('DockerRuntimeProvider', () => {
     pull.mockReset();
     followProgress.mockReset();
     info.mockReset();
+    getNetwork.mockReset();
+    listNetworks.mockReset();
     // Default: daemon reports no AppArmor support, so the explicit profile is
     // skipped unless a test opts in.
     info.mockResolvedValue({ SecurityOptions: ['name=seccomp'] });
@@ -879,6 +885,119 @@ describe('DockerRuntimeProvider', () => {
       await provider.remove('alive');
 
       expect(remove).toHaveBeenCalledWith({ force: true, v: true });
+    });
+  });
+
+  describe('sweepOrphanedNetworks', () => {
+    const ingressConfig = () =>
+      buildConfig({
+        type: 'docker',
+        docker: {
+          socketPath: '/var/run/docker.sock',
+          runtime: 'sysbox-runc',
+          network: 'bridge',
+        },
+      } as any);
+
+    const withIngress = () => {
+      const cfg = ingressConfig();
+      (cfg as any).ingress = { enabled: true };
+      return cfg;
+    };
+
+    // A timestamp well outside the grace window so the network is sweepable.
+    const OLD = new Date(Date.now() - 3600_000).toISOString();
+
+    it('is a no-op when ingress is disabled', async () => {
+      const provider = await buildProvider(); // no ingress
+      const removed = await provider.sweepOrphanedNetworks!();
+      expect(removed).toBe(0);
+      expect(listNetworks).not.toHaveBeenCalled();
+    });
+
+    it('removes managed networks with no attached containers', async () => {
+      listNetworks.mockResolvedValue([{ Id: 'net1', Name: 'devic-a' }]);
+      const remove = jest.fn().mockResolvedValue(undefined);
+      getNetwork.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({ Created: OLD, Containers: {} }),
+        remove,
+      });
+
+      const provider = await buildProvider(withIngress());
+      const removed = await provider.sweepOrphanedNetworks!();
+
+      expect(listNetworks).toHaveBeenCalledWith({
+        filters: JSON.stringify({ label: ['devic-sandbox.managed=true'] }),
+      });
+      expect(remove).toHaveBeenCalled();
+      expect(removed).toBe(1);
+    });
+
+    it('leaves networks that still have a sandbox container attached', async () => {
+      listNetworks.mockResolvedValue([{ Id: 'net1', Name: 'devic-a' }]);
+      const remove = jest.fn().mockResolvedValue(undefined);
+      getNetwork.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({
+          Created: OLD,
+          Containers: { abc123: { Name: 'sbx' } },
+        }),
+        remove,
+      });
+
+      const provider = await buildProvider(withIngress());
+      const removed = await provider.sweepOrphanedNetworks!();
+
+      expect(remove).not.toHaveBeenCalled();
+      expect(removed).toBe(0);
+    });
+
+    it('protects freshly-created networks inside the grace window', async () => {
+      listNetworks.mockResolvedValue([{ Id: 'net1', Name: 'devic-a' }]);
+      const remove = jest.fn().mockResolvedValue(undefined);
+      getNetwork.mockReturnValue({
+        inspect: jest.fn().mockResolvedValue({
+          Created: new Date().toISOString(),
+          Containers: {},
+        }),
+        remove,
+      });
+
+      const provider = await buildProvider(withIngress());
+      const removed = await provider.sweepOrphanedNetworks!();
+
+      expect(remove).not.toHaveBeenCalled();
+      expect(removed).toBe(0);
+    });
+
+    it('continues past a network that fails to remove (race)', async () => {
+      listNetworks.mockResolvedValue([
+        { Id: 'net1', Name: 'devic-a' },
+        { Id: 'net2', Name: 'devic-b' },
+      ]);
+      const conflict: any = new Error('has active endpoints');
+      conflict.statusCode = 403;
+      const remove2 = jest.fn().mockResolvedValue(undefined);
+      getNetwork
+        .mockReturnValueOnce({
+          inspect: jest.fn().mockResolvedValue({ Created: OLD, Containers: {} }),
+          remove: jest.fn().mockRejectedValue(conflict),
+        })
+        .mockReturnValueOnce({
+          inspect: jest.fn().mockResolvedValue({ Created: OLD, Containers: {} }),
+          remove: remove2,
+        });
+
+      const provider = await buildProvider(withIngress());
+      const removed = await provider.sweepOrphanedNetworks!();
+
+      expect(remove2).toHaveBeenCalled();
+      expect(removed).toBe(1);
+    });
+
+    it('returns 0 without throwing when listing fails', async () => {
+      listNetworks.mockRejectedValue(new Error('daemon down'));
+      const provider = await buildProvider(withIngress());
+      await expect(provider.sweepOrphanedNetworks!()).resolves.toBe(0);
     });
   });
 });

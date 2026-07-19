@@ -474,6 +474,75 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     }
   }
 
+  /**
+   * Grace window shielding a just-created network from the sweeper. `create()`
+   * makes the isolated network before it creates and starts the container, so
+   * there is a brief moment where the network exists with no sandbox container
+   * attached. Without this guard a concurrent stop/expiration sweep could
+   * reclaim that network mid-creation.
+   */
+  private static readonly NETWORK_SWEEP_GRACE_MS = 60_000;
+
+  async sweepOrphanedNetworks(): Promise<number> {
+    if (!this.ingressEnabled) return 0;
+
+    let summaries: Docker.NetworkInspectInfo[];
+    try {
+      summaries = await this.docker.listNetworks({
+        filters: JSON.stringify({ label: ['devic-sandbox.managed=true'] }),
+      });
+    } catch (err) {
+      this.logger.warn(
+        `sweepOrphanedNetworks: list failed: ${(err as Error).message}`,
+      );
+      return 0;
+    }
+
+    let removed = 0;
+    for (const summary of summaries) {
+      try {
+        const network = this.docker.getNetwork(summary.Id);
+        const info = await network.inspect();
+
+        // Protect in-flight create(): a network younger than the grace window
+        // may still be waiting for its container to be attached.
+        const createdMs = info.Created
+          ? new Date(info.Created).getTime()
+          : 0;
+        if (createdMs && Date.now() - createdMs < DockerRuntimeProvider.NETWORK_SWEEP_GRACE_MS) {
+          continue;
+        }
+
+        // Orphaned == no sandbox container attached. The ingress self-container
+        // may still be connected from a prior attachLocal(); it does not count
+        // as a live tenant, so disconnect it and reclaim the network.
+        const attached = Object.keys(info.Containers ?? {});
+        const nonSelf = attached.filter((id) => id !== this.selfContainerId);
+        if (nonSelf.length > 0) continue;
+
+        if (this.selfContainerId && attached.includes(this.selfContainerId)) {
+          await network
+            .disconnect({ Container: this.selfContainerId, Force: true })
+            .catch(() => undefined);
+        }
+        await network.remove();
+        removed++;
+      } catch (err: any) {
+        // 404: raced with another remover. 403/409: a container attached
+        // between inspect and remove — leave it for the next sweep.
+        if (err.statusCode === 404) continue;
+        this.logger.debug(
+          `sweepOrphanedNetworks: skip ${summary.Name}: ${(err as Error).message}`,
+        );
+      }
+    }
+
+    if (removed > 0) {
+      this.logger.log(`Reclaimed ${removed} orphaned managed network(s)`);
+    }
+    return removed;
+  }
+
   async getAddress(
     name: string,
     internalPort: number,
