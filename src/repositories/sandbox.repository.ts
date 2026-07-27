@@ -87,6 +87,34 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
       .exec() as Promise<SandboxDocument | null>;
   }
 
+  /**
+   * Container names of every sandbox that still has a reason to exist in the
+   * runtime. Terminal states are excluded on purpose: an expired, stopped or
+   * failed sandbox cannot be resumed (there is no start endpoint), so its
+   * container is reclaimable.
+   */
+  async findLiveContainerNames(): Promise<string[]> {
+    const rows = await this.model
+      .find(
+        {
+          status: {
+            $in: [
+              SandboxStatus.PENDING,
+              SandboxStatus.CREATING,
+              SandboxStatus.RUNNING,
+              SandboxStatus.STOPPING,
+            ],
+          },
+        },
+        { name: 1 },
+      )
+      .lean()
+      .exec();
+    return (rows as Array<{ name?: string }>)
+      .map((r) => r.name)
+      .filter((n): n is string => !!n);
+  }
+
   async findHotReserved(snapshotId?: string): Promise<SandboxDocument[]> {
     const filter: Record<string, any> = {
       hotReserved: true,

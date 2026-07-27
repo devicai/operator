@@ -15,6 +15,7 @@ const followProgress = jest.fn();
 const info = jest.fn();
 const getNetwork = jest.fn();
 const listNetworks = jest.fn();
+const listContainers = jest.fn();
 
 jest.mock('dockerode', () => {
   return jest.fn().mockImplementation(() => ({
@@ -25,6 +26,7 @@ jest.mock('dockerode', () => {
     info,
     getNetwork,
     listNetworks,
+    listContainers,
     modem: { followProgress },
   }));
 });
@@ -998,6 +1000,63 @@ describe('DockerRuntimeProvider', () => {
       listNetworks.mockRejectedValue(new Error('daemon down'));
       const provider = await buildProvider(withIngress());
       await expect(provider.sweepOrphanedNetworks!()).resolves.toBe(0);
+    });
+  });
+  describe('listManaged', () => {
+    const managed = (name: string, extra: Record<string, any> = {}) => ({
+      Names: [`/${name}`],
+      Labels: { 'devic-sandbox.managed': 'true', 'devic-sandbox.name': name },
+      Created: 1_700_000_000,
+      State: 'running',
+      ...extra,
+    });
+
+    it('reports sandbox containers with name, creation time and state', async () => {
+      listContainers.mockResolvedValue([managed('sandbox-abc', { State: 'exited' })]);
+      const provider = await buildProvider(buildConfig());
+      await expect(provider.listManaged!()).resolves.toEqual([
+        { name: 'sandbox-abc', createdAtMs: 1_700_000_000_000, status: 'exited' },
+      ]);
+    });
+
+    it('leaves out helpers that share the managed label but are not sandboxes', async () => {
+      // Snapshot sources and test fixtures go through create() under their own
+      // name and have no sandbox document; a caller reconciling against the
+      // database would read them as orphans and destroy work in progress.
+      listContainers.mockResolvedValue([
+        managed('sandbox-real'),
+        managed('devic-snap-src-1778833388717'),
+        {
+          ...managed('baseline-probe'),
+          Labels: {
+            'devic-sandbox.managed': 'true',
+            'devic-sandbox.baseline': 'true',
+          },
+        },
+      ]);
+      const provider = await buildProvider(buildConfig());
+      const result = await provider.listManaged!();
+      expect(result.map((c) => c.name)).toEqual(['sandbox-real']);
+    });
+
+    it('falls back to the container name when the label is missing', async () => {
+      listContainers.mockResolvedValue([
+        {
+          Names: ['/sandbox-nolabel'],
+          Labels: { 'devic-sandbox.managed': 'true' },
+          Created: 1,
+          State: 'running',
+        },
+      ]);
+      const provider = await buildProvider(buildConfig());
+      const result = await provider.listManaged!();
+      expect(result[0].name).toBe('sandbox-nolabel');
+    });
+
+    it('returns nothing rather than throwing when the daemon is unreachable', async () => {
+      listContainers.mockRejectedValue(new Error('no socket'));
+      const provider = await buildProvider(buildConfig());
+      await expect(provider.listManaged!()).resolves.toEqual([]);
     });
   });
 });
