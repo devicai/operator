@@ -1,5 +1,11 @@
-import { Injectable, Inject, Logger, forwardRef } from '@nestjs/common';
-import { Interval } from '@nestjs/schedule';
+import {
+  Injectable,
+  Inject,
+  Logger,
+  forwardRef,
+  OnModuleInit,
+  OnApplicationShutdown,
+} from '@nestjs/common';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from './sandbox-registry';
 import { SnapshotsService } from '../snapshots/snapshots.service';
@@ -10,20 +16,19 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 
-/** How often the runtime is reconciled against the database. */
-const CONTAINER_SWEEP_INTERVAL_MS = 300_000;
-
-/**
- * A container younger than this is never swept, so an in-flight create is
- * safe even if its document has not been written yet.
- */
-const CONTAINER_SWEEP_GRACE_MS = 600_000;
+// Fallbacks for `maintenance.*` (and `defaults.ttlCheckIntervalMs`) when the
+// deployment does not set them. Every one is overridable from config.yml.
+const DEFAULT_TTL_CHECK_INTERVAL_MS = 30_000;
+const DEFAULT_CONTAINER_SWEEP_INTERVAL_MS = 300_000;
+const DEFAULT_CONTAINER_SWEEP_GRACE_MS = 600_000;
+const DEFAULT_MIN_INTERVAL_MS = 5_000;
 
 @Injectable()
-export class SandboxTtlService {
+export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
   private readonly logger = new Logger(SandboxTtlService.name);
   private running = false;
   private sweeping = false;
+  private timers: NodeJS.Timeout[] = [];
 
   constructor(
     private readonly sandboxRepo: SandboxRepository,
@@ -34,7 +39,49 @@ export class SandboxTtlService {
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
   ) {}
 
-  @Interval(30000)
+  onModuleInit(): void {
+    // Scheduled here rather than with @Interval so the cadence comes from
+    // config: a decorator argument is fixed at class-definition time, which is
+    // how `defaults.ttlCheckIntervalMs` ended up documented but ignored.
+    const ttlInterval = this.intervalMs(
+      this.config.defaults?.ttlCheckIntervalMs,
+      DEFAULT_TTL_CHECK_INTERVAL_MS,
+    );
+    const sweepInterval = this.intervalMs(
+      this.config.maintenance?.containerSweepIntervalMs,
+      DEFAULT_CONTAINER_SWEEP_INTERVAL_MS,
+    );
+
+    this.timers.push(
+      setInterval(() => void this.checkExpiredSandboxes(), ttlInterval),
+      setInterval(() => void this.sweepOrphanedContainers(), sweepInterval),
+    );
+
+    this.logger.log(
+      `TTL reap every ${ttlInterval}ms, container sweep every ` +
+        `${sweepInterval}ms (grace ${this.sweepGraceMs}ms)`,
+    );
+  }
+
+  onApplicationShutdown(): void {
+    for (const timer of this.timers) clearInterval(timer);
+    this.timers = [];
+  }
+
+  /** Config value, floored so a zero or a typo cannot become a busy loop. */
+  private intervalMs(configured: number | undefined, fallback: number): number {
+    const floor =
+      this.config.maintenance?.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS;
+    return Math.max(floor, configured ?? fallback);
+  }
+
+  private get sweepGraceMs(): number {
+    return (
+      this.config.maintenance?.containerSweepGraceMs ??
+      DEFAULT_CONTAINER_SWEEP_GRACE_MS
+    );
+  }
+
   async checkExpiredSandboxes(): Promise<void> {
     if (this.running) return;
     this.running = true;
@@ -105,7 +152,6 @@ export class SandboxTtlService {
    * Runs on its own slower interval — it lists the whole daemon, which is not
    * something to do every 30 seconds.
    */
-  @Interval(CONTAINER_SWEEP_INTERVAL_MS)
   async sweepOrphanedContainers(): Promise<void> {
     if (!this.runtime.listManaged) return;
     if (this.sweeping) return;
@@ -117,7 +163,7 @@ export class SandboxTtlService {
 
       const liveNames = await this.sandboxRepo.findLiveContainerNames();
       const live = new Set(liveNames);
-      const cutoff = Date.now() - CONTAINER_SWEEP_GRACE_MS;
+      const cutoff = Date.now() - this.sweepGraceMs;
 
       let removed = 0;
       for (const container of managed) {

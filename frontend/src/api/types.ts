@@ -22,6 +22,11 @@ export interface SandboxDto {
   hotReserved?: boolean;
   /** Permanent mark: this sandbox was handed out by the hot pool. */
   claimedFromHotPool?: boolean;
+  /** Bytes written on top of the image, as of the last sampling. */
+  diskBytes?: number;
+  diskCheckedAt?: string;
+  /** Set when the sandbox was stopped by the system, e.g. 'disk-limit'. */
+  stoppedReason?: string;
   /** When it was claimed — for pooled sandboxes this, not createdAt, is the start. */
   claimedAt?: string;
   /** Server-computed sort key: claimedAt ?? createdAt. */
@@ -222,6 +227,10 @@ export interface UsageSummary {
   disk: {
     usedBytes: number;
     limitBytes: number | null;
+    /** Sum of the writable layers of running sandboxes. */
+    sandboxBytes?: number;
+    /** Per-sandbox cap, not a total. */
+    sandboxLimitBytes?: number | null;
   };
 }
 

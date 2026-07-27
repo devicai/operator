@@ -2,6 +2,7 @@ import { Module, forwardRef } from '@nestjs/common';
 import { SandboxesController } from './sandboxes.controller';
 import { SandboxesService } from './sandboxes.service';
 import { SandboxTtlService } from './sandbox-ttl.service';
+import { SandboxDiskService } from './sandbox-disk.service';
 import { SandboxRegistry } from './sandbox-registry';
 import { SnapshotsModule } from '../snapshots/snapshots.module';
 import { HotPoolModule } from '../hot-pool/hot-pool.module';
@@ -12,7 +13,12 @@ import { HotPoolModule } from '../hot-pool/hot-pool.module';
     forwardRef(() => HotPoolModule),
   ],
   controllers: [SandboxesController],
-  providers: [SandboxesService, SandboxTtlService, SandboxRegistry],
-  exports: [SandboxesService, SandboxRegistry],
+  providers: [
+    SandboxesService,
+    SandboxTtlService,
+    SandboxDiskService,
+    SandboxRegistry,
+  ],
+  exports: [SandboxesService, SandboxDiskService, SandboxRegistry],
 })
 export class SandboxesModule {}

@@ -256,7 +256,15 @@ describe('ResourceUsageService', () => {
 
       expect(await service.getUsageSummary()).toEqual({
         memory: { usedMib: 512, limitMib: 1024, hotPoolReservedMib: 0 },
-        disk: { usedBytes: 1024, limitBytes: 4096 },
+        // `sandboxBytes` shares the sandbox aggregate mock with memory, hence
+        // the repeated 512. Snapshot storage and sandbox writable layers are
+        // separate budgets: only the former is bounded by `limitBytes`.
+        disk: {
+          usedBytes: 1024,
+          limitBytes: 4096,
+          sandboxBytes: 512,
+          sandboxLimitBytes: null,
+        },
       });
     });
 
@@ -267,8 +275,24 @@ describe('ResourceUsageService', () => {
       });
       expect(await service.getUsageSummary()).toEqual({
         memory: { usedMib: 0, limitMib: null, hotPoolReservedMib: 0 },
-        disk: { usedBytes: 0, limitBytes: null },
+        disk: {
+          usedBytes: 0,
+          limitBytes: null,
+          sandboxBytes: 0,
+          sandboxLimitBytes: null,
+        },
       });
+    });
+
+    it('reports the per-sandbox disk cap so the UI can scale what it draws', async () => {
+      const { service } = await buildService({
+        sandboxAgg: [{ total: 2048 }],
+        snapshots: [],
+        limits: { maxSandboxDiskBytes: 8589934592 },
+      });
+      const summary = await service.getUsageSummary();
+      expect(summary.disk.sandboxBytes).toBe(2048);
+      expect(summary.disk.sandboxLimitBytes).toBe(8589934592);
     });
 
     it('includes the hot pool reserved overhead when an accountant is registered', async () => {

@@ -87,6 +87,13 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
       .exec() as Promise<SandboxDocument | null>;
   }
 
+  /** Every sandbox currently running, for accounting passes. */
+  async findRunning(): Promise<SandboxDocument[]> {
+    return this.model
+      .find({ status: SandboxStatus.RUNNING })
+      .exec() as Promise<SandboxDocument[]>;
+  }
+
   /**
    * Container names of every sandbox that still has a reason to exist in the
    * runtime. Terminal states are excluded on purpose: an expired, stopped or

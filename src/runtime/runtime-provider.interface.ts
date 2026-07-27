@@ -257,7 +257,13 @@ export interface RuntimeProvider {
    * terminal state is never revisited, so its container would sit there
    * holding its writable layer forever.
    */
-  listManaged?(): Promise<ManagedSandboxInfo[]>;
+  listManaged?(options?: {
+    /**
+     * Also report each sandbox's writable-layer size. Costs the runtime extra
+     * work, so callers that only need the inventory should leave it off.
+     */
+    withSize?: boolean;
+  }): Promise<ManagedSandboxInfo[]>;
 }
 
 export interface ManagedSandboxInfo {
@@ -267,6 +273,11 @@ export interface ManagedSandboxInfo {
   createdAtMs: number;
   /** Runtime-level state, e.g. 'running' / 'exited'. */
   status: string;
+  /**
+   * Bytes written on top of the image. Only present when `withSize` was
+   * requested. Excludes the image layers, which are shared between sandboxes.
+   */
+  sizeRwBytes?: number;
 }
 
 export const RUNTIME_PROVIDER = Symbol('RUNTIME_PROVIDER');

@@ -93,6 +93,12 @@ const UsagePanel: React.FC<UsagePanelProps> = ({ usage, loading }) => {
   const diskLimit = usage?.disk.limitBytes ?? null;
   const diskPercent = diskLimit && diskLimit > 0 ? (diskUsed / diskLimit) * 100 : null;
 
+  // What running sandboxes have written on top of their images. A separate
+  // budget from snapshot storage: its limit is per sandbox, not a total, so
+  // there is no meaningful percentage to draw here.
+  const sandboxDisk = usage?.disk.sandboxBytes ?? 0;
+  const sandboxDiskLimit = usage?.disk.sandboxLimitBytes ?? null;
+
   return (
     <Card size="small" loading={loading} style={{ marginBottom: 12 }}>
       <div style={{ display: 'flex', gap: 24, flexWrap: 'wrap' }}>
@@ -113,6 +119,17 @@ const UsagePanel: React.FC<UsagePanelProps> = ({ usage, loading }) => {
           used={formatBytes(diskUsed)}
           limit={diskLimit !== null ? formatBytes(diskLimit) : null}
           percent={diskPercent}
+        />
+        <Metric
+          icon={faHardDrive}
+          label={
+            sandboxDiskLimit
+              ? `Disk (sandboxes) — cap ${formatBytes(sandboxDiskLimit)} each`
+              : 'Disk (sandboxes)'
+          }
+          used={formatBytes(sandboxDisk)}
+          limit={null}
+          percent={null}
         />
       </div>
     </Card>

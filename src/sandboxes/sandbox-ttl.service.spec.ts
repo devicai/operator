@@ -11,6 +11,7 @@ function makeService(overrides: {
   managed?: any[];
   liveNames?: string[];
   listManaged?: boolean;
+  config?: any;
 } = {}) {
   const sandboxRepo = {
     findExpired: jest.fn().mockResolvedValue(overrides.expired ?? []),
@@ -41,9 +42,11 @@ function makeService(overrides: {
     registry,
     runtime,
     snapshotsService,
+    config: overrides.config ?? {},
     logger: { log: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
     running: false,
     sweeping: false,
+    timers: [],
   });
   return { service, sandboxRepo, registry, runtime, snapshotsService };
 }
@@ -178,5 +181,66 @@ describe('SandboxTtlService.sweepOrphanedContainers', () => {
     (service as any).sweeping = true;
     await service.sweepOrphanedContainers();
     expect(runtime.remove).not.toHaveBeenCalled();
+  });
+});
+
+describe('SandboxTtlService scheduling', () => {
+  const schedule = (config: any) => {
+    const { service } = makeService({ config });
+    const intervals: number[] = [];
+    const spy = jest
+      .spyOn(global, 'setInterval')
+      .mockImplementation(((fn: any, ms: number) => {
+        intervals.push(ms);
+        return 0 as any;
+      }) as any);
+    service.onModuleInit();
+    spy.mockRestore();
+    return { intervals, service };
+  };
+
+  it('takes both cadences from config', () => {
+    const { intervals } = schedule({
+      defaults: { ttlCheckIntervalMs: 45_000 },
+      maintenance: { containerSweepIntervalMs: 120_000 },
+    });
+    expect(intervals).toEqual([45_000, 120_000]);
+  });
+
+  it('falls back to the built-in defaults when config is silent', () => {
+    const { intervals } = schedule({});
+    expect(intervals).toEqual([30_000, 300_000]);
+  });
+
+  it('floors an interval that would busy-loop the daemon', () => {
+    // A zero (or a typo) must not turn a periodic job into a hot loop.
+    const { intervals } = schedule({
+      defaults: { ttlCheckIntervalMs: 0 },
+      maintenance: { containerSweepIntervalMs: 1, minIntervalMs: 5_000 },
+    });
+    expect(intervals).toEqual([5_000, 5_000]);
+  });
+
+  it('honours a configured sweep grace window', async () => {
+    const { service, runtime } = makeService({
+      config: { maintenance: { containerSweepGraceMs: 60_000 } },
+      managed: [
+        // Two minutes old: past a 60s grace, but inside the 10 min default.
+        { name: 'sandbox-old', status: 'exited', createdAtMs: Date.now() - 120_000 },
+      ],
+      liveNames: [],
+    });
+
+    await service.sweepOrphanedContainers();
+
+    expect(runtime.remove).toHaveBeenCalledWith('sandbox-old');
+  });
+
+  it('clears its timers on shutdown', () => {
+    const { service } = schedule({});
+    const spy = jest.spyOn(global, 'clearInterval');
+    service.onApplicationShutdown();
+    expect(spy).toHaveBeenCalledTimes(2);
+    spy.mockRestore();
   });
 });

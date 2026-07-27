@@ -1,19 +1,35 @@
 import { NestFactory } from '@nestjs/core';
-import { ValidationPipe, Logger } from '@nestjs/common';
+import { ValidationPipe, Logger, LogLevel } from '@nestjs/common';
 import { json } from 'express';
 import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { WsAdapter } from '@nestjs/platform-ws';
 import { AppModule } from './app.module';
 import { loadConfig } from './config/config.loader';
 
+/** Nest's log levels, least to most severe. */
+const LOG_LEVELS: LogLevel[] = ['verbose', 'debug', 'log', 'warn', 'error', 'fatal'];
+
+/**
+ * Expand `logging.level` into every level at or above it.
+ *
+ * The configured level is a *threshold*, not a single channel: asking for
+ * `debug` means "debug and everything more severe". Passing the level verbatim
+ * enabled exactly that one plus error/warn, so `level: debug` — the setting
+ * most deployments run — dropped every `logger.log()`, taking the boot banner,
+ * sandbox expiry and hot pool activity with it.
+ */
+function resolveLogLevels(level?: string): LogLevel[] {
+  const index = level ? LOG_LEVELS.indexOf(level as LogLevel) : -1;
+  if (index === -1) return LOG_LEVELS.slice(LOG_LEVELS.indexOf('log'));
+  return LOG_LEVELS.slice(index);
+}
+
 async function bootstrap() {
   const config = loadConfig();
   const logger = new Logger('Bootstrap');
 
   const app = await NestFactory.create(AppModule, {
-    logger: config.logging?.level
-      ? [config.logging.level as any, 'error', 'warn']
-      : ['log', 'error', 'warn'],
+    logger: resolveLogLevels(config.logging?.level),
   });
 
   // WebSocket adapter

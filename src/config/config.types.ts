@@ -10,6 +10,7 @@ export interface ModuleConfig {
   webhooks?: WebhooksConfig;
   logging: LoggingConfig;
   resourceLimits?: ResourceLimitsConfig;
+  maintenance?: MaintenanceConfig;
   hotPool?: HotPoolConfig;
   ingress?: IngressConfig;
   snapshots?: SnapshotsConfig;
@@ -237,6 +238,60 @@ export interface ResourceLimitsConfig {
   maxTotalMemoryMib?: number;
   /** Maximum total disk usage (bytes) for stored snapshots. 0/undefined disables the limit. */
   maxTotalDiskBytes?: number;
+  /**
+   * Maximum disk (bytes) a single sandbox may write before it is stopped.
+   * 0/undefined disables the limit.
+   *
+   * This is a *reactive* cap, not a kernel quota: usage is sampled on an
+   * interval, so a sandbox can overshoot between two samples. A hard cap needs
+   * `--storage-opt size=`, which Docker only honors on overlay2 over XFS
+   * mounted with `pquota` — on ext4 the daemon rejects it outright. Without
+   * this, one runaway sandbox can fill the host and take every other service
+   * down with it.
+   */
+  maxSandboxDiskBytes?: number;
+  /**
+   * Disk (bytes) at which a sandbox is flagged as heavy without being touched.
+   * Surfaces in the API and the UI so an operator sees the growth coming.
+   * 0/undefined disables the warning.
+   */
+  warnSandboxDiskBytes?: number;
+}
+
+/**
+ * Cadence of the background jobs that keep the runtime and the database in
+ * agreement. Every value is a trade-off between reclaiming resources promptly
+ * and the load each pass puts on the daemon, so an operator running a busy
+ * host — or a laptop — needs to be able to tune them without a rebuild.
+ */
+export interface MaintenanceConfig {
+  /**
+   * How often the runtime is reconciled against the database, reclaiming
+   * containers whose sandbox is gone or in a terminal state.
+   * Default 300000 (5 min). Lists the whole daemon, so keep it well above the
+   * TTL sweep interval.
+   */
+  containerSweepIntervalMs?: number;
+  /**
+   * A container younger than this is never reclaimed, so a create still in
+   * flight is safe even before its document exists. Default 600000 (10 min).
+   * Must comfortably exceed the slowest create on this host.
+   */
+  containerSweepGraceMs?: number;
+  /** How often per-sandbox disk usage is sampled. Default 60000 (1 min). */
+  sandboxDiskCheckIntervalMs?: number;
+  /**
+   * Grace window shielding a just-created per-sandbox network from the network
+   * sweeper, which would otherwise reclaim it mid-create. Default 60000.
+   * Only relevant when ingress is enabled.
+   */
+  networkSweepGraceMs?: number;
+  /**
+   * Floor applied to every interval above. Guards against a typo (or a zero)
+   * turning a periodic job into a busy loop against the Docker daemon.
+   * Default 5000.
+   */
+  minIntervalMs?: number;
 }
 
 /**
