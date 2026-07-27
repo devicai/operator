@@ -1,6 +1,16 @@
+# Cap every service's log file. The default json-file driver grows without
+# bound: on one deployment mongo's log reached 1.2 GB in five weeks, and it is
+# never read past the last few thousand lines.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "50m"
+    max-file: "3"
+
 services:
   app:
     build: .
+    logging: *default-logging
     ports:
       - "127.0.0.1:${PORT:-3200}:3200"
       # Public ingress proxy (routes <id>.sandbox.devic.ai to running sandboxes).
@@ -17,6 +27,7 @@ services:
 
   frontend:
     build: ./frontend
+    logging: *default-logging
     ports:
       - "127.0.0.1:${FRONTEND_PORT:-5174}:80"
     depends_on:
@@ -26,6 +37,7 @@ services:
 
   mongo:
     image: mongo:7
+    logging: *default-logging
     profiles: [infra]
     # `mongod` runs as PID 1 and is not an init: it never reap()s the orphaned
     # `mongosh` processes the healthcheck spawns, so each one lingers as a
@@ -45,6 +57,7 @@ services:
 
   redis:
     image: redis:7-alpine
+    logging: *default-logging
     profiles: [infra]
     # Same orphan->zombie pattern as mongo: `redis-server` is PID 1 and the
     # `redis-cli` healthcheck processes reparent to it without being reaped.
@@ -61,6 +74,7 @@ services:
 
   microsandbox:
     image: microsandbox/microsandbox:latest
+    logging: *default-logging
     profiles: [infra]
     privileged: true
     ports:

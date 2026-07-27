@@ -246,6 +246,27 @@ export interface RuntimeProvider {
    * networks reclaimed. No-op for runtimes without per-sandbox networks.
    */
   sweepOrphanedNetworks?(): Promise<number>;
+
+  /**
+   * Optional: every sandbox this runtime currently holds, running or not.
+   *
+   * Used to reconcile the runtime against the database. A sandbox container
+   * outlives its document whenever a teardown is missed — the process
+   * restarted mid-expiry, a `remove` failed, a container was created
+   * out-of-band — and nothing else would ever notice: a document in a
+   * terminal state is never revisited, so its container would sit there
+   * holding its writable layer forever.
+   */
+  listManaged?(): Promise<ManagedSandboxInfo[]>;
+}
+
+export interface ManagedSandboxInfo {
+  /** Container name, which matches the sandbox document's `name`. */
+  name: string;
+  /** Epoch millis the container was created, or 0 when unknown. */
+  createdAtMs: number;
+  /** Runtime-level state, e.g. 'running' / 'exited'. */
+  status: string;
 }
 
 export const RUNTIME_PROVIDER = Symbol('RUNTIME_PROVIDER');

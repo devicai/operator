@@ -25,6 +25,7 @@ import {
   ExecStream,
   ExecStreamEvent,
   FsChange,
+  ManagedSandboxInfo,
   RuntimeHandle,
   RuntimeProvider,
   RuntimeSandbox,
@@ -50,6 +51,12 @@ import {
  */
 const isolatedNetworkName = (sandboxName: string): string =>
   `devic-${sandboxName}`;
+
+/**
+ * Naming convention every sandbox container follows (`sandbox-<sandboxId>`,
+ * set by SandboxesService and SnapshotsService).
+ */
+const SANDBOX_CONTAINER_PREFIX = 'sandbox-';
 
 @Injectable()
 export class DockerRuntimeProvider implements RuntimeProvider {
@@ -482,6 +489,37 @@ export class DockerRuntimeProvider implements RuntimeProvider {
    * reclaim that network mid-creation.
    */
   private static readonly NETWORK_SWEEP_GRACE_MS = 60_000;
+
+  async listManaged(): Promise<ManagedSandboxInfo[]> {
+    let containers: Docker.ContainerInfo[];
+    try {
+      containers = await this.docker.listContainers({
+        all: true,
+        filters: JSON.stringify({ label: ['devic-sandbox.managed=true'] }),
+      });
+    } catch (err) {
+      this.logger.warn(`listManaged failed: ${(err as Error).message}`);
+      return [];
+    }
+
+    return containers
+      .filter((c) => !c.Labels?.['devic-sandbox.baseline'])
+      .map((c) => ({
+        // Prefer the label: it is what `create` was given, whereas Names
+        // carries a leading slash and can hold aliases.
+        name:
+          c.Labels?.['devic-sandbox.name'] ??
+          (c.Names?.[0] ?? '').replace(/^\//, ''),
+        createdAtMs: c.Created ? c.Created * 1000 : 0,
+        status: c.State ?? 'unknown',
+      }))
+      // Only real sandboxes. The managed label is also worn by short-lived
+      // helpers that go through create() under their own name (snapshot
+      // sources, integration-test fixtures); those have no sandbox document
+      // by design, so a caller reconciling against the database would read
+      // them as orphans and destroy work in progress.
+      .filter((c) => c.name.startsWith(SANDBOX_CONTAINER_PREFIX));
+  }
 
   async sweepOrphanedNetworks(): Promise<number> {
     if (!this.ingressEnabled) return 0;

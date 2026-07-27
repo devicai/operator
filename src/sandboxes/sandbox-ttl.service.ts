@@ -10,10 +10,20 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 
+/** How often the runtime is reconciled against the database. */
+const CONTAINER_SWEEP_INTERVAL_MS = 300_000;
+
+/**
+ * A container younger than this is never swept, so an in-flight create is
+ * safe even if its document has not been written yet.
+ */
+const CONTAINER_SWEEP_GRACE_MS = 600_000;
+
 @Injectable()
 export class SandboxTtlService {
   private readonly logger = new Logger(SandboxTtlService.name);
   private running = false;
+  private sweeping = false;
 
   constructor(
     private readonly sandboxRepo: SandboxRepository,
@@ -46,22 +56,25 @@ export class SandboxTtlService {
         }
 
         try {
-          const containerName = await this.registry.get(doc.sandboxId);
-          if (containerName) {
-            const handle = await this.runtime.get(containerName);
-            if (handle?.status === 'running') {
-              const sandbox = await handle.connect();
-              await sandbox.detach();
-            }
-          }
+          // `doc.name` is the container name — the document is the source of
+          // truth. The Redis registry is a cache whose key lives only
+          // `ttl + 60s`, so a reap that arrives late (process restart, a big
+          // batch) used to find nothing there and leave the container running
+          // forever, while the document was already marked expired and never
+          // revisited.
+          //
+          // Remove rather than stop: an expired sandbox cannot be resumed —
+          // there is no start/resume endpoint — so a stopped container is dead
+          // weight that keeps holding its writable layer.
+          await this.runtime.remove(doc.name);
         } catch (err) {
           this.logger.warn(
-            `Error detaching expired sandbox ${doc.sandboxId}: ${(err as Error).message}`,
+            `Error removing expired sandbox ${doc.sandboxId}: ${(err as Error).message}`,
           );
         }
 
         await this.registry.remove(doc.sandboxId);
-        this.logger.log(`Sandbox ${doc.sandboxId} expired and detached`);
+        this.logger.log(`Sandbox ${doc.sandboxId} expired and removed`);
       }
 
       // After reaping expired sandboxes, reclaim any per-sandbox networks that
@@ -76,6 +89,64 @@ export class SandboxTtlService {
       this.logger.error(`TTL check error: ${(err as Error).message}`);
     } finally {
       this.running = false;
+    }
+  }
+
+  /**
+   * Reconcile the runtime against the database: remove every managed container
+   * whose sandbox is gone or in a terminal state.
+   *
+   * The reaper above handles the normal path, but containers still escape it —
+   * a `remove` that failed, a teardown interrupted by a restart, a container
+   * created out-of-band. Nothing revisits them: a document that is already
+   * `expired`/`stopped`/`failed` never comes back through `findExpired()`, so
+   * without this sweep the container holds its writable layer indefinitely.
+   *
+   * Runs on its own slower interval — it lists the whole daemon, which is not
+   * something to do every 30 seconds.
+   */
+  @Interval(CONTAINER_SWEEP_INTERVAL_MS)
+  async sweepOrphanedContainers(): Promise<void> {
+    if (!this.runtime.listManaged) return;
+    if (this.sweeping) return;
+    this.sweeping = true;
+
+    try {
+      const managed = await this.runtime.listManaged();
+      if (managed.length === 0) return;
+
+      const liveNames = await this.sandboxRepo.findLiveContainerNames();
+      const live = new Set(liveNames);
+      const cutoff = Date.now() - CONTAINER_SWEEP_GRACE_MS;
+
+      let removed = 0;
+      for (const container of managed) {
+        if (live.has(container.name)) continue;
+        // Protect an in-flight create: the document exists before the
+        // container does, but a container whose document has not landed yet
+        // (or a `sandbox-*` created by hand seconds ago) deserves the benefit
+        // of the doubt.
+        if (container.createdAtMs && container.createdAtMs > cutoff) continue;
+
+        try {
+          await this.runtime.remove(container.name);
+          removed++;
+        } catch (err) {
+          this.logger.warn(
+            `Could not reclaim orphaned container ${container.name}: ${(err as Error).message}`,
+          );
+        }
+      }
+
+      if (removed > 0) {
+        this.logger.log(
+          `Reclaimed ${removed} orphaned sandbox container(s) of ${managed.length} managed`,
+        );
+      }
+    } catch (err) {
+      this.logger.error(`Container sweep error: ${(err as Error).message}`);
+    } finally {
+      this.sweeping = false;
     }
   }
 }
