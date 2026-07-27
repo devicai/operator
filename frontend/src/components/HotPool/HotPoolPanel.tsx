@@ -48,6 +48,8 @@ const HotPoolPanel: React.FC = () => {
   if (!data) return null;
 
   const { config, metrics, snapshot, hotSandboxes, lastError } = data;
+  // Servers running a build without `recentClaims` must not blank the panel.
+  const recentClaims = data.recentClaims ?? [];
 
   const enabled = !!config.enabled;
   const fillPct = metrics.target > 0 ? (metrics.current / metrics.target) * 100 : 0;
@@ -188,6 +190,39 @@ const HotPoolPanel: React.FC = () => {
           description={lastError}
           style={{ marginTop: 8 }}
         />
+      )}
+
+      {recentClaims.length > 0 && (
+        <div style={{ marginTop: 12 }}>
+          <Text style={{ fontSize: 12, opacity: 0.7 }}>
+            <FontAwesomeIcon icon={faBoltLightning} style={{ marginRight: 6, color: '#ff7a45' }} />
+            Recently claimed:
+          </Text>
+          <div style={{ marginTop: 4, display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+            {recentClaims.map((c) => (
+              <Tooltip
+                key={c.sandboxId}
+                title={
+                  `${c.sandboxId} — ${c.status} · TTL ${Math.round(c.ttlSeconds / 60)}m` +
+                  (c.claimedAt ? ` · claimed ${timeAgo(c.claimedAt)}` : '') +
+                  (c.bindingId ? ` · binding ${c.bindingId}` : '')
+                }
+              >
+                <Tag
+                  color={c.status === 'running' ? 'volcano' : 'default'}
+                  style={{ marginInlineEnd: 0 }}
+                >
+                  <code style={{ fontSize: 10 }}>{c.name}</code>
+                  {c.claimedAt && (
+                    <span style={{ fontSize: 10, opacity: 0.7, marginLeft: 4 }}>
+                      {timeAgo(c.claimedAt)}
+                    </span>
+                  )}
+                </Tag>
+              </Tooltip>
+            ))}
+          </div>
+        </div>
       )}
 
       {enabled && hotSandboxes.length > 0 && (

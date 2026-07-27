@@ -35,6 +35,23 @@ export interface HotPoolSandboxView {
   ageSeconds: number;
 }
 
+/**
+ * A sandbox the pool has already handed out. Surfacing these is what lets an
+ * operator answer "which pod is serving the session I just started?" — the
+ * claimed sandbox keeps its pre-warm `createdAt`, so it is not where a
+ * chronological listing would suggest.
+ */
+export interface HotPoolClaimView {
+  sandboxId: string;
+  name: string;
+  status: string;
+  /** TTL granted at claim time, in seconds. */
+  ttlSeconds: number;
+  claimedAt: string | null;
+  expiresAt: string | null;
+  bindingId: string | null;
+}
+
 export interface HotPoolStatus {
   config: HotPoolConfig;
   /** Effective config after applying defaults and validating limits. */
@@ -42,6 +59,8 @@ export interface HotPoolStatus {
   metrics: HotPoolMetrics;
   snapshot: { snapshotId: string; name: string } | null;
   hotSandboxes: HotPoolSandboxView[];
+  /** Most recently claimed sandboxes, newest first. */
+  recentClaims: HotPoolClaimView[];
   lastReconcileAt: string | null;
   lastError: string | null;
 }

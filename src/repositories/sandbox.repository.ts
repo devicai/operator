@@ -1,11 +1,11 @@
 import { Inject, Injectable } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
-import { Model } from 'mongoose';
+import { FilterQuery, Model } from 'mongoose';
 import { BaseRepository } from './base.repository';
 import { ExtensionProperty } from '../config/config.types';
 import { EXTENSIONS_TOKEN } from '../providers/extensions.provider';
 import { Sandbox, SandboxDocument, SandboxStatus } from '../schemas/sandbox.schema';
-import { ExtensionScope } from '../interfaces';
+import { ExtensionScope, PaginatedResponse } from '../interfaces';
 
 @Injectable()
 export class SandboxRepository extends BaseRepository<SandboxDocument> {
@@ -58,12 +58,17 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
     },
   ): Promise<SandboxDocument | null> {
     const cappedTtl = Math.min(update.ttlSeconds, update.maxTtlSeconds);
-    const expiresAt = new Date(Date.now() + cappedTtl * 1000);
+    const claimedAt = new Date();
+    const expiresAt = new Date(claimedAt.getTime() + cappedTtl * 1000);
     const set: Record<string, any> = {
       hotReserved: false,
+      claimedFromHotPool: true,
+      claimedAt,
       ttlSeconds: cappedTtl,
       expiresAt,
-      'metadata.hotClaimedAt': new Date().toISOString(),
+      // Kept for backwards compatibility with clients reading the metadata bag;
+      // `claimedAt` is the queryable, indexed source of truth.
+      'metadata.hotClaimedAt': claimedAt.toISOString(),
     };
     if (update.bindingId) {
       set.bindingId = update.bindingId;
@@ -106,6 +111,89 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
     };
     if (snapshotId) filter['metadata.hotPoolSnapshotId'] = snapshotId;
     return this.model.countDocuments(filter).exec();
+  }
+
+  /**
+   * Matches sandboxes that were served by the hot pool. Documents claimed
+   * before `claimedAt` existed only carry `metadata.hotClaimedAt`, so both
+   * shapes are accepted.
+   */
+  static readonly CLAIMED_FROM_POOL_FILTER = {
+    $or: [
+      { claimedFromHotPool: true },
+      { 'metadata.hotClaimedAt': { $exists: true } },
+    ],
+  };
+
+  /**
+   * Paginated listing ordered by *activity* rather than creation.
+   *
+   * A claimed hot sandbox keeps the `createdAt` of the moment its pod was
+   * pre-warmed — often days earlier — so sorting by `createdAt` buries the
+   * sandbox that just started serving a session under the idle pool pods. The
+   * computed `activityAt` (claim time, falling back to creation time) puts
+   * every row where an operator expects to find it.
+   */
+  async findByActivity(
+    filter: FilterQuery<SandboxDocument>,
+    scope: ExtensionScope,
+    options?: { limit?: number; offset?: number },
+  ): Promise<PaginatedResponse<SandboxDocument>> {
+    const scopedFilter = this.applyScope(filter, scope);
+    const limit = options?.limit ?? 20;
+    const offset = options?.offset ?? 0;
+
+    const [data, total] = await Promise.all([
+      this.model
+        .aggregate([
+          { $match: scopedFilter },
+          {
+            $addFields: {
+              activityAt: {
+                $ifNull: [
+                  '$claimedAt',
+                  { $toDate: '$metadata.hotClaimedAt' },
+                  '$createdAt',
+                ],
+              },
+            },
+          },
+          { $sort: { activityAt: -1, _id: -1 } },
+          { $skip: offset },
+          { $limit: limit },
+        ])
+        .exec(),
+      this.model.countDocuments(scopedFilter).exec(),
+    ]);
+
+    return {
+      data: data as SandboxDocument[],
+      pagination: {
+        total,
+        limit,
+        offset,
+        hasMore: offset + limit < total,
+      },
+    };
+  }
+
+  /** Most recently claimed hot sandboxes, newest first. */
+  async findRecentClaims(limit: number): Promise<SandboxDocument[]> {
+    const rows = await this.model
+      .aggregate([
+        { $match: SandboxRepository.CLAIMED_FROM_POOL_FILTER },
+        {
+          $addFields: {
+            activityAt: {
+              $ifNull: ['$claimedAt', { $toDate: '$metadata.hotClaimedAt' }],
+            },
+          },
+        },
+        { $sort: { activityAt: -1 } },
+        { $limit: limit },
+      ])
+      .exec();
+    return rows as SandboxDocument[];
   }
 
   async aggregateHotMemoryMib(snapshotId?: string): Promise<number> {

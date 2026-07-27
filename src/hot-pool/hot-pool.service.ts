@@ -26,10 +26,14 @@ import {
 import { UpdateHotPoolDto } from './dto/update-hot-pool.dto';
 import { ClaimHotDto } from './dto/claim-hot.dto';
 import {
+  HotPoolClaimView,
   HotPoolMetrics,
   HotPoolSandboxView,
   HotPoolStatus,
 } from './hot-pool.types';
+
+/** How many past claims `getStatus()` reports. */
+const RECENT_CLAIMS_LIMIT = 10;
 
 /**
  * Maintains a fleet of pre-restored sandboxes, ready to be claimed instantly.
@@ -180,6 +184,21 @@ export class HotPoolService implements OnModuleInit {
       ),
     }));
 
+    const claimDocs = await this.sandboxRepo.findRecentClaims(
+      RECENT_CLAIMS_LIMIT,
+    );
+    const recentClaims: HotPoolClaimView[] = claimDocs.map((d) => ({
+      sandboxId: d.sandboxId,
+      name: d.name,
+      status: d.status,
+      ttlSeconds: d.ttlSeconds,
+      claimedAt:
+        (d.claimedAt ? new Date(d.claimedAt).toISOString() : null) ??
+        ((d.metadata as any)?.hotClaimedAt ?? null),
+      expiresAt: d.expiresAt ? new Date(d.expiresAt).toISOString() : null,
+      bindingId: d.bindingId ?? null,
+    }));
+
     let snapshotInfo: HotPoolStatus['snapshot'] = null;
     if (this.liveConfig.snapshotId) {
       const snap = await this.snapshotRepo.findOne(
@@ -197,6 +216,7 @@ export class HotPoolService implements OnModuleInit {
       metrics,
       snapshot: snapshotInfo,
       hotSandboxes,
+      recentClaims,
       lastReconcileAt: this.lastReconcileAt
         ? this.lastReconcileAt.toISOString()
         : null,
@@ -236,8 +256,23 @@ export class HotPoolService implements OnModuleInit {
     this.totalClaims += 1;
     this.lastClaimedAt = new Date();
 
+    // The pod was registered with the pool's year-long TTL; shrink the Redis
+    // key to the claimed lifetime so the registry expires alongside the doc
+    // instead of outliving the sandbox by up to a year.
+    try {
+      await this.sandboxesService.syncRegistryTtl(
+        claimed.sandboxId,
+        claimed.ttlSeconds,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not sync registry TTL for ${claimed.sandboxId}: ${(err as Error).message}`,
+      );
+    }
+
     this.logger.log(
-      `Claimed hot sandbox ${claimed.sandboxId} (binding=${dto.bindingId ?? '-'}, totalClaims=${this.totalClaims})`,
+      `Claimed hot sandbox ${claimed.sandboxId} (binding=${dto.bindingId ?? '-'}, ` +
+        `ttl=${claimed.ttlSeconds}s, totalClaims=${this.totalClaims})`,
     );
 
     // Fire-and-forget refill.

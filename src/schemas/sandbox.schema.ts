@@ -92,6 +92,26 @@ export class Sandbox {
 
   @ApiProperty({
     description:
+      'True once this sandbox has been handed out from the hot pool. Unlike ' +
+      '`hotReserved` (which is cleared on claim) this flag is permanent, so a ' +
+      'sandbox serving a session can always be told apart from a cold-started ' +
+      'one.',
+  })
+  @Prop({ default: false, index: true })
+  claimedFromHotPool: boolean;
+
+  @ApiProperty({
+    description:
+      'When the sandbox was claimed from the hot pool. This — not `createdAt`, ' +
+      'which records when the pod was pre-warmed — is when the sandbox started ' +
+      'serving its owner.',
+    required: false,
+  })
+  @Prop({ index: true })
+  claimedAt?: Date;
+
+  @ApiProperty({
+    description:
       'Port inside the sandbox that the ingress proxy forwards HTTP traffic ' +
       'to. Falls back to ingress.defaultUpstreamPort when not set.',
     required: false,

@@ -22,6 +22,7 @@ import {
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
+import { useSnapshots } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
 import CreateSandboxModal from './CreateSandboxModal';
@@ -51,15 +52,55 @@ function formatRemaining(expiresAt: string): string {
   return `${min}m ${sec}s`;
 }
 
+/**
+ * When a sandbox was claimed from the hot pool, or null if it never was.
+ * Sandboxes claimed before `claimedAt` was persisted only carry the timestamp
+ * inside `metadata`.
+ */
+function claimTime(row: SandboxDto): string | null {
+  if (row.hotReserved) return null;
+  return row.claimedAt ?? ((row.metadata as any)?.hotClaimedAt as string) ?? null;
+}
+
+/** Hot-pool origin filter — maps to the API's two independent flags. */
+type OriginFilter = 'claimed' | 'in-pool' | 'not-pooled';
+
+const ORIGIN_QUERY: Record<
+  OriginFilter,
+  { fromHotPool?: boolean; hotReserved?: boolean }
+> = {
+  claimed: { fromHotPool: true },
+  'in-pool': { hotReserved: true },
+  'not-pooled': { fromHotPool: false, hotReserved: false },
+};
+
 const SandboxesPage: React.FC = () => {
   const [statusFilter, setStatusFilter] = useState<string | undefined>();
+  const [snapshotFilter, setSnapshotFilter] = useState<string | undefined>();
+  const [originFilter, setOriginFilter] = useState<OriginFilter | undefined>();
+  const [page, setPage] = useState(1);
+  const [pageSize, setPageSize] = useState(20);
   const [createOpen, setCreateOpen] = useState(false);
   const [terminalSandbox, setTerminalSandbox] = useState<SandboxDto | null>(null);
   const [snapshotSandbox, setSnapshotSandbox] = useState<SandboxDto | null>(null);
   const [stoppingIds, setStoppingIds] = useState<Set<string>>(new Set());
   const [destroyingIds, setDestroyingIds] = useState<Set<string>>(new Set());
 
-  const { data, isLoading } = useSandboxes({ status: statusFilter });
+  // Any filter change re-slices the result set, so an offset from the old set
+  // would land on an arbitrary page (or past the end).
+  const resetPage = <T,>(setter: (v: T) => void) => (value: T) => {
+    setter(value);
+    setPage(1);
+  };
+
+  const { data, isLoading } = useSandboxes({
+    status: statusFilter,
+    snapshotId: snapshotFilter,
+    ...(originFilter ? ORIGIN_QUERY[originFilter] : {}),
+    limit: pageSize,
+    offset: (page - 1) * pageSize,
+  });
+  const { data: snapshotsPage } = useSnapshots();
   const { data: usage, isLoading: usageLoading } = useUsage();
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
@@ -105,8 +146,7 @@ const SandboxesPage: React.FC = () => {
       dataIndex: 'name',
       key: 'name',
       render: (name: string, row) => {
-        const fromHotPool =
-          !row.hotReserved && (row.metadata as any)?.hotPool === true;
+        const claimedAt = claimTime(row);
         return (
           <div>
             <code style={{ fontSize: 12 }}>{name}</code>
@@ -115,10 +155,14 @@ const SandboxesPage: React.FC = () => {
                 <Tag color="orange" style={{ fontSize: 10, marginLeft: 6 }}>HOT</Tag>
               </Tooltip>
             )}
-            {fromHotPool && (
-              <Tooltip title="Claimed from the hot pool — no cold-start cost">
+            {claimedAt && (
+              <Tooltip
+                title={`Claimed from the hot pool ${formatRelative(claimedAt)} (${formatDateTime(
+                  claimedAt,
+                )}) — no cold-start cost`}
+              >
                 <Tag color="volcano" style={{ fontSize: 10, marginLeft: 6 }}>
-                  FROM POOL
+                  CLAIMED {formatRelative(claimedAt)}
                 </Tag>
               </Tooltip>
             )}
@@ -185,15 +229,28 @@ const SandboxesPage: React.FC = () => {
       },
     },
     {
-      title: 'Created',
-      dataIndex: 'createdAt',
-      key: 'createdAt',
+      // For a claimed pod the row's own createdAt is when it was pre-warmed,
+      // not when it started serving — showing that would misdate every session.
+      title: 'Started',
+      key: 'startedAt',
       width: 125,
-      render: (d: string) => (
-        <Tooltip title={formatRelative(d)}>
-          <span style={{ fontSize: 11 }}>{formatDateTime(d)}</span>
-        </Tooltip>
-      ),
+      render: (_: any, row) => {
+        const claimedAt = claimTime(row);
+        const shown = claimedAt ?? row.createdAt;
+        return (
+          <Tooltip
+            title={
+              claimedAt
+                ? `Claimed ${formatRelative(claimedAt)} · pod pre-warmed ${formatDateTime(
+                    row.createdAt,
+                  )}`
+                : formatRelative(shown)
+            }
+          >
+            <span style={{ fontSize: 11 }}>{formatDateTime(shown)}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: 'Expires',
@@ -202,6 +259,13 @@ const SandboxesPage: React.FC = () => {
       width: 125,
       render: (d: string, row) => {
         if (!d) return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
+        if (row.hotReserved) {
+          return (
+            <Tooltip title="Idle pool pods carry a placeholder expiry so the TTL sweep skips them">
+              <span style={{ fontSize: 11, opacity: 0.5 }}>—</span>
+            </Tooltip>
+          );
+        }
         return (
           <Tooltip title={row.status === 'running' ? formatRelative(d) : 'Not running'}>
             <span style={{ fontSize: 11, opacity: row.status === 'running' ? 1 : 0.5 }}>
@@ -216,6 +280,16 @@ const SandboxesPage: React.FC = () => {
       key: 'ttl',
       width: 130,
       render: (_: any, row) => {
+        // A pod waiting in the pool holds a year-long placeholder TTL. Rendering
+        // it as a countdown ("525583m 56s") reads like a real lifetime and is
+        // what makes a pool pod indistinguishable from a live session at a glance.
+        if (row.hotReserved) {
+          return (
+            <Tooltip title="Waiting in the hot pool — its real TTL is set when a caller claims it">
+              <Tag color="orange" style={{ marginRight: 0 }}>in pool</Tag>
+            </Tooltip>
+          );
+        }
         const duration = (
           <Tooltip title="Configured lifetime">
             <span style={{ fontSize: 11, opacity: 0.75 }}>
@@ -305,19 +379,47 @@ const SandboxesPage: React.FC = () => {
           <FontAwesomeIcon icon={faTerminal} style={{ marginRight: 8 }} />
           Sandboxes
         </Title>
-        <Space>
+        <Space wrap>
           <Select
             placeholder="Filter status"
             allowClear
             style={{ width: 140 }}
             value={statusFilter}
-            onChange={setStatusFilter}
+            onChange={resetPage(setStatusFilter)}
             options={[
               { label: 'Running', value: 'running' },
+              { label: 'Creating', value: 'creating' },
+              { label: 'Pending', value: 'pending' },
+              { label: 'Stopping', value: 'stopping' },
               { label: 'Stopped', value: 'stopped' },
               { label: 'Expired', value: 'expired' },
               { label: 'Failed', value: 'failed' },
             ]}
+          />
+          <Select
+            placeholder="Filter origin"
+            allowClear
+            style={{ width: 160 }}
+            value={originFilter}
+            onChange={resetPage(setOriginFilter)}
+            options={[
+              { label: 'Claimed from pool', value: 'claimed' },
+              { label: 'Idle in pool', value: 'in-pool' },
+              { label: 'Never pooled', value: 'not-pooled' },
+            ]}
+          />
+          <Select
+            placeholder="Filter snapshot"
+            allowClear
+            showSearch
+            optionFilterProp="label"
+            style={{ width: 200 }}
+            value={snapshotFilter}
+            onChange={resetPage(setSnapshotFilter)}
+            options={(snapshotsPage?.data ?? []).map((s) => ({
+              label: s.name || s.snapshotId,
+              value: s.snapshotId,
+            }))}
           />
           <Button
             type="primary"
@@ -338,12 +440,27 @@ const SandboxesPage: React.FC = () => {
         loading={isLoading}
         columns={columns}
         dataSource={sandboxes}
-        pagination={false}
+        pagination={{
+          current: page,
+          pageSize,
+          total: data?.pagination.total ?? 0,
+          showSizeChanger: true,
+          pageSizeOptions: [20, 50, 100],
+          showTotal: (total, [from, to]) => `${from}-${to} of ${total}`,
+          onChange: (nextPage, nextSize) => {
+            setPage(nextSize !== pageSize ? 1 : nextPage);
+            setPageSize(nextSize);
+          },
+        }}
         locale={{
           emptyText: (
             <Empty
               image={Empty.PRESENTED_IMAGE_SIMPLE}
-              description="No sandboxes yet. Create one to get started."
+              description={
+                statusFilter || originFilter || snapshotFilter
+                  ? 'No sandboxes match these filters.'
+                  : 'No sandboxes yet. Create one to get started.'
+              }
             />
           ),
         }}
