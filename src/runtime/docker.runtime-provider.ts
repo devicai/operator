@@ -24,6 +24,7 @@ import {
   ExecResult,
   ExecStream,
   ExecStreamEvent,
+  DiskQuotaSupport,
   FsChange,
   ManagedSandboxInfo,
   RuntimeHandle,
@@ -57,6 +58,26 @@ const isolatedNetworkName = (sandboxName: string): string =>
  * set by SandboxesService and SnapshotsService).
  */
 const SANDBOX_CONTAINER_PREFIX = 'sandbox-';
+
+/** Headroom over the image the probe container is allowed. */
+const PROBE_IMAGE_HEADROOM_BYTES = 32 * 1024 * 1024;
+/** How far past that headroom the probe tries to write. */
+const PROBE_OVERSHOOT_BYTES = 128 * 1024 * 1024;
+
+/**
+ * A daemon that cannot back the quota says so in the create error. The message
+ * is stable across versions ("--storage-opt is supported only for overlay over
+ * xfs with 'pquota' mount option"), but match loosely: the wording differs
+ * between storage drivers and the failure mode is the same.
+ */
+function isStorageOptUnsupported(err: unknown): boolean {
+  const message = (err as Error)?.message?.toLowerCase() ?? '';
+  return (
+    message.includes('storage-opt') ||
+    message.includes('storageopt') ||
+    (message.includes('quota') && message.includes('not supported'))
+  );
+}
 
 @Injectable()
 export class DockerRuntimeProvider implements RuntimeProvider {
@@ -92,6 +113,10 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     string,
     Promise<Map<string, number>>
   >();
+  /** Set once the daemon has refused a quota, so we stop asking. */
+  private quotaRejected = false;
+  /** Result of the one-off enforcement probe. */
+  private diskQuotaProbe: DiskQuotaSupport | null = null;
 
   constructor(@Inject(CONFIG) private readonly config: ModuleConfig) {
     const docker = config.runtime.docker;
@@ -226,7 +251,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
 
     const runAsUser = this.hardening.runAsUser?.trim();
 
-    const container = await this.docker.createContainer({
+    const spec = (withQuota: boolean): Docker.ContainerCreateOptions => ({
       name: cfg.name,
       Image: cfg.image,
       Env: env,
@@ -246,12 +271,29 @@ export class DockerRuntimeProvider implements RuntimeProvider {
         SecurityOpt: securityOpt.length ? securityOpt : undefined,
         PidsLimit: this.hardening.pidsLimit,
         AutoRemove: false,
+        ...(withQuota ? { StorageOpt: { size: String(this.diskQuotaBytes) } } : {}),
       },
       Labels: {
         'devic-sandbox.managed': 'true',
         'devic-sandbox.name': cfg.name,
       },
     });
+
+    let container: Docker.Container;
+    if (this.wantsDiskQuota) {
+      try {
+        container = await this.docker.createContainer(spec(true));
+      } catch (err) {
+        // A daemon that cannot back the quota rejects the create outright
+        // (overlay2 on ext4 is the common case). Falling back keeps sandbox
+        // creation working; the sampled cap remains the live protection.
+        if (!isStorageOptUnsupported(err)) throw err;
+        this.noteQuotaUnsupported((err as Error).message);
+        container = await this.docker.createContainer(spec(false));
+      }
+    } else {
+      container = await this.docker.createContainer(spec(false));
+    }
 
     await container.start();
 
@@ -496,6 +538,151 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       this.config.maintenance?.networkSweepGraceMs ??
       DockerRuntimeProvider.DEFAULT_NETWORK_SWEEP_GRACE_MS
     );
+  }
+
+  // ─────────────────── per-sandbox disk quota ───────────────────
+
+  /** Bytes to hand the runtime as a hard cap, or 0 when not configured. */
+  private get diskQuotaBytes(): number {
+    return this.config.resourceLimits?.maxSandboxDiskBytes ?? 0;
+  }
+
+  /** Opt-out: a configured cap is enforced unless explicitly disabled. */
+  private get wantsDiskQuota(): boolean {
+    if (this.diskQuotaBytes <= 0) return false;
+    if (this.config.resourceLimits?.enforceSandboxDiskQuota === false) {
+      return false;
+    }
+    return this.quotaRejected === false;
+  }
+
+  private noteQuotaUnsupported(reason: string): void {
+    if (this.quotaRejected) return;
+    this.quotaRejected = true;
+    this.logger.warn(
+      `This daemon rejects per-container disk quotas (${reason.trim()}). ` +
+        'Sandboxes are created without one; the sampled cap in ' +
+        'SandboxDiskService remains the only disk protection.',
+    );
+  }
+
+  /**
+   * Find out whether a quota this daemon accepts is actually enforced.
+   *
+   * Asking the daemon is not enough. Two very different hosts both "support"
+   * `StorageOpt` from the API's point of view: overlay2 on XFS with pquota
+   * enforces it, while Docker Desktop's overlayfs accepts the option and
+   * ignores it — a container capped at 100 MB there writes 200 MB happily.
+   * Reporting that as protection would be worse than reporting nothing, so
+   * this writes past the cap in a throwaway container and checks it fails.
+   *
+   * Runs once, in the background, and only reports: creation never waits on it.
+   */
+  async probeDiskQuota(): Promise<DiskQuotaSupport> {
+    if (this.diskQuotaProbe) return this.diskQuotaProbe;
+    if (this.diskQuotaBytes <= 0) return 'not-configured';
+    if (this.config.resourceLimits?.enforceSandboxDiskQuota === false) {
+      return 'disabled';
+    }
+
+    const name = `devic-quota-probe-${randomUUID().slice(0, 8)}`;
+    // Room for the image plus a margin the test write must exceed.
+    const probeSize = PROBE_IMAGE_HEADROOM_BYTES;
+    const overshootMb = Math.ceil(PROBE_OVERSHOOT_BYTES / (1024 * 1024));
+    let container: Docker.Container | undefined;
+
+    try {
+      const image = this.config.defaults?.defaultImage ?? 'node:24';
+      const imageBytes = await this.imageSizeBytes(image);
+      container = await this.docker.createContainer({
+        name,
+        Image: image,
+        Entrypoint: ['/bin/sh', '-c'],
+        // Writes past the cap; with a real quota this dies with ENOSPC.
+        Cmd: [
+          `dd if=/dev/zero of=/quota-probe bs=1M count=${overshootMb} 2>/dev/null; ` +
+            'echo "wrote:$(stat -c %s /quota-probe 2>/dev/null || echo 0)"',
+        ],
+        Tty: true,
+        HostConfig: {
+          Runtime: this.runtime,
+          AutoRemove: false,
+          StorageOpt: { size: String(imageBytes + probeSize) },
+        },
+        Labels: {
+          'devic-sandbox.managed': 'true',
+          'devic-sandbox.baseline': 'true',
+        },
+      });
+
+      await container.start();
+      await container.wait();
+      const logs = (await container.logs({
+        stdout: true,
+        stderr: false,
+      })) as unknown as Buffer;
+      const written = Number(
+        /wrote:(\d+)/.exec(logs.toString('utf-8'))?.[1] ?? '0',
+      );
+
+      // Enforced means the write was cut short by the quota.
+      this.diskQuotaProbe =
+        written < PROBE_OVERSHOOT_BYTES ? 'enforced' : 'accepted-not-enforced';
+    } catch (err) {
+      this.diskQuotaProbe = isStorageOptUnsupported(err)
+        ? 'unsupported'
+        : 'unknown';
+      if (this.diskQuotaProbe === 'unsupported') {
+        this.noteQuotaUnsupported((err as Error).message);
+      } else {
+        this.logger.warn(
+          `Disk quota probe inconclusive: ${(err as Error).message}`,
+        );
+      }
+    } finally {
+      await container?.remove({ force: true, v: true }).catch(() => undefined);
+    }
+
+    this.logQuotaSupport();
+    return this.diskQuotaProbe!;
+  }
+
+  private logQuotaSupport(): void {
+    switch (this.diskQuotaProbe) {
+      case 'enforced':
+        this.logger.log(
+          `Per-sandbox disk quota enforced by the runtime at ` +
+            `${this.diskQuotaBytes} bytes`,
+        );
+        break;
+      case 'accepted-not-enforced':
+        // The dangerous case: everything looks configured and nothing holds.
+        this.logger.warn(
+          'This daemon accepts a per-container disk quota but does not ' +
+            'enforce it (Docker Desktop behaves this way). Sandboxes can ' +
+            'exceed maxSandboxDiskBytes between samples; only the sampled ' +
+            'cap in SandboxDiskService applies.',
+        );
+        break;
+      case 'unsupported':
+        break; // already reported by noteQuotaUnsupported
+      default:
+        this.logger.warn(
+          'Could not determine whether per-sandbox disk quotas are enforced; ' +
+            'assuming they are not.',
+        );
+    }
+  }
+
+  private async imageSizeBytes(image: string): Promise<number> {
+    try {
+      const info = (await this.docker.getImage(image).inspect()) as {
+        Size?: number;
+      };
+      return info.Size ?? 0;
+    } catch {
+      return 0;
+    }
   }
 
   async listManaged(options?: {

@@ -145,6 +145,12 @@ resourceLimits:
   # Omit both values (or set 0) to disable the accounting entirely.
   warnSandboxDiskBytes: 3221225472   # 3 GiB
   maxSandboxDiskBytes: 8589934592    # 8 GiB
+  # Además del muestreo, pedir al runtime una cuota de kernel del mismo tamaño,
+  # para que el sandbox reciba ENOSPC en vez de pasarse entre dos muestras.
+  # Opt-out: true por defecto. Solo se aplica donde funciona de verdad — el
+  # arranque comprueba si el daemon la respeta y lo dice en el log. overlay2
+  # sobre ext4 la rechaza; Docker Desktop la acepta y la ignora.
+  enforceSandboxDiskQuota: true
 
 # Pre-warmed pool of restored sandboxes, ready to be claimed instantly.
 # The pool reserves a slice of `resourceLimits.maxTotalMemoryMib` proportional

@@ -251,6 +251,19 @@ export interface ResourceLimitsConfig {
    */
   maxSandboxDiskBytes?: number;
   /**
+   * Also hand `maxSandboxDiskBytes` to the runtime as a kernel-enforced quota,
+   * so a sandbox gets ENOSPC instead of overshooting between two samples.
+   * Defaults to true — opt out by setting false.
+   *
+   * Applied only where it actually works. Two hosts refuse it in different
+   * ways: overlay2 on ext4 rejects the option outright, while some daemons
+   * (Docker Desktop's overlayfs among them) accept it and silently ignore it.
+   * The runtime probes for real enforcement at boot and reports which
+   * protection is live; the sampled cap in SandboxDiskService stays on either
+   * way, since a quota only bounds one sandbox at a time.
+   */
+  enforceSandboxDiskQuota?: boolean;
+  /**
    * Disk (bytes) at which a sandbox is flagged as heavy without being touched.
    * Surfaces in the API and the UI so an operator sees the growth coming.
    * 0/undefined disables the warning.
