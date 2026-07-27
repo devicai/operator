@@ -488,7 +488,15 @@ export class DockerRuntimeProvider implements RuntimeProvider {
    * attached. Without this guard a concurrent stop/expiration sweep could
    * reclaim that network mid-creation.
    */
-  private static readonly NETWORK_SWEEP_GRACE_MS = 60_000;
+  private static readonly DEFAULT_NETWORK_SWEEP_GRACE_MS = 60_000;
+
+  /** Overridable from `maintenance.networkSweepGraceMs`. */
+  private get networkSweepGraceMs(): number {
+    return (
+      this.config.maintenance?.networkSweepGraceMs ??
+      DockerRuntimeProvider.DEFAULT_NETWORK_SWEEP_GRACE_MS
+    );
+  }
 
   async listManaged(options?: {
     withSize?: boolean;
@@ -556,7 +564,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
         const createdMs = info.Created
           ? new Date(info.Created).getTime()
           : 0;
-        if (createdMs && Date.now() - createdMs < DockerRuntimeProvider.NETWORK_SWEEP_GRACE_MS) {
+        if (createdMs && Date.now() - createdMs < this.networkSweepGraceMs) {
           continue;
         }
 

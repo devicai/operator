@@ -145,7 +145,6 @@ resourceLimits:
   # Omit both values (or set 0) to disable the accounting entirely.
   warnSandboxDiskBytes: 3221225472   # 3 GiB
   maxSandboxDiskBytes: 8589934592    # 8 GiB
-  sandboxDiskCheckIntervalMs: 60000
 
 # Pre-warmed pool of restored sandboxes, ready to be claimed instantly.
 # The pool reserves a slice of `resourceLimits.maxTotalMemoryMib` proportional
@@ -154,6 +153,26 @@ resourceLimits:
 #
 # All values are persisted in MongoDB on first start and can be edited live
 # from the frontend Settings page (changes take effect on the next reconcile).
+# Cadence of the background jobs that keep the runtime and the database in
+# agreement. Every value is optional — omit the block to use the defaults shown.
+maintenance:
+  # Reconciles the runtime against the database, reclaiming containers whose
+  # sandbox is gone or in a terminal state. Lists the whole daemon, so keep it
+  # well above the TTL sweep (defaults.ttlCheckIntervalMs).
+  containerSweepIntervalMs: 300000   # 5 min
+  # A container younger than this is never reclaimed, so a create still in
+  # flight is safe even before its document exists. Must comfortably exceed the
+  # slowest create on this host.
+  containerSweepGraceMs: 600000      # 10 min
+  # How often per-sandbox disk usage is sampled (see resourceLimits).
+  sandboxDiskCheckIntervalMs: 60000  # 1 min
+  # Shields a just-created per-sandbox network from the network sweeper.
+  # Only relevant when ingress is enabled.
+  networkSweepGraceMs: 60000         # 1 min
+  # Floor applied to every interval above, so a zero or a typo cannot turn a
+  # periodic job into a busy loop against the Docker daemon.
+  minIntervalMs: 5000
+
 hotPool:
   enabled: false
   # Snapshot every hot sandbox is restored from.

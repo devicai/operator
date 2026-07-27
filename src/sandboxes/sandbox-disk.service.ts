@@ -8,9 +8,9 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 
+// Fallbacks for `maintenance.*` when the deployment does not set them.
 const DEFAULT_CHECK_INTERVAL_MS = 60_000;
-/** Floor on the sampling interval — measuring is cheap, but not free. */
-const MIN_CHECK_INTERVAL_MS = 10_000;
+const DEFAULT_MIN_INTERVAL_MS = 5_000;
 
 /**
  * Watches how much disk each sandbox writes and stops the ones that run away.
@@ -47,9 +47,11 @@ export class SandboxDiskService implements OnModuleInit {
       );
       return;
     }
+    // Floored so a zero or a typo in config cannot turn the sampler into a
+    // busy loop against the Docker daemon.
     const interval = Math.max(
-      MIN_CHECK_INTERVAL_MS,
-      this.config.resourceLimits?.sandboxDiskCheckIntervalMs ??
+      this.config.maintenance?.minIntervalMs ?? DEFAULT_MIN_INTERVAL_MS,
+      this.config.maintenance?.sandboxDiskCheckIntervalMs ??
         DEFAULT_CHECK_INTERVAL_MS,
     );
     this.timer = setInterval(() => {

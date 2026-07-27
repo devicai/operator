@@ -187,16 +187,30 @@ resourceLimits:
   # sandboxes, so it is not charged to any of them.
   warnSandboxDiskBytes: 3221225472   # 3 GiB — flagged, not touched
   maxSandboxDiskBytes: 8589934592    # 8 GiB — stopped
-  sandboxDiskCheckIntervalMs: 60000  # sampling interval (min 10000)
 ```
 
 #### Per-sandbox disk
 
 `maxTotalDiskBytes` bounds snapshot storage only. What a sandbox writes while it runs — a `pip install`, a model download, a build cache — lands in the container's writable layer, which nothing measured before: a single sandbox could fill the host and take every other service on it down with it.
 
-Usage is sampled every `sandboxDiskCheckIntervalMs` and recorded on each sandbox as `diskBytes` / `diskCheckedAt`, so growth is visible in the API and the UI before anything is enforced. A sandbox that reaches `maxSandboxDiskBytes` is stopped through the regular stop path — persisted to its snapshot if linked, unpublished from ingress — and marked `stoppedReason: 'disk-limit'`, so the owner finds a stopped sandbox with an explanation rather than a vanished one.
+Usage is sampled every `maintenance.sandboxDiskCheckIntervalMs` and recorded on each sandbox as `diskBytes` / `diskCheckedAt`, so growth is visible in the API and the UI before anything is enforced. A sandbox that reaches `maxSandboxDiskBytes` is stopped through the regular stop path — persisted to its snapshot if linked, unpublished from ingress — and marked `stoppedReason: 'disk-limit'`, so the owner finds a stopped sandbox with an explanation rather than a vanished one.
 
 This is a **reactive** cap, not a kernel quota: a sandbox can overshoot between two samples. A hard cap needs `--storage-opt size=`, which Docker honors only on overlay2 over XFS mounted with `pquota`; on ext4 the daemon rejects it outright. Set both thresholds to `0` (or omit them) to disable the accounting entirely.
+
+#### Background job cadence
+
+Every periodic job reads its interval from config, so a busy host and a laptop can be tuned differently without a rebuild. Omit the block for the defaults shown:
+
+```yaml
+maintenance:
+  containerSweepIntervalMs: 300000   # reconcile runtime <-> database
+  containerSweepGraceMs: 600000      # never reclaim a container younger than this
+  sandboxDiskCheckIntervalMs: 60000  # per-sandbox disk sampling
+  networkSweepGraceMs: 60000         # shields a network mid-create (ingress only)
+  minIntervalMs: 5000                # floor, so a typo cannot busy-loop the daemon
+```
+
+The TTL reaper's own cadence stays where it always was, in `defaults.ttlCheckIntervalMs`.
 
 #### What gets enforced where
 
