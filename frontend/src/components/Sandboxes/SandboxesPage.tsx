@@ -30,7 +30,12 @@ import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
 import UsagePanel from '../Usage/UsagePanel';
 import HotPoolPanel from '../HotPool/HotPoolPanel';
-import { formatDateTime, formatDuration, formatRelative } from '../../utils/date';
+import {
+  formatDateTime,
+  formatDuration,
+  formatRelative,
+  formatSize,
+} from '../../utils/date';
 
 const { Title } = Typography;
 
@@ -166,6 +171,15 @@ const SandboxesPage: React.FC = () => {
                 </Tag>
               </Tooltip>
             )}
+            {row.stoppedReason === 'disk-limit' && (
+              <Tooltip
+                title={`Stopped automatically: wrote ${formatSize(row.diskBytes)}, over the per-sandbox disk cap`}
+              >
+                <Tag color="red" style={{ fontSize: 10, marginLeft: 6 }}>
+                  DISK LIMIT
+                </Tag>
+              </Tooltip>
+            )}
             {row.publicUrl && row.status === 'running' && (
               <Tooltip title={`Public URL → forwards to :${row.exposedHttpPort ?? 80} inside the sandbox`}>
                 <a
@@ -212,6 +226,35 @@ const SandboxesPage: React.FC = () => {
           {row.cpus} vCPU / {row.memoryMib} MiB
         </span>
       ),
+    },
+    {
+      // What the sandbox wrote on top of its image. The image is shared, so
+      // counting it would show every sandbox owning another 1.1 GB of node:24.
+      title: 'Disk',
+      key: 'disk',
+      width: 100,
+      align: 'right',
+      render: (_: any, row) => {
+        if (row.diskBytes === undefined) {
+          return <span style={{ fontSize: 11, opacity: 0.4 }}>-</span>;
+        }
+        const limit = usage?.disk.sandboxLimitBytes ?? null;
+        const ratio = limit ? row.diskBytes / limit : 0;
+        const color =
+          ratio >= 0.9 ? '#ff4d4f' : ratio >= 0.6 ? '#faad14' : undefined;
+        return (
+          <Tooltip
+            title={
+              (limit
+                ? `${((ratio) * 100).toFixed(0)}% of the ${formatSize(limit)} per-sandbox cap`
+                : 'Written on top of the image') +
+              (row.diskCheckedAt ? ` · measured ${formatRelative(row.diskCheckedAt)}` : '')
+            }
+          >
+            <span style={{ fontSize: 11, color }}>{formatSize(row.diskBytes)}</span>
+          </Tooltip>
+        );
+      },
     },
     {
       title: 'RAM share',

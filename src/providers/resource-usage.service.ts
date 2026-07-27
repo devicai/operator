@@ -133,14 +133,30 @@ export class ResourceUsageService {
     }
   }
 
-  async getUsageSummary() {
-    const [memoryMib, diskBytes, hotOverhead] = await Promise.all([
-      this.getTotalMemoryMib(),
-      this.getTotalSnapshotBytes(),
-      this.hotAccountant
-        ? this.hotAccountant.getReservedMemoryOverhead()
-        : Promise.resolve(0),
+  /**
+   * Bytes written by running sandboxes on top of their images, from the last
+   * sampling by SandboxDiskService. Reported separately from snapshot storage:
+   * the two are different budgets and `maxTotalDiskBytes` only bounds the
+   * latter.
+   */
+  async getTotalSandboxDiskBytes(): Promise<number> {
+    const result = await this.sandboxModel.aggregate<{ total: number }>([
+      { $match: { status: SandboxStatus.RUNNING } },
+      { $group: { _id: null, total: { $sum: '$diskBytes' } } },
     ]);
+    return result[0]?.total ?? 0;
+  }
+
+  async getUsageSummary() {
+    const [memoryMib, diskBytes, sandboxDiskBytes, hotOverhead] =
+      await Promise.all([
+        this.getTotalMemoryMib(),
+        this.getTotalSnapshotBytes(),
+        this.getTotalSandboxDiskBytes(),
+        this.hotAccountant
+          ? this.hotAccountant.getReservedMemoryOverhead()
+          : Promise.resolve(0),
+      ]);
     return {
       memory: {
         usedMib: memoryMib,
@@ -150,6 +166,9 @@ export class ResourceUsageService {
       disk: {
         usedBytes: diskBytes,
         limitBytes: this.config.resourceLimits?.maxTotalDiskBytes ?? null,
+        sandboxBytes: sandboxDiskBytes,
+        sandboxLimitBytes:
+          this.config.resourceLimits?.maxSandboxDiskBytes ?? null,
       },
     };
   }

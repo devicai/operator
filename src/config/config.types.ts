@@ -237,6 +237,26 @@ export interface ResourceLimitsConfig {
   maxTotalMemoryMib?: number;
   /** Maximum total disk usage (bytes) for stored snapshots. 0/undefined disables the limit. */
   maxTotalDiskBytes?: number;
+  /**
+   * Maximum disk (bytes) a single sandbox may write before it is stopped.
+   * 0/undefined disables the limit.
+   *
+   * This is a *reactive* cap, not a kernel quota: usage is sampled on an
+   * interval, so a sandbox can overshoot between two samples. A hard cap needs
+   * `--storage-opt size=`, which Docker only honors on overlay2 over XFS
+   * mounted with `pquota` — on ext4 the daemon rejects it outright. Without
+   * this, one runaway sandbox can fill the host and take every other service
+   * down with it.
+   */
+  maxSandboxDiskBytes?: number;
+  /**
+   * Disk (bytes) at which a sandbox is flagged as heavy without being touched.
+   * Surfaces in the API and the UI so an operator sees the growth coming.
+   * 0/undefined disables the warning.
+   */
+  warnSandboxDiskBytes?: number;
+  /** How often per-sandbox disk usage is sampled. Default 60000 (1 min). */
+  sandboxDiskCheckIntervalMs?: number;
 }
 
 /**

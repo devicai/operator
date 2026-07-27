@@ -490,11 +490,14 @@ export class DockerRuntimeProvider implements RuntimeProvider {
    */
   private static readonly NETWORK_SWEEP_GRACE_MS = 60_000;
 
-  async listManaged(): Promise<ManagedSandboxInfo[]> {
+  async listManaged(options?: {
+    withSize?: boolean;
+  }): Promise<ManagedSandboxInfo[]> {
     let containers: Docker.ContainerInfo[];
     try {
       containers = await this.docker.listContainers({
         all: true,
+        size: options?.withSize ?? false,
         filters: JSON.stringify({ label: ['devic-sandbox.managed=true'] }),
       });
     } catch (err) {
@@ -512,6 +515,12 @@ export class DockerRuntimeProvider implements RuntimeProvider {
           (c.Names?.[0] ?? '').replace(/^\//, ''),
         createdAtMs: c.Created ? c.Created * 1000 : 0,
         status: c.State ?? 'unknown',
+        // SizeRw is the writable layer alone — what the sandbox actually
+        // wrote. SizeRootFs would fold in the shared image and read as if
+        // every sandbox owned another 1.1 GB of node:24.
+        ...(options?.withSize
+          ? { sizeRwBytes: (c as any).SizeRw ?? 0 }
+          : {}),
       }))
       // Only real sandboxes. The managed label is also worn by short-lived
       // helpers that go through create() under their own name (snapshot

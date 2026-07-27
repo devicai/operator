@@ -134,6 +134,18 @@ resourceLimits:
   # Sum of sizeBytes for snapshots in 'ready' state.
   # New snapshots are rejected once total disk usage reaches this value.
   maxTotalDiskBytes: 21474836480  # 20 GiB
+  # Per-sandbox disk cap. Counts only the container's writable layer — what the
+  # sandbox itself wrote — not the shared image. A sandbox that reaches
+  # maxSandboxDiskBytes is stopped (persisted to its snapshot first, if linked)
+  # with stoppedReason 'disk-limit'; warnSandboxDiskBytes only flags it.
+  #
+  # This is sampled on an interval, so a sandbox can overshoot between samples.
+  # A kernel-enforced cap requires `--storage-opt size=`, which Docker honors
+  # only on overlay2 over XFS mounted with 'pquota' — on ext4 it is rejected.
+  # Omit both values (or set 0) to disable the accounting entirely.
+  warnSandboxDiskBytes: 3221225472   # 3 GiB
+  maxSandboxDiskBytes: 8589934592    # 8 GiB
+  sandboxDiskCheckIntervalMs: 60000
 
 # Pre-warmed pool of restored sandboxes, ready to be claimed instantly.
 # The pool reserves a slice of `resourceLimits.maxTotalMemoryMib` proportional

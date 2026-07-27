@@ -92,6 +92,32 @@ export class Sandbox {
 
   @ApiProperty({
     description:
+      'Bytes written by this sandbox on top of its image (the container\'s ' +
+      'writable layer), as of the last sampling. The image itself is shared ' +
+      'between sandboxes and is not counted.',
+    required: false,
+  })
+  @Prop()
+  diskBytes?: number;
+
+  @ApiProperty({
+    description: 'When `diskBytes` was last sampled.',
+    required: false,
+  })
+  @Prop()
+  diskCheckedAt?: Date;
+
+  @ApiProperty({
+    description:
+      'Why the sandbox was stopped, when it was not stopped by its owner. ' +
+      "Currently only 'disk-limit'.",
+    required: false,
+  })
+  @Prop()
+  stoppedReason?: string;
+
+  @ApiProperty({
+    description:
       'True once this sandbox has been handed out from the hot pool. Unlike ' +
       '`hotReserved` (which is cleared on claim) this flag is permanent, so a ' +
       'sandbox serving a session can always be told apart from a cold-started ' +

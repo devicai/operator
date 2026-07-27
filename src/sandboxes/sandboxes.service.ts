@@ -580,7 +580,15 @@ export class SandboxesService {
     return normalized;
   }
 
-  async stop(id: string, scope: ExtensionScope): Promise<SandboxDocument> {
+  /**
+   * Stop a running sandbox. `reason` records a stop the owner did not ask for
+   * (currently only the disk cap) so the API and the UI can explain it.
+   */
+  async stop(
+    id: string,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<SandboxDocument> {
     const doc = await this.findById(id, scope);
     if (doc.status !== SandboxStatus.RUNNING) {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
@@ -591,13 +599,13 @@ export class SandboxesService {
     }
 
     try {
-      const containerName = await this.registry.get(doc.sandboxId);
-      if (containerName) {
-        const handle = await this.runtime.get(containerName);
-        if (handle?.status === 'running') {
-          const sandbox = await handle.connect();
-          await sandbox.detach();
-        }
+      // Address the container through the document, not the Redis registry:
+      // the registry key expires with the TTL and a lapsed key would leave the
+      // container running while the document reads as stopped.
+      const handle = await this.runtime.get(doc.name);
+      if (handle?.status === 'running') {
+        const sandbox = await handle.connect();
+        await sandbox.detach();
       }
     } catch (err) {
       this.logger.warn(`Error stopping sandbox ${doc.sandboxId}: ${(err as Error).message}`);
@@ -618,7 +626,10 @@ export class SandboxesService {
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
       {
-        $set: { status: SandboxStatus.STOPPED },
+        $set: {
+          status: SandboxStatus.STOPPED,
+          ...(reason ? { stoppedReason: reason } : {}),
+        },
         $unset: { publicUrl: '', internalEndpoint: '' },
       },
       scope,
