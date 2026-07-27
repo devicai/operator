@@ -20,6 +20,12 @@ export interface SandboxDto {
   recentCommands: string[];
   bindingId?: string;
   hotReserved?: boolean;
+  /** Permanent mark: this sandbox was handed out by the hot pool. */
+  claimedFromHotPool?: boolean;
+  /** When it was claimed — for pooled sandboxes this, not createdAt, is the start. */
+  claimedAt?: string;
+  /** Server-computed sort key: claimedAt ?? createdAt. */
+  activityAt?: string;
   exposedHttpPort?: number;
   subdomain?: string;
   publicUrl?: string;
@@ -252,12 +258,23 @@ export interface HotPoolMetrics {
   lastClaimedAt: string | null;
 }
 
+export interface HotPoolClaimView {
+  sandboxId: string;
+  name: string;
+  status: SandboxStatus;
+  ttlSeconds: number;
+  claimedAt: string | null;
+  expiresAt: string | null;
+  bindingId: string | null;
+}
+
 export interface HotPoolStatus {
   config: HotPoolConfig;
   effective: HotPoolConfig;
   metrics: HotPoolMetrics;
   snapshot: { snapshotId: string; name: string } | null;
   hotSandboxes: HotPoolSandboxView[];
+  recentClaims: HotPoolClaimView[];
   lastReconcileAt: string | null;
   lastError: string | null;
 }

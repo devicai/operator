@@ -61,7 +61,15 @@ api.interceptors.response.use(
 
 // Sandboxes
 export const sandboxesApi = {
-  getAll(params?: { limit?: number; offset?: number; status?: string }): Promise<AxiosResponse<PaginatedResponse<SandboxDto>>> {
+  getAll(params?: {
+    limit?: number;
+    offset?: number;
+    status?: string;
+    snapshotId?: string;
+    fromHotPool?: boolean;
+    hotReserved?: boolean;
+    sortBy?: 'activity' | 'created';
+  }): Promise<AxiosResponse<PaginatedResponse<SandboxDto>>> {
     return api.get('/sandboxes', { params });
   },
   getOne(id: string): Promise<AxiosResponse<SandboxDto>> {

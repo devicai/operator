@@ -54,9 +54,14 @@ export class SandboxesService {
   async create(dto: CreateSandboxDto, scope: ExtensionScope): Promise<SandboxDocument> {
     if (dto.useHotPool && this.hotPool) {
       try {
+        // The pool serves whatever it pre-warmed, so image/cpu/memory of a
+        // profile can't be honored — but its TTL can, and must be: a caller
+        // asking for a profile expects the sandbox to live as long as that
+        // profile says, not as long as the module default.
+        const ttlSeconds = dto.ttlSeconds ?? (await this.resolveProfileTtl(dto.profileId, scope));
         const claimed = await this.hotPool.claim({
           bindingId: dto.bindingId,
-          ttlSeconds: dto.ttlSeconds,
+          ttlSeconds,
         });
         this.logger.log(
           `Sandbox ${claimed.sandboxId} served from hot pool (binding=${dto.bindingId ?? '-'})`,
@@ -223,13 +228,78 @@ export class SandboxesService {
     }
   }
 
+  /**
+   * Align the Redis registry entry with a TTL that changed after the sandbox
+   * was registered (hot pool claim). No-op when the sandbox has no entry.
+   */
+  async syncRegistryTtl(sandboxId: string, ttlSeconds: number): Promise<void> {
+    await this.registry.extendTtl(sandboxId, ttlSeconds);
+  }
+
+  /**
+   * TTL configured on a profile, or undefined when there is no profile (or it
+   * carries no TTL) so the caller can fall back to the module default. A
+   * missing profile is not an error here — the regular create path reports it.
+   */
+  private async resolveProfileTtl(
+    profileId: string | undefined,
+    scope: ExtensionScope,
+  ): Promise<number | undefined> {
+    if (!profileId) return undefined;
+    try {
+      const profile = await this.profileRepo.findById(profileId, scope);
+      return profile?.ttlSeconds;
+    } catch {
+      return undefined;
+    }
+  }
+
   async findAll(
     scope: ExtensionScope,
-    options?: { limit?: number; offset?: number; status?: string },
+    options?: {
+      limit?: number;
+      offset?: number;
+      status?: string;
+      snapshotId?: string;
+      /** Only sandboxes served by the hot pool (true) or never pooled (false). */
+      fromHotPool?: boolean;
+      /** Only pods idle in the pool (true) or everything but them (false). */
+      hotReserved?: boolean;
+      /** `activity` (default) sorts by claim time, falling back to creation. */
+      sortBy?: 'activity' | 'created';
+    },
   ): Promise<PaginatedResponse<SandboxDocument>> {
     const filter: Record<string, any> = {};
     if (options?.status) filter.status = options.status;
-    return this.sandboxRepo.find(filter, scope, options);
+    if (options?.hotReserved !== undefined) {
+      filter.hotReserved = options.hotReserved
+        ? true
+        : { $ne: true };
+    }
+    if (options?.fromHotPool !== undefined) {
+      const claimed = SandboxRepository.CLAIMED_FROM_POOL_FILTER;
+      if (options.fromHotPool) Object.assign(filter, claimed);
+      else filter.$nor = [claimed];
+    }
+    if (options?.snapshotId) {
+      // A sandbox can point at a snapshot in three ways: a live link, a plain
+      // restore, or the pool's source snapshot. Operators filtering by snapshot
+      // mean "came from this snapshot", so match all three.
+      filter.$and = [
+        {
+          $or: [
+            { snapshotId: options.snapshotId },
+            { 'metadata.restoredFrom': options.snapshotId },
+            { 'metadata.hotPoolSnapshotId': options.snapshotId },
+          ],
+        },
+      ];
+    }
+
+    if (options?.sortBy === 'created') {
+      return this.sandboxRepo.find(filter, scope, options);
+    }
+    return this.sandboxRepo.findByActivity(filter, scope, options);
   }
 
   async findById(id: string, scope: ExtensionScope): Promise<SandboxDocument> {

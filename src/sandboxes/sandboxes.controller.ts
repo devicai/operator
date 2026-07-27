@@ -13,7 +13,7 @@ import {
   UseInterceptors,
   UploadedFile,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiConsumes } from '@nestjs/swagger';
+import { ApiTags, ApiOperation, ApiConsumes, ApiQuery } from '@nestjs/swagger';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
 import { tmpdir } from 'os';
@@ -24,23 +24,72 @@ import { RunCommandDto } from './dto/run-command.dto';
 import { WriteFileDto } from './dto/write-file.dto';
 import { uploadLimits } from '../config/upload-limits';
 
+/**
+ * Query strings carry booleans as text; anything but an explicit true/false is
+ * "not filtered" so an absent or malformed flag never narrows the listing.
+ */
+function parseBoolQuery(value?: string): boolean | undefined {
+  if (value === undefined || value === '') return undefined;
+  if (value === 'true' || value === '1') return true;
+  if (value === 'false' || value === '0') return false;
+  return undefined;
+}
+
 @ApiTags('Sandboxes')
 @Controller('sandboxes')
 export class SandboxesController {
   constructor(private readonly service: SandboxesService) {}
 
   @Get()
-  @ApiOperation({ summary: 'List sandboxes' })
+  @ApiOperation({
+    summary: 'List sandboxes',
+    description:
+      'Sorted by activity (hot-pool claim time, falling back to creation) so a ' +
+      'sandbox that just started serving a session leads the list even though ' +
+      'its pod was pre-warmed earlier. Pass sortBy=created for raw creation ' +
+      'order. Filter by status, source snapshot, and hot-pool origin.',
+  })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'offset', required: false, type: Number })
+  @ApiQuery({ name: 'status', required: false })
+  @ApiQuery({
+    name: 'snapshotId',
+    required: false,
+    description:
+      'Sandboxes originating from this snapshot: linked, plainly restored, or ' +
+      'pre-warmed by the hot pool.',
+  })
+  @ApiQuery({
+    name: 'fromHotPool',
+    required: false,
+    type: Boolean,
+    description: 'true → only sandboxes claimed from the hot pool.',
+  })
+  @ApiQuery({
+    name: 'hotReserved',
+    required: false,
+    type: Boolean,
+    description: 'true → only pods still idle in the pool.',
+  })
+  @ApiQuery({ name: 'sortBy', required: false, enum: ['activity', 'created'] })
   findAll(
     @Req() req: any,
     @Query('limit') limit?: number,
     @Query('offset') offset?: number,
     @Query('status') status?: string,
+    @Query('snapshotId') snapshotId?: string,
+    @Query('fromHotPool') fromHotPool?: string,
+    @Query('hotReserved') hotReserved?: string,
+    @Query('sortBy') sortBy?: 'activity' | 'created',
   ) {
     return this.service.findAll(req.extensionScope ?? {}, {
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
       status,
+      snapshotId,
+      fromHotPool: parseBoolQuery(fromHotPool),
+      hotReserved: parseBoolQuery(hotReserved),
+      sortBy: sortBy === 'created' ? 'created' : 'activity',
     });
   }
 
