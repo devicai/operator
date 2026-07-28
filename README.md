@@ -283,6 +283,47 @@ The restore endpoint accepts a `linked` flag:
 - **`linked: true`** (default) — Sandbox stays linked to the snapshot. On stop or TTL expiry, changes are automatically persisted back to the snapshot.
 - **`linked: false`** — Fully independent sandbox (fork). The snapshot remains unchanged regardless of what happens in the sandbox.
 
+#### Snapshot Image Cache
+
+Restoring from a tarball costs time proportional to snapshot size, because the
+archive is pushed into the new container and extracted there — single-threaded
+gzip inside the sandbox's own CPU quota. Measured against a live instance:
+
+| Snapshot | From tarball | From image |
+|---|---|---|
+| 0 MB | 3.0 s | ~2 s |
+| 199.8 MB | 15–28 s | ~2 s |
+| 760.9 MB | 65.1 s | ~2 s |
+
+Enabling `snapshots.imageCache` pre-materializes each snapshot as a container
+image, so a restore is a plain container create and no longer scales with size.
+
+**The tarball remains the artifact of record.** Export, import and backups read
+it, and the image is rebuilt from it after every capture. Deleting every cached
+image costs start time and nothing else — restores fall back to the tarball,
+which is the behaviour with the cache off.
+
+Three properties are worth knowing before enabling it:
+
+- **Disk.** An image stores its content uncompressed (that is why it starts
+  instantly). Only the delta over the base image is charged to the cache, since
+  the base is shared by every sandbox on the host regardless. Set
+  `maxTotalBytes`; the least recently restored images are evicted to stay under
+  it, and an image backing a live sandbox is never evicted.
+- **Capture cost.** Each capture writes the tarball and then, in the
+  background, rebuilds the image (~23 s for a 200 MB snapshot). Nothing waits
+  on it: the snapshot is `ready` as soon as the tarball is.
+- **Layer depth.** The image is always rebuilt from the ORIGINAL base image, so
+  its depth is pinned at base+1 no matter how many times a linked snapshot is
+  persisted. This is not an optimization but a correctness requirement: under
+  `sysbox-runc` an image of 71 layers fails to start with an opaque OCI error
+  while 70 starts fine (measured; the same images run under `runc`), and the
+  failure surfaces only at the next restore.
+
+A sandbox restored from a cached image records its base image in a container
+label, so its own snapshots stay diffs against that base rather than against
+the snapshot image it happened to boot from.
+
 ### Sandbox Profiles
 
 | Method | Endpoint | Description |

@@ -21,6 +21,8 @@ import {
   parseManifest,
 } from './sysbox-diff.util';
 import {
+  CachedImageInfo,
+  CommittedImageInfo,
   ExecResult,
   ExecStream,
   ExecStreamEvent,
@@ -58,6 +60,43 @@ const isolatedNetworkName = (sandboxName: string): string =>
  */
 const SANDBOX_CONTAINER_PREFIX = 'sandbox-';
 
+/**
+ * Container label naming the image `diff()` must compare against, when that is
+ * not the image the container was created from. See RuntimeSandboxConfig.
+ */
+const BASELINE_IMAGE_LABEL = 'devic-sandbox.diff-baseline';
+
+/** Marks images produced by the snapshot image cache, so eviction can find them. */
+const SNAPSHOT_IMAGE_LABEL = 'devic-sandbox.snapshot';
+
+/**
+ * Hard ceiling on layers in a snapshot image.
+ *
+ * Measured on this stack, not taken from Docker's documented 127: under
+ * sysbox-runc a container whose image has 71 layers fails to start with an
+ * opaque `OCI runtime create failed` while 70 starts fine, and the same images
+ * run happily under runc — sysbox's own overlay for id-shifting eats the
+ * budget. The failure is silent (the commit succeeds, only the next start
+ * breaks), so a committed image at or above this is rejected rather than
+ * published. Snapshot images are rebuilt from the base image on every capture,
+ * so in practice depth stays at base+1 and this is a backstop, not a limit
+ * anyone should reach.
+ */
+const MAX_IMAGE_LAYERS = 70;
+
+/**
+ * Split `repo:tag` without tripping over a registry host that carries a port
+ * (`registry.example.com:5000/devic-snapshot:abc`) — the tag is what follows
+ * the LAST colon, and only when no `/` comes after it.
+ */
+function splitImageRef(ref: string): { repo: string; tag: string } {
+  const colon = ref.lastIndexOf(':');
+  if (colon === -1 || ref.indexOf('/', colon) !== -1) {
+    return { repo: ref, tag: 'latest' };
+  }
+  return { repo: ref.slice(0, colon), tag: ref.slice(colon + 1) };
+}
+
 @Injectable()
 export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly logger = new Logger(DockerRuntimeProvider.name);
@@ -66,6 +105,8 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   private readonly defaultNetwork: string;
   private readonly hardening: Required<DockerHardeningConfig>;
   private readonly imagesPolicy: { allowlist: string[]; maxSizeBytes: number };
+  /** Repository holding module-built snapshot images; see ensureImage. */
+  private readonly snapshotRepository: string;
   private readonly allowHostPortPublishing: boolean;
   /** Per-command shell timeout (ms) handed to each sandbox's persistent shell. */
   private readonly commandTimeoutMs: number;
@@ -113,6 +154,8 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       allowlist: docker?.images?.allowlist ?? [],
       maxSizeBytes: docker?.images?.maxSizeBytes ?? 0,
     };
+    this.snapshotRepository =
+      config.snapshots?.imageCache?.repository?.trim() || 'devic-snapshot';
     this.allowHostPortPublishing = docker?.allowHostPortPublishing ?? false;
     this.commandTimeoutMs = config.defaults?.commandTimeoutMs ?? 300000;
     this.seccompOpt = this.resolveSeccompOpt(this.hardening.seccompProfile);
@@ -250,6 +293,9 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       Labels: {
         'devic-sandbox.managed': 'true',
         'devic-sandbox.name': cfg.name,
+        ...(cfg.baselineImage
+          ? { [BASELINE_IMAGE_LABEL]: cfg.baselineImage }
+          : {}),
       },
     });
 
@@ -538,6 +584,154 @@ export class DockerRuntimeProvider implements RuntimeProvider {
       .filter((c) => c.name.startsWith(SANDBOX_CONTAINER_PREFIX));
   }
 
+  // ---------------------------------------------------------------------------
+  // Snapshot image cache
+  // ---------------------------------------------------------------------------
+
+  async commitImage(
+    containerName: string,
+    ref: string,
+    labels?: Record<string, string>,
+  ): Promise<CommittedImageInfo> {
+    const { repo, tag } = splitImageRef(ref);
+    const container = this.docker.getContainer(containerName);
+
+    await container.commit({
+      repo,
+      tag,
+      // Carry the label set through to the image so eviction can enumerate
+      // snapshot images without consulting the database.
+      changes: Object.entries(labels ?? {})
+        .map(([k, v]) => `LABEL ${k}=${v}`)
+        .join('\n') || undefined,
+    } as any);
+
+    const info = await this.docker.getImage(ref).inspect();
+    const layers = info.RootFS?.Layers?.length ?? 0;
+
+    if (layers >= MAX_IMAGE_LAYERS) {
+      // Publishing this would hand out an image that commits fine and then
+      // refuses to start. Drop it and let the caller fall back to the tarball.
+      await this.docker
+        .getImage(ref)
+        .remove({ force: true })
+        .catch(() => undefined);
+      throw new Error(
+        `Committed image ${ref} has ${layers} layers, at or over the ${MAX_IMAGE_LAYERS} ` +
+          'this runtime can start; discarded',
+      );
+    }
+
+    return {
+      ref,
+      uniqueSizeBytes: await this.uniqueImageSize(ref),
+      layers,
+    };
+  }
+
+  /** True for a reference in the repository this module commits snapshots to. */
+  private isSnapshotImage(ref: string): boolean {
+    return splitImageRef(ref).repo === this.snapshotRepository;
+  }
+
+  async imageExists(ref: string): Promise<boolean> {
+    try {
+      await this.docker.getImage(ref).inspect();
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async removeImage(ref: string): Promise<boolean> {
+    try {
+      await this.docker.getImage(ref).remove({});
+      return true;
+    } catch (err: any) {
+      if (err?.statusCode === 404) return true;
+      // 409: a container still references it. Expected while a sandbox
+      // restored from this image is alive — the caller retries later.
+      this.logger.debug(
+        `removeImage ${ref} skipped: ${(err as Error).message}`,
+      );
+      return false;
+    }
+  }
+
+  async listSnapshotImages(repository: string): Promise<CachedImageInfo[]> {
+    let images: Docker.ImageInfo[];
+    try {
+      images = await this.docker.listImages({
+        filters: JSON.stringify({ label: [`${SNAPSHOT_IMAGE_LABEL}`] }),
+      });
+    } catch (err) {
+      this.logger.warn(`listSnapshotImages failed: ${(err as Error).message}`);
+      return [];
+    }
+
+    // A container holding an image blocks its removal, so eviction needs to
+    // know up front rather than discovering it through a failed delete.
+    const inUse = new Set<string>();
+    try {
+      const containers = await this.docker.listContainers({ all: true });
+      for (const c of containers) if (c.ImageID) inUse.add(c.ImageID);
+    } catch {
+      // Unknown: treat everything as free and let removeImage decide.
+    }
+
+    const out: CachedImageInfo[] = [];
+    for (const img of images) {
+      for (const ref of img.RepoTags ?? []) {
+        const { repo, tag } = splitImageRef(ref);
+        if (repo !== repository) continue;
+        out.push({
+          ref,
+          tag,
+          uniqueSizeBytes: await this.uniqueImageSize(ref),
+          createdAtMs: img.Created ? img.Created * 1000 : 0,
+          inUse: inUse.has(img.Id),
+        });
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Bytes this image adds on top of the image it was committed from.
+   *
+   * Charging the full rootfs would be wrong by an order of magnitude — a
+   * snapshot of node:24 inspects as 425 MB here, of which 399 MB is the base
+   * every sandbox on the host already pays for regardless of this cache.
+   *
+   * Computed from the parent chain rather than the daemon's own shared/unique
+   * split, because that split cannot be trusted across daemons: for an image
+   * whose real delta over its base was 26.2 MB (verified against the tarball
+   * that produced it), `/system/df` reported Size 1666101620 and SharedSize
+   * 1214038016 — a "unique" 452 MB, seventeen times the truth, and larger than
+   * the whole image inspects as. Subtracting the parent's size gave exactly
+   * 26217518. A commit always has a parent, so this is the accurate path for
+   * every image this cache creates.
+   */
+  private async uniqueImageSize(ref: string): Promise<number> {
+    try {
+      const info = (await this.docker.getImage(ref).inspect()) as {
+        Size?: number;
+        Parent?: string;
+      };
+      const total = info.Size ?? 0;
+      if (!info.Parent) return total;
+      const parent = (await this.docker.getImage(info.Parent).inspect()) as {
+        Size?: number;
+      };
+      return Math.max(0, total - (parent.Size ?? 0));
+    } catch (err) {
+      this.logger.debug(
+        `could not size image ${ref}: ${(err as Error).message}`,
+      );
+      return 0;
+    }
+  }
+
   async sweepOrphanedNetworks(): Promise<number> {
     if (!this.ingressEnabled) return 0;
 
@@ -644,6 +838,20 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   }
 
   private async ensureImage(image: string): Promise<void> {
+    // Snapshot images are built by this module, never named by a caller: the
+    // repository is fixed in config and only commitImage() writes to it. Their
+    // BASE image already passed this check when the snapshot was created, so
+    // re-checking would only ask the allowlist about a name it cannot know —
+    // rejecting every restore from the image cache. They are also local by
+    // construction, so the pull below must not be attempted either.
+    //
+    // The size cap is skipped for the same reason: it exists to stop a tenant
+    // pulling an enormous image from a registry, whereas a snapshot image is
+    // just its base plus content that tenant already wrote — content the
+    // per-sandbox disk cap governs. Enforcing it here would only make restores
+    // from the cache fail while the identical tarball restore succeeded.
+    if (this.isSnapshotImage(image)) return;
+
     // Admission backstop: every create/restore/hot-pool path funnels through
     // here, so an unlisted image is rejected before it is ever pulled or run.
     if (!isImageAllowed(image, this.imagesPolicy.allowlist)) {
@@ -859,6 +1067,19 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async diff(): Promise<FsChange[]> {
+    // A sandbox restored from a snapshot's derived image was created from
+    // `devic-snapshot:<id>`, but its tarball must remain a diff against the
+    // ORIGINAL base image. `docker diff` can only compare against the image the
+    // container was created from, so whenever a baseline is declared we must go
+    // through the manifest walk — under every runtime, not just sysbox.
+    // Skipping this would produce a tarball holding only the changes made since
+    // the restore; replaying it onto the base image would silently drop
+    // everything the snapshot already contained.
+    const baseline = await this.declaredBaselineImage();
+    if (baseline) {
+      return this.diffViaBaseManifest(baseline);
+    }
+
     // Under sysbox-runc, `docker diff` is blind to changes in sysbox's
     // internally-mounted system dirs (/usr, /etc, /lib, /var) — it would report
     // only /root, /home and the workdir, silently dropping installed packages
@@ -898,9 +1119,27 @@ class DockerSandbox implements RuntimeSandbox {
    * fresh container of the same base image. The difference is exactly the user's
    * changes — sysbox's deterministic file injection cancels out.
    */
-  private async diffViaBaseManifest(): Promise<FsChange[]> {
-    const info = await this.container.inspect();
-    const image = info.Config?.Image || info.Image;
+  /**
+   * Image this container's diffs must be computed against, when it differs
+   * from the image it was created from. Read from the label written at create
+   * time so it survives a process restart — the capture that needs it can
+   * happen days after the create that set it.
+   */
+  private async declaredBaselineImage(): Promise<string | null> {
+    try {
+      const info = await this.container.inspect();
+      return info.Config?.Labels?.[BASELINE_IMAGE_LABEL] || null;
+    } catch {
+      return null;
+    }
+  }
+
+  private async diffViaBaseManifest(baselineImage?: string): Promise<FsChange[]> {
+    let image = baselineImage;
+    if (!image) {
+      const info = await this.container.inspect();
+      image = info.Config?.Image || info.Image;
+    }
     if (!image) throw new Error('could not resolve base image for diff');
     const base = await this.ctx.getBaseManifest(image);
     const out = await this.exec(buildManifestFindCommand());

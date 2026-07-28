@@ -231,6 +231,44 @@ export interface SnapshotsConfig {
    * to exclude from full snapshots, merged on top of the `cleanup` preset.
    */
   excludePaths?: string[];
+  /** Derived per-snapshot images that make restores O(1) instead of O(size). */
+  imageCache?: SnapshotImageCacheConfig;
+}
+
+/**
+ * Pre-materializes each snapshot as a container image so restoring is just
+ * "create a container" — measured ~2s flat, against 15-65s for replaying the
+ * tarball, which scales with snapshot size.
+ *
+ * The image is strictly a cache. The tarball remains the artifact of record:
+ * it is what export/import read, what backups copy, and what the image is
+ * rebuilt from. Losing every image costs speed and nothing else.
+ *
+ * Disabled by default — it trades disk for start time, and that is the
+ * operator's call. An image holds its content UNCOMPRESSED (that is why it
+ * starts instantly), so it occupies noticeably more than the tarball it came
+ * from: measured 532 MB against a 200 MB tar.gz.
+ */
+export interface SnapshotImageCacheConfig {
+  /** Master switch. Default: false. */
+  enabled?: boolean;
+  /**
+   * Repository name for derived images; the snapshot id becomes the tag.
+   * Default: 'devic-snapshot'.
+   */
+  repository?: string;
+  /**
+   * Cap on the total unique bytes held by cached images. When exceeded, the
+   * least recently restored images are dropped until it fits. 0/undefined
+   * means no cap — which on a shared host means the cache grows until the
+   * disk is full, so set it.
+   */
+  maxTotalBytes?: number;
+  /**
+   * Give up on a build that exceeds this. A build is background work, but an
+   * unbounded one would pin a throwaway container forever. Default: 600000.
+   */
+  buildTimeoutMs?: number;
 }
 
 export interface ResourceLimitsConfig {

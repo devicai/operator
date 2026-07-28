@@ -94,6 +94,68 @@ export class Snapshot {
   @ApiProperty()
   @Prop({ type: Object, default: {} })
   metadata: Record<string, any>;
+
+  // ---------------------------------------------------------------------------
+  // Image cache
+  //
+  // A snapshot's tarball is its artifact of record. These fields describe an
+  // OPTIONAL derived copy of the same content, pre-materialized as a container
+  // image so a restore is just "create a container" instead of "create a
+  // container and replay a tarball into it" (~2s flat vs 15-65s scaling with
+  // size). Every field here is disposable: delete the image and the next
+  // restore falls back to the tarball, which is exactly today's behaviour.
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Bumped on every capture (create and each persist). The image records which
+   * version it was built from, so a build that finishes after a newer capture
+   * landed is discarded instead of publishing stale content.
+   */
+  @ApiProperty({
+    description: 'Monotonic counter incremented on every capture of this snapshot.',
+  })
+  @Prop({ default: 0 })
+  persistVersion: number;
+
+  @ApiProperty({
+    description:
+      "State of the derived image: 'none' (never built), 'building', " +
+      "'ready' (usable for restore), 'failed' (build errored; restores use the " +
+      'tarball). Absent on documents that predate the image cache.',
+    required: false,
+  })
+  @Prop({ index: true })
+  imageState?: string;
+
+  @ApiProperty({
+    description: 'Image reference holding this snapshot, e.g. devic-snapshot:abc123.',
+    required: false,
+  })
+  @Prop()
+  imageRef?: string;
+
+  /** `persistVersion` the current image was built from. */
+  @ApiProperty({ required: false })
+  @Prop()
+  imageSourceVersion?: number;
+
+  @ApiProperty({ required: false })
+  @Prop()
+  imageBuiltAt?: Date;
+
+  /**
+   * Bytes the image adds on top of layers it shares with its base. Drives the
+   * cache cap and eviction; the shared base is not attributed here because it
+   * is paid once for every sandbox on the host, image cache or not.
+   */
+  @ApiProperty({ required: false })
+  @Prop({ default: 0 })
+  imageSizeBytes?: number;
+
+  /** Last time a restore was served from the image. Drives LRU eviction. */
+  @ApiProperty({ required: false })
+  @Prop({ index: true })
+  imageLastUsedAt?: Date;
 }
 
 export type SnapshotDocument = Snapshot & Document;

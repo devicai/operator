@@ -18,6 +18,21 @@ export interface RuntimeSandboxConfig {
   /** hostPort -> guestPort */
   ports?: Record<string, number>;
   networkPolicy?: 'allow-all' | 'deny-all';
+  /**
+   * Image that `diff()` must treat as the starting point, when that is NOT the
+   * image the container was created from.
+   *
+   * Only set when restoring from a snapshot's derived image. There, `image` is
+   * `devic-snapshot:<id>` (base + snapshot content) while the snapshot's
+   * tarball is, and must stay, a diff against the ORIGINAL base image. Without
+   * this the next capture would diff against the snapshot image, produce a
+   * tarball holding only what changed since, and restoring that tarball onto
+   * the base image would silently drop everything the snapshot already had.
+   *
+   * Persisted as a container label so it survives a process restart — the
+   * capture that needs it may happen days after the create that set it.
+   */
+  baselineImage?: string;
 }
 
 export interface ExecResult {
@@ -264,6 +279,50 @@ export interface RuntimeProvider {
      */
     withSize?: boolean;
   }): Promise<ManagedSandboxInfo[]>;
+
+  // ---------------------------------------------------------------------------
+  // Snapshot image cache (all optional — a runtime without them simply has no
+  // image cache and every restore replays the tarball, as it always did).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seal a container's current filesystem as an image tagged `ref`.
+   *
+   * Note this captures MORE than `diff()` reports: under sysbox-runc a commit
+   * takes the whole writable layer, including the internally-mounted /usr,
+   * /etc and /var that `docker diff` cannot see. Callers must therefore commit
+   * only containers whose content they fully intend to publish.
+   */
+  commitImage?(
+    containerName: string,
+    ref: string,
+    labels?: Record<string, string>,
+  ): Promise<CommittedImageInfo>;
+
+  imageExists?(ref: string): Promise<boolean>;
+
+  /** Remove an image. Idempotent; resolves false when it was in use. */
+  removeImage?(ref: string): Promise<boolean>;
+
+  /** Every cached snapshot image, for accounting and eviction. */
+  listSnapshotImages?(repository: string): Promise<CachedImageInfo[]>;
+}
+
+export interface CommittedImageInfo {
+  ref: string;
+  /** Bytes not shared with any other image, i.e. what this image really costs. */
+  uniqueSizeBytes: number;
+  /** Total layers. Bounded by the runtime — see DockerRuntimeProvider.MAX_LAYERS. */
+  layers: number;
+}
+
+export interface CachedImageInfo {
+  ref: string;
+  tag: string;
+  uniqueSizeBytes: number;
+  createdAtMs: number;
+  /** True when a container still references it, which blocks removal. */
+  inUse: boolean;
 }
 
 export interface ManagedSandboxInfo {

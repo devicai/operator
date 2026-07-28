@@ -4,6 +4,7 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  OnModuleInit,
   Optional,
 } from '@nestjs/common';
 import { nanoid } from 'nanoid';
@@ -46,6 +47,7 @@ import {
   isSafeDeletePath,
   sh,
 } from './snapshot-fs.util';
+import { SnapshotImageService } from './snapshot-image.service';
 
 const SNAPSHOTS_DIR = join(homedir(), '.devic-sandbox', 'snapshots');
 
@@ -63,7 +65,7 @@ const MAX_PERSISTED_DELETES = 20000;
 type Codec = 'zstd' | 'gzip';
 
 @Injectable()
-export class SnapshotsService {
+export class SnapshotsService implements OnModuleInit {
   private readonly logger = new Logger(SnapshotsService.name);
 
   constructor(
@@ -73,10 +75,61 @@ export class SnapshotsService {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly resourceUsage: ResourceUsageService,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+    private readonly imageService: SnapshotImageService,
     @Optional() private readonly ingressService?: IngressService,
   ) {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
+    }
+  }
+
+  onModuleInit(): void {
+    // The image cache materializes a snapshot by replaying its tarball into a
+    // throwaway container. Hand it THIS service's extraction routine rather
+    // than letting it grow its own: the image must contain exactly what a
+    // tarball restore would produce, and the only way to guarantee that is to
+    // run the same code.
+    this.imageService.registerTarballApplier((containerName, snapshot) =>
+      this.applyTarballTo(containerName, snapshot),
+    );
+  }
+
+  /**
+   * Replay a snapshot's tarball into an already-running container. Shared by
+   * the tarball restore path and by the image cache's build.
+   */
+  private async applyTarballTo(
+    containerName: string,
+    snapshot: SnapshotDocument,
+  ): Promise<void> {
+    const onDiskPath = this.resolveSnapshotPath(snapshot.snapshotPath);
+    if (!existsSync(onDiskPath)) {
+      throw new BadRequestException('Snapshot file not found on disk');
+    }
+    const handle = await this.runtime.get(containerName);
+    if (!handle) {
+      throw new Error(`container ${containerName} is not reachable`);
+    }
+    const sandbox = await handle.connect();
+    const scope: SnapshotScope = (snapshot.scope as SnapshotScope) ?? 'workdir';
+    const codec: Codec = (snapshot.compression as Codec) ?? 'gzip';
+
+    if (scope === 'full') {
+      await this.restoreFull(
+        sandbox,
+        snapshot.workdir,
+        containerName,
+        onDiskPath,
+        codec,
+        (snapshot.metadata?.deletes as string[]) ?? [],
+      );
+    } else {
+      await this.restoreWorkdir(
+        sandbox,
+        snapshot.workdir,
+        containerName,
+        onDiskPath,
+      );
     }
   }
 
@@ -235,6 +288,8 @@ export class SnapshotsService {
                 }
               : {}),
           },
+          // Every capture invalidates whatever image exists for this snapshot.
+          $inc: { persistVersion: 1 },
         },
         scope,
       );
@@ -242,6 +297,11 @@ export class SnapshotsService {
       this.logger.log(
         `Snapshot ${snapshotId} (${captureScope}/${codec}) created (${(sizeBytes / 1024).toFixed(1)} KB)`,
       );
+
+      // Background: the tarball above is the artifact of record and the
+      // snapshot is already usable. The image only makes the next restore
+      // faster, so nobody waits for it.
+      this.imageService.scheduleBuild(updated!);
 
       return updated!;
     } catch (err) {
@@ -393,45 +453,67 @@ export class SnapshotsService {
       scope,
     );
 
+    // Serve from the pre-built image when one matches this exact snapshot
+    // version, which turns the restore into a plain container create. Checked
+    // per restore rather than cached: the image may have been evicted to keep
+    // the cache under its cap, or pruned out of band.
+    const fromImage = await this.imageService.isUsable(snapshot);
+
     try {
       const sandbox = await this.runtime.create({
         name: containerName,
-        image: snapshot.image,
+        image: fromImage ? snapshot.imageRef! : snapshot.image,
         workdir: snapshot.workdir,
         cpus: dto.cpus ?? snapshot.cpus,
         memoryMib: dto.memoryMib ?? snapshot.memoryMib,
         env: snapshot.envVars ?? {},
         ports,
         networkPolicy: 'allow-all',
+        // The container now starts from base+content, but this sandbox's own
+        // snapshots must still be diffs against the base alone. Without this
+        // the next capture would record only what changed after the restore,
+        // and replaying that tarball onto the base image would silently lose
+        // everything the snapshot already held.
+        ...(fromImage ? { baselineImage: snapshot.image } : {}),
       });
       await this.registry.register(sandboxId, containerName, ttlSeconds);
 
-      if (restoreScope === 'full') {
-        await this.restoreFull(
-          sandbox,
-          snapshot.workdir,
-          sandboxId,
-          onDiskPath,
-          codec,
-          (snapshot.metadata?.deletes as string[]) ?? [],
-        );
+      if (!fromImage) {
+        if (restoreScope === 'full') {
+          await this.restoreFull(
+            sandbox,
+            snapshot.workdir,
+            sandboxId,
+            onDiskPath,
+            codec,
+            (snapshot.metadata?.deletes as string[]) ?? [],
+          );
+        } else {
+          await this.restoreWorkdir(
+            sandbox,
+            snapshot.workdir,
+            sandboxId,
+            onDiskPath,
+          );
+        }
       } else {
-        await this.restoreWorkdir(
-          sandbox,
-          snapshot.workdir,
-          sandboxId,
-          onDiskPath,
-        );
+        await this.imageService.markUsed(snapshot);
       }
 
       await this.sandboxRepo.updateById(
         (sandboxDoc as any)._id.toString(),
-        { $set: { status: SandboxStatus.RUNNING } },
+        {
+          $set: {
+            status: SandboxStatus.RUNNING,
+            'metadata.restoredFromImage': fromImage,
+          },
+        },
         scope,
       );
 
       this.logger.log(
-        `Sandbox ${sandboxId} restored from ${restoreScope} snapshot ${snapshotId}`,
+        `Sandbox ${sandboxId} restored from ${restoreScope} snapshot ${snapshotId}` +
+          (fromImage ? ' (image)' : ' (tarball)'),
       );
 
       const updated = await this.sandboxRepo.findById(
@@ -529,6 +611,15 @@ export class SnapshotsService {
 
   async destroy(id: string, scope: ExtensionScope): Promise<void> {
     const doc = await this.findById(id, scope);
+
+    // Best-effort: a sandbox restored from this image still holds it and the
+    // daemon will refuse. The cache sweep reclaims it once that sandbox is
+    // gone, so a failure here leaks nothing permanently.
+    await this.imageService.discard(doc).catch((err) =>
+      this.logger.warn(
+        `Could not drop image for snapshot ${doc.snapshotId}: ${(err as Error).message}`,
+      ),
+    );
 
     const onDiskPath = this.resolveSnapshotPath(doc.snapshotPath);
     try {
@@ -772,7 +863,7 @@ export class SnapshotsService {
         sizeBytes = statSync(targetPath).size;
       } catch {}
 
-      await this.snapshotRepo.updateById(
+      const persisted = await this.snapshotRepo.updateById(
         (snapshotDoc as any)._id.toString(),
         {
           $set: {
@@ -788,6 +879,11 @@ export class SnapshotsService {
                 }
               : {}),
           },
+          // The tarball just changed, so any existing image is now stale.
+          // Bumping first means a restore landing between here and the rebuild
+          // sees a version mismatch and falls back to the tarball rather than
+          // serving the previous contents.
+          $inc: { persistVersion: 1 },
         },
         {},
       );
@@ -795,6 +891,8 @@ export class SnapshotsService {
       this.logger.log(
         `Snapshot ${snapshotDoc.snapshotId} updated from sandbox ${sandboxDoc.sandboxId} (${(sizeBytes / 1024).toFixed(1)} KB)`,
       );
+
+      if (persisted) this.imageService.scheduleBuild(persisted);
     } catch (err) {
       this.logger.error(
         `Failed to persist snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
