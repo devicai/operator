@@ -66,6 +66,17 @@ export class Sandbox {
   @Prop({ index: true })
   expiresAt: Date;
 
+  @ApiProperty({
+    description:
+      'Keep the session alive while it is being used: any command, file read/' +
+      'write, upload or download landing in the last ' +
+      '`defaults.autoExtendWindowSeconds` before `expiresAt` pushes the expiry ' +
+      'forward by another `ttlSeconds`. Still bounded by ' +
+      '`defaults.maxTtlSeconds`, so an active sandbox does not live forever.',
+  })
+  @Prop({ default: false })
+  autoExtend: boolean;
+
   @ApiProperty()
   @Prop()
   snapshotId: string;

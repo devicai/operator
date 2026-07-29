@@ -5,6 +5,7 @@ import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { WsAdapter } from '@nestjs/platform-ws';
 import { AppModule } from './app.module';
 import { loadConfig } from './config/config.loader';
+import { ClientErrorLoggingFilter } from './filters/client-error-logging.filter';
 
 /** Nest's log levels, least to most severe. */
 const LOG_LEVELS: LogLevel[] = ['verbose', 'debug', 'log', 'warn', 'error', 'fatal'];
@@ -50,6 +51,11 @@ async function bootstrap() {
       transform: true,
     }),
   );
+
+  // Registered after the pipe so the rejections it raises are logged too: a
+  // request refused for a bad body is exactly the kind of failure that used to
+  // vanish without a line.
+  app.useGlobalFilters(new ClientErrorLoggingFilter(app.getHttpAdapter()));
 
   // CORS
   if (config.server.cors?.enabled) {

@@ -1,4 +1,4 @@
-import { Form, Input, InputNumber, Modal, Select, message, Divider, Typography } from 'antd';
+import { Checkbox, Form, Input, InputNumber, Modal, Select, message, Divider, Typography } from 'antd';
 import { useCreateSandbox } from '../../hooks/useSandboxes';
 import { useRestoreSnapshot } from '../../hooks/useSnapshots';
 import { useSandboxProfiles } from '../../hooks/useSandboxProfiles';
@@ -34,6 +34,7 @@ const CreateSandboxModal: React.FC<Props> = ({ open, onCancel }) => {
             ttlSeconds: rest.ttlSeconds,
             cpus: rest.cpus,
             memoryMib: rest.memoryMib,
+            autoExtend: rest.autoExtend,
           },
         });
         message.success('Sandbox created from snapshot');
@@ -120,6 +121,13 @@ const CreateSandboxModal: React.FC<Props> = ({ open, onCancel }) => {
             <InputNumber min={60} max={7200} placeholder="1800" style={{ width: '100%' }} />
           </Form.Item>
         </div>
+        <Form.Item name="autoExtend" valuePropName="checked" style={{ marginBottom: 0 }}>
+          <Checkbox>Auto-extend while in use</Checkbox>
+        </Form.Item>
+        <Text type="secondary" style={{ display: 'block', fontSize: 11 }}>
+          A command or file operation in the last 30s before expiry renews the sandbox
+          for another TTL, up to the configured maximum. An idle sandbox still expires.
+        </Text>
       </Form>
     </Modal>
   );

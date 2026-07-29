@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsInt, IsOptional, IsString, Min } from 'class-validator';
+import { IsBoolean, IsInt, IsOptional, IsString, Min } from 'class-validator';
 
 export class ClaimHotDto {
   @ApiPropertyOptional({
@@ -16,4 +16,14 @@ export class ClaimHotDto {
   @IsInt()
   @Min(60)
   ttlSeconds?: number;
+
+  @ApiPropertyOptional({
+    description:
+      'Renew the claimed sandbox while it is in use. Mirrors `autoExtend` on ' +
+      '/sandboxes. A pod sitting in the pool never auto-extends — the flag ' +
+      'only starts applying once the sandbox has an owner.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  autoExtend?: boolean;
 }

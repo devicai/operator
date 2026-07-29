@@ -350,6 +350,13 @@ const SandboxesPage: React.FC = () => {
               <Tag color={color} style={{ marginRight: 0 }}>{remaining}</Tag>
             </Tooltip>
             {duration}
+            {/* A sandbox that keeps outliving its countdown looks like a stuck
+                reaper unless the renewal is visible here. */}
+            {row.autoExtend && (
+              <Tooltip title="Auto-extends on activity: any command or file operation in the last seconds before expiry buys another TTL, up to the configured maximum">
+                <Tag color="blue" style={{ marginRight: 0 }}>auto</Tag>
+              </Tooltip>
+            )}
           </Space>
         );
       },
