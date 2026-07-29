@@ -377,6 +377,9 @@ export class SnapshotsService {
         exposedHttpPort,
         ttlSeconds,
         expiresAt,
+        // Never for a pool pod: it must expire on the pool's terms, and the
+        // flag is written for real at claim time.
+        autoExtend: options.hotReserved ? false : (dto.autoExtend ?? false),
         ...(isLinked ? { snapshotId: snapshot.snapshotId } : {}),
         hotReserved: options.hotReserved,
         commandCount: 0,

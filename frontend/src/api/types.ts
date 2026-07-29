@@ -15,6 +15,7 @@ export interface SandboxDto {
   ports: Record<string, number>;
   ttlSeconds: number;
   expiresAt: string;
+  autoExtend?: boolean;
   snapshotId?: string;
   commandCount: number;
   recentCommands: string[];
@@ -85,6 +86,7 @@ export interface CreateSandboxDto {
   ports?: Record<string, number>;
   ttlSeconds?: number;
   networkPolicy?: string;
+  autoExtend?: boolean;
 }
 
 export interface CommandResult {
@@ -104,6 +106,8 @@ export interface SandboxStatusResult {
   commandCount: number;
   remainingSeconds: number;
   expiresAt: string;
+  ttlSeconds: number;
+  autoExtend: boolean;
   createdAt: string;
 }
 
@@ -194,6 +198,7 @@ export interface RestoreSnapshotDto {
   cpus?: number;
   memoryMib?: number;
   linked?: boolean;
+  autoExtend?: boolean;
 }
 
 export interface ImportSnapshotDto {
@@ -291,4 +296,5 @@ export interface HotPoolStatus {
 export interface ClaimHotDto {
   bindingId?: string;
   ttlSeconds?: number;
+  autoExtend?: boolean;
 }

@@ -31,6 +31,7 @@ export const AVAILABLE_MCP_TOOLS: AvailableMcpTool[] = [
       { name: 'bindingId', type: 'string', required: false, description: 'External binding ID for implicit resolution' },
       { name: 'image', type: 'string', required: false, description: 'Docker image (default: node:24)' },
       { name: 'ttlSeconds', type: 'number', required: false, description: 'Time to live in seconds (default: 1800)' },
+      { name: 'autoExtend', type: 'boolean', required: false, description: 'Keep the sandbox alive while it is in use: any command or file operation arriving in the last 30s before expiry renews it for another ttlSeconds, up to the configured maximum TTL. An idle sandbox still expires on time.' },
       { name: 'force', type: 'boolean', required: false, description: 'Create a fresh sandbox even if the session already has one bound' },
       { name: 'useHotPool', type: 'boolean', required: false, description: 'Override hot pool resolution: true forces an attempt (falls back to fresh create), false skips it. Defaults to true unless image/profileId would diverge from the pool snapshot.' },
     ],

@@ -64,6 +64,19 @@ export class CreateSandboxDto {
 
   @ApiPropertyOptional({
     description:
+      'Keep the sandbox alive while it is in use. When a command, file ' +
+      'read/write, upload or download arrives within the last ' +
+      '`defaults.autoExtendWindowSeconds` (30s by default) before expiry, the ' +
+      'expiry is pushed forward by another `ttlSeconds` — capped by ' +
+      '`defaults.maxTtlSeconds`. An idle sandbox still expires on time.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  autoExtend?: boolean;
+
+  @ApiPropertyOptional({
+    description:
       'When true, the request first tries to claim a pre-warmed sandbox from ' +
       'the hot pool. Falls back to a regular create if the pool is empty or ' +
       'the requested config is incompatible.',

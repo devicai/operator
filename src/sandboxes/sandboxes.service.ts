@@ -32,6 +32,12 @@ import { tmpdir } from 'os';
 import { createReadStream, statSync, existsSync, unlinkSync, rm } from 'fs';
 import { Readable } from 'stream';
 
+/**
+ * How close to `expiresAt` an action must land for an auto-extending sandbox
+ * to renew itself, when `defaults.autoExtendWindowSeconds` is not configured.
+ */
+const DEFAULT_AUTO_EXTEND_WINDOW_SECONDS = 30;
+
 @Injectable()
 export class SandboxesService {
   private readonly logger = new Logger(SandboxesService.name);
@@ -62,6 +68,7 @@ export class SandboxesService {
         const claimed = await this.hotPool.claim({
           bindingId: dto.bindingId,
           ttlSeconds,
+          autoExtend: dto.autoExtend,
         });
         this.logger.log(
           `Sandbox ${claimed.sandboxId} served from hot pool (binding=${dto.bindingId ?? '-'})`,
@@ -171,6 +178,7 @@ export class SandboxesService {
         ports,
         ttlSeconds,
         expiresAt,
+        autoExtend: dto.autoExtend ?? false,
         bindingId: dto.bindingId,
         exposedHttpPort,
         commandCount: 0,
@@ -318,11 +326,15 @@ export class SandboxesService {
     bindingId: string,
     profileId: string | undefined,
     scope: ExtensionScope,
+    options?: { autoExtend?: boolean },
   ): Promise<SandboxDocument> {
     const existing = await this.sandboxRepo.findByBinding(bindingId, scope);
     if (existing && existing.status === SandboxStatus.RUNNING) return existing;
 
-    return this.create({ bindingId, profileId }, scope);
+    return this.create(
+      { bindingId, profileId, autoExtend: options?.autoExtend },
+      scope,
+    );
   }
 
   private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
@@ -359,6 +371,8 @@ export class SandboxesService {
     if (doc.status !== SandboxStatus.RUNNING) {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
+
+    await this.maybeAutoExtend(doc);
 
     const sandbox = await this.getSandboxInstance(doc);
 
@@ -442,6 +456,7 @@ export class SandboxesService {
     scope: ExtensionScope,
   ): Promise<void> {
     const doc = await this.findById(id, scope);
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     await sandbox.writeFile(filePath, Buffer.from(content));
   }
@@ -452,6 +467,7 @@ export class SandboxesService {
     scope: ExtensionScope,
   ): Promise<string> {
     const doc = await this.findById(id, scope);
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     const data = await sandbox.readFile(filePath);
     return data.toString('utf-8');
@@ -476,6 +492,9 @@ export class SandboxesService {
         `Sandbox is not running (status: ${doc.status})`,
       );
     }
+    // Browsing the file explorer runs a command in the sandbox like any other
+    // action, so it counts as use too.
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     const target = dirPath || doc.currentCwd || doc.workdir;
 
@@ -508,6 +527,7 @@ export class SandboxesService {
         `Sandbox is not running (status: ${doc.status})`,
       );
     }
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
 
     const hostTmp = join(tmpdir(), `operator-dl-${nanoid(10)}`);
@@ -549,6 +569,7 @@ export class SandboxesService {
           `Sandbox is not running (status: ${doc.status})`,
         );
       }
+      await this.maybeAutoExtend(doc);
       const sandbox = await this.getSandboxInstance(doc);
 
       let target = destPath || `${doc.workdir}/`;
@@ -688,40 +709,149 @@ export class SandboxesService {
     const currentExpiresAtMs = new Date(doc.expiresAt).getTime();
     const newExpiresAtMs = currentExpiresAtMs + additionalSeconds * 1000;
 
-    const maxTtl = this.config.defaults.maxTtlSeconds;
-    const totalTtl =
-      (newExpiresAtMs - new Date((doc as any).createdAt).getTime()) / 1000;
-
-    if (totalTtl > maxTtl) {
+    if (newExpiresAtMs > this.ttlCeilingMs(doc)) {
       throw new BadRequestException(
-        `Total TTL would exceed maximum of ${maxTtl}s`,
+        `Total TTL would exceed maximum of ${this.config.defaults.maxTtlSeconds}s`,
       );
     }
 
     const newExpiresAt = new Date(newExpiresAtMs);
-    // Registry TTL is "seconds remaining from now" (redis EXPIRE), so convert.
-    await this.registry.extendTtl(
-      doc.sandboxId,
-      Math.max(1, Math.ceil((newExpiresAtMs - Date.now()) / 1000)),
-    );
-
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
       { $set: { expiresAt: newExpiresAt } },
       scope,
     );
 
-    if (this.ingressService?.isEnabled() && updated?.subdomain) {
+    await this.syncTtlSideEffects(updated!, newExpiresAt);
+
+    return updated!;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-extension
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renew a sandbox that is still being used, so a session does not die under
+   * the caller's hands mid-task.
+   *
+   * Only sandboxes created with `autoExtend: true` are eligible, and only when
+   * the action arrives inside the renewal window — a sandbox with plenty of
+   * time left is not touched, so this costs one date comparison on the hot
+   * path. Every action that reaches the sandbox counts as use: commands, file
+   * reads and writes, uploads and downloads.
+   *
+   * Runs *before* the action rather than after: a command issued with five
+   * seconds left would otherwise be reaped halfway through.
+   *
+   * Best-effort by construction — a sandbox that cannot be renewed (it hit
+   * `maxTtlSeconds`, Redis is down, another action won the race) still serves
+   * the action it was called for, so nothing here is allowed to throw.
+   */
+  private async maybeAutoExtend(doc: SandboxDocument): Promise<void> {
+    if (!doc.autoExtend) return;
+    if (doc.status !== SandboxStatus.RUNNING) return;
+
+    try {
+      const currentExpiresAt = new Date(doc.expiresAt);
+      const remainingMs = currentExpiresAt.getTime() - Date.now();
+      // Past the expiry the reaper owns this document — it may be inside
+      // `atomicExpire` right now — and moving `expiresAt` would leave a
+      // document reading RUNNING with its container already gone.
+      if (remainingMs <= 0 || remainingMs > this.autoExtendWindowMs) return;
+
+      const grantedMs = this.autoExtendGrantMs(doc, currentExpiresAt);
+      if (grantedMs <= 0) {
+        this.logger.debug(
+          `Sandbox ${doc.sandboxId} reached the ${this.config.defaults.maxTtlSeconds}s ` +
+            'TTL ceiling; not auto-extending',
+        );
+        return;
+      }
+
+      const newExpiresAt = new Date(currentExpiresAt.getTime() + grantedMs);
+      const updated = await this.sandboxRepo.atomicExtendExpiry(
+        (doc as any)._id.toString(),
+        currentExpiresAt,
+        newExpiresAt,
+      );
+      // Lost the compare-and-set: a concurrent action already renewed this
+      // sandbox (or the reaper moved it out of RUNNING). Either way there is
+      // nothing left to do.
+      if (!updated) return;
+
+      await this.syncTtlSideEffects(updated, newExpiresAt);
+      this.logger.log(
+        `Sandbox ${doc.sandboxId} auto-extended by ${Math.round(grantedMs / 1000)}s ` +
+          `on activity (expires ${newExpiresAt.toISOString()})`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Auto-extend failed for ${doc.sandboxId}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private get autoExtendWindowMs(): number {
+    const seconds =
+      this.config.defaults?.autoExtendWindowSeconds ??
+      DEFAULT_AUTO_EXTEND_WINDOW_SECONDS;
+    return seconds * 1000;
+  }
+
+  /**
+   * Latest instant a sandbox may be extended to, whether the extension was
+   * asked for explicitly or granted automatically.
+   *
+   * Measured from when the sandbox started serving its owner rather than from
+   * `createdAt`: for a sandbox claimed from the hot pool `createdAt` records
+   * when the pod was pre-warmed — potentially days earlier — which would leave
+   * it with no extension budget at all the moment it was handed out.
+   */
+  private ttlCeilingMs(doc: SandboxDocument): number {
+    const anchor = doc.claimedAt ?? (doc as any).createdAt;
+    return new Date(anchor).getTime() + this.config.defaults.maxTtlSeconds * 1000;
+  }
+
+  /**
+   * Milliseconds an auto-extension may add: another full `ttlSeconds`, clamped
+   * to the ceiling above. Zero once the ceiling is reached — the sandbox then
+   * expires normally, however busy it is.
+   */
+  private autoExtendGrantMs(doc: SandboxDocument, currentExpiresAt: Date): number {
+    const desiredMs = currentExpiresAt.getTime() + doc.ttlSeconds * 1000;
+    return Math.max(
+      0,
+      Math.min(desiredMs, this.ttlCeilingMs(doc)) - currentExpiresAt.getTime(),
+    );
+  }
+
+  /**
+   * Carry a new expiry over to everything that caches it: the Redis registry
+   * keyed by sandbox id, and the ingress mapping for a published sandbox.
+   * Neither is the source of truth (the document is), so a failure here is
+   * logged and not propagated.
+   */
+  private async syncTtlSideEffects(
+    doc: SandboxDocument,
+    newExpiresAt: Date,
+  ): Promise<void> {
+    // Registry TTL is "seconds remaining from now" (redis EXPIRE), so convert.
+    const remainingSeconds = Math.max(
+      1,
+      Math.ceil((newExpiresAt.getTime() - Date.now()) / 1000),
+    );
+    await this.registry.extendTtl(doc.sandboxId, remainingSeconds);
+
+    if (this.ingressService?.isEnabled() && doc.subdomain) {
       try {
-        await this.ingressService.refreshTtl(updated);
+        await this.ingressService.refreshTtl(doc);
       } catch (err) {
         this.logger.warn(
           `Ingress TTL refresh failed for ${doc.sandboxId}: ${(err as Error).message}`,
         );
       }
     }
-
-    return updated!;
   }
 
   async getStatus(id: string, scope: ExtensionScope) {
@@ -738,6 +868,8 @@ export class SandboxesService {
       commandCount: doc.commandCount,
       remainingSeconds: Math.floor(remainingMs / 1000),
       expiresAt: doc.expiresAt,
+      ttlSeconds: doc.ttlSeconds,
+      autoExtend: doc.autoExtend ?? false,
       publicUrl: doc.publicUrl,
       createdAt: (doc as any).createdAt,
     };

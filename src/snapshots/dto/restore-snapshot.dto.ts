@@ -38,6 +38,18 @@ export class RestoreSnapshotDto {
   linked?: boolean;
 
   @ApiPropertyOptional({
+    default: false,
+    description:
+      'Keep the restored sandbox alive while it is in use. Mirrors ' +
+      '`autoExtend` on /sandboxes: an action arriving within ' +
+      '`defaults.autoExtendWindowSeconds` of the expiry renews it for another ' +
+      '`ttlSeconds`, capped by `defaults.maxTtlSeconds`.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  autoExtend?: boolean;
+
+  @ApiPropertyOptional({
     description:
       'Port inside the restored sandbox the public ingress proxy should ' +
       'forward HTTP traffic to. Defaults to the port captured in the ' +

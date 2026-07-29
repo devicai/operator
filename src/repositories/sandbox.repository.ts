@@ -55,6 +55,7 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
       bindingId?: string;
       ttlSeconds: number;
       maxTtlSeconds: number;
+      autoExtend?: boolean;
     },
   ): Promise<SandboxDocument | null> {
     const cappedTtl = Math.min(update.ttlSeconds, update.maxTtlSeconds);
@@ -66,6 +67,9 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
       claimedAt,
       ttlSeconds: cappedTtl,
       expiresAt,
+      // A pod idling in the pool must never renew itself; the flag is written
+      // at claim time, when the sandbox starts serving a real owner.
+      autoExtend: update.autoExtend ?? false,
       // Kept for backwards compatibility with clients reading the metadata bag;
       // `claimedAt` is the queryable, indexed source of truth.
       'metadata.hotClaimedAt': claimedAt.toISOString(),
@@ -83,6 +87,31 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
         },
         { $set: set },
         { new: true, sort: { createdAt: 1 } },
+      )
+      .exec() as Promise<SandboxDocument | null>;
+  }
+
+  /**
+   * Push `expiresAt` forward, but only while it still holds the value the
+   * caller based its arithmetic on.
+   *
+   * Auto-extension is driven by whatever action happens to arrive inside the
+   * renewal window, and a session under load lands several at once: read
+   * modify-write would then grant each of them a full extra TTL, so a sandbox
+   * could jump well past `maxTtlSeconds` in a single burst. Losing the compare
+   * -and-set is the expected outcome for all but one of them — the sandbox has
+   * already been renewed — so `null` here is not an error.
+   */
+  async atomicExtendExpiry(
+    id: string,
+    from: Date,
+    to: Date,
+  ): Promise<SandboxDocument | null> {
+    return this.model
+      .findOneAndUpdate(
+        { _id: id, status: SandboxStatus.RUNNING, expiresAt: from },
+        { $set: { expiresAt: to } },
+        { new: true },
       )
       .exec() as Promise<SandboxDocument | null>;
   }

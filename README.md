@@ -106,9 +106,43 @@ defaults:
   defaultTtlSeconds: 1800    # 30 minutes
   maxTtlSeconds: 7200        # 2 hours max
   ttlCheckIntervalMs: 30000  # Check every 30s
+  autoExtendWindowSeconds: 30  # Renewal window for autoExtend sandboxes
 ```
 
 > The legacy block name `microsandbox:` is still accepted for backwards compatibility — it is read as `defaults:` if `defaults:` is missing.
+
+#### Keeping a session alive (`autoExtend`)
+
+A sandbox expires on a fixed deadline, which cuts an agent off mid-task whenever
+the work outlasts the TTL it was created with. Pass `autoExtend: true` on
+`POST /sandboxes` (or on the `create_sandbox` MCP tool) to make the sandbox
+renew itself while it is being used:
+
+```json
+{ "ttlSeconds": 1800, "autoExtend": true }
+```
+
+Any command, file read, file write, directory listing, upload or download arriving in the last
+`autoExtendWindowSeconds` (30s by default) before `expiresAt` pushes the expiry
+forward by another full `ttlSeconds`. Actions arriving earlier cost nothing —
+the sandbox already has time left — so a busy session is renewed roughly once
+per TTL rather than on every call.
+
+What it deliberately does not do:
+
+- **Outlive `maxTtlSeconds`.** The ceiling still applies, measured from when the
+  sandbox started serving its owner (the hot-pool claim, when there was one).
+  The final renewal is clamped to it, and past it the sandbox expires normally
+  no matter how busy it is.
+- **Keep an idle sandbox alive.** No activity in the window, no renewal.
+- **Fail your request.** Renewal is best-effort: if it cannot happen, the
+  command or file operation still runs.
+- **Cover the WebSocket terminal.** Terminal traffic talks to the runtime
+  directly and does not renew the sandbox.
+
+`GET /sandboxes/:id/status` reports `autoExtend` alongside `remainingSeconds`,
+and each renewal is logged. `POST /sandboxes/:id/extend-ttl` remains available
+for explicit, caller-driven extensions.
 
 ### Runtime backends
 

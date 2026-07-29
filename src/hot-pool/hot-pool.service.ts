@@ -244,6 +244,7 @@ export class HotPoolService implements OnModuleInit {
         bindingId: dto.bindingId,
         ttlSeconds,
         maxTtlSeconds: this.config.defaults.maxTtlSeconds,
+        autoExtend: dto.autoExtend,
       },
     );
 

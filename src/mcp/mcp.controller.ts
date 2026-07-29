@@ -175,6 +175,12 @@ export class McpController implements OnModuleInit {
           bindingId: z.string().optional().describe('External binding ID — reuses or creates a sandbox keyed by this id'),
           image: z.string().optional().describe('Docker image'),
           ttlSeconds: z.number().optional().describe('TTL in seconds'),
+          autoExtend: z
+            .boolean()
+            .optional()
+            .describe(
+              'Keep the sandbox alive while it is in use: a command or file operation arriving in the last 30s before expiry renews it for another ttlSeconds, up to the configured maximum TTL. An idle sandbox still expires on time.',
+            ),
           force: z.boolean().optional().describe('Create a fresh sandbox even if the session already has one bound'),
           useHotPool: z
             .boolean()
@@ -183,12 +189,13 @@ export class McpController implements OnModuleInit {
               'Override hot pool resolution: true forces an attempt (falls back to fresh create), false skips it. Defaults to true unless image/profileId would diverge from the pool snapshot.',
             ),
         } as any,
-        async ({ profileId, bindingId, image, ttlSeconds, force, useHotPool }: any) => {
+        async ({ profileId, bindingId, image, ttlSeconds, autoExtend, force, useHotPool }: any) => {
           try {
             const scope = {};
             let sandbox;
 
-            const noOverrides = !bindingId && !image && !ttlSeconds && !profileId;
+            const noOverrides =
+              !bindingId && !image && !ttlSeconds && !profileId && !autoExtend;
             if (!force && noOverrides && session.sandboxId) {
               const existing = await this.sandboxesService
                 .findById(session.sandboxId, scope)
@@ -226,6 +233,7 @@ export class McpController implements OnModuleInit {
                 bindingId,
                 effectiveProfileId,
                 scope,
+                { autoExtend },
               );
             } else {
               sandbox = await this.sandboxesService.create(
@@ -233,6 +241,7 @@ export class McpController implements OnModuleInit {
                   profileId: effectiveProfileId,
                   image,
                   ttlSeconds,
+                  autoExtend,
                   bindingId: session.bindingId ?? undefined,
                   useHotPool: wantsHotPool,
                 },
@@ -251,6 +260,7 @@ export class McpController implements OnModuleInit {
                 workdir: sandbox.workdir,
                 ttlSeconds: sandbox.ttlSeconds,
                 expiresAt: sandbox.expiresAt,
+                autoExtend: sandbox.autoExtend ?? false,
                 publicUrl: sandbox.publicUrl,
                 reused: false,
                 fromHotPool: fromHot,
