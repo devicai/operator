@@ -6,6 +6,13 @@ coverage
 .env
 .env.*
 config.yml
+# Deploy backups. The deployment rsyncs into an unpacked copy of this directory
+# and keeps a `<name>.predeploy-<timestamp>` alongside the original, which lands
+# in the build context. For a backup of `src/` that means TypeScript sees the
+# same sources twice, the inferred rootDir widens from `src` to the project
+# root, and the build silently emits `dist/src/main.js` — the image builds fine
+# and then crash-loops on `Cannot find module '/app/dist/main'`.
+*.predeploy-*
 *.log
 .DS_Store
 .idea
