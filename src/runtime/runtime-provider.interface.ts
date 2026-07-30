@@ -257,6 +257,12 @@ export interface RuntimeProvider {
    * terminal state is never revisited, so its container would sit there
    * holding its writable layer forever.
    */
+  /**
+   * Optional: verify, once, whether a per-sandbox disk quota is actually
+   * enforced here — not merely accepted. Reports; never blocks creation.
+   */
+  probeDiskQuota?(): Promise<DiskQuotaSupport>;
+
   listManaged?(options?: {
     /**
      * Also report each sandbox's writable-layer size. Costs the runtime extra
@@ -265,6 +271,19 @@ export interface RuntimeProvider {
     withSize?: boolean;
   }): Promise<ManagedSandboxInfo[]>;
 }
+
+/**
+ * Whether a per-container disk quota actually holds on this runtime.
+ * `accepted-not-enforced` is the case that matters: the option is taken and
+ * quietly does nothing, which would otherwise be read as protection.
+ */
+export type DiskQuotaSupport =
+  | 'enforced'
+  | 'accepted-not-enforced'
+  | 'unsupported'
+  | 'not-configured'
+  | 'disabled'
+  | 'unknown';
 
 export interface ManagedSandboxInfo {
   /** Container name, which matches the sandbox document's `name`. */

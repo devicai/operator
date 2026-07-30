@@ -61,6 +61,14 @@ export class SandboxDiskService implements OnModuleInit {
       `Per-sandbox disk accounting every ${interval}ms ` +
         `(warn=${this.warnBytes ?? '-'}, limit=${this.limitBytes ?? '-'})`,
     );
+
+    // Ask the runtime whether the cap is also enforced by the kernel. Runs in
+    // the background: it creates a throwaway container, and boot must not wait
+    // on it. The sampled cap above protects the host either way — the answer
+    // only tells the operator how much overshoot is possible.
+    void this.runtime.probeDiskQuota?.().catch((err) => {
+      this.logger.warn(`Disk quota probe failed: ${(err as Error).message}`);
+    });
   }
 
   onApplicationShutdown(): void {

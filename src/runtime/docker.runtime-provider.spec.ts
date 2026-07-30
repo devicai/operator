@@ -16,6 +16,10 @@ const info = jest.fn();
 const getNetwork = jest.fn();
 const listNetworks = jest.fn();
 const listContainers = jest.fn();
+const containerLogs = jest.fn();
+const containerWait = jest.fn();
+const containerStart = jest.fn();
+const containerRemove = jest.fn();
 
 jest.mock('dockerode', () => {
   return jest.fn().mockImplementation(() => ({
@@ -1057,6 +1061,184 @@ describe('DockerRuntimeProvider', () => {
       listContainers.mockRejectedValue(new Error('no socket'));
       const provider = await buildProvider(buildConfig());
       await expect(provider.listManaged!()).resolves.toEqual([]);
+    });
+  });
+  describe('probeDiskQuota', () => {
+    const buildQuotaProvider = async (bytes = 8 * 1024 * 1024 * 1024) => {
+      const cfg: any = buildConfig();
+      cfg.resourceLimits = { maxSandboxDiskBytes: bytes };
+      return { provider: await buildProvider(cfg), cfg };
+    };
+
+    const armProbe = (writtenBytes: number) => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({ Size: 1000 }) });
+      containerStart.mockResolvedValue(undefined);
+      containerWait.mockResolvedValue(undefined);
+      containerRemove.mockResolvedValue(undefined);
+      containerLogs.mockResolvedValue(Buffer.from(`wrote:${writtenBytes}\n`));
+      createContainer.mockResolvedValue({
+        start: containerStart,
+        wait: containerWait,
+        logs: containerLogs,
+        remove: containerRemove,
+      });
+    };
+
+    it('reports enforcement when the quota cuts the write short', async () => {
+      armProbe(32 * 1024 * 1024); // ENOSPC before the overshoot completed
+      const { provider } = await buildQuotaProvider();
+      await expect(provider.probeDiskQuota!()).resolves.toBe('enforced');
+    });
+
+    it('catches a daemon that accepts the quota and ignores it', async () => {
+      // Docker Desktop's overlayfs does exactly this: a container capped at
+      // 100 MB writes 200 MB happily. Reporting that as protection would be
+      // worse than reporting none, which is why the probe writes for real.
+      armProbe(128 * 1024 * 1024);
+      const { provider } = await buildQuotaProvider();
+      await expect(provider.probeDiskQuota!()).resolves.toBe(
+        'accepted-not-enforced',
+      );
+    });
+
+    it('reports unsupported when the daemon refuses the option', async () => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({ Size: 1000 }) });
+      createContainer.mockRejectedValue(
+        new Error(
+          "--storage-opt is supported only for overlay over xfs with 'pquota' mount option",
+        ),
+      );
+      const { provider } = await buildQuotaProvider();
+      await expect(provider.probeDiskQuota!()).resolves.toBe('unsupported');
+    });
+
+    it('does not claim enforcement when the probe itself breaks', async () => {
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({ Size: 1000 }) });
+      createContainer.mockRejectedValue(new Error('daemon exploded'));
+      const { provider } = await buildQuotaProvider();
+      await expect(provider.probeDiskQuota!()).resolves.toBe('unknown');
+    });
+
+    it('skips the probe when no cap is configured', async () => {
+      const provider = await buildProvider(buildConfig());
+      await expect(provider.probeDiskQuota!()).resolves.toBe('not-configured');
+      expect(createContainer).not.toHaveBeenCalled();
+    });
+
+    it('skips the probe when the operator opted out', async () => {
+      const cfg: any = buildConfig();
+      cfg.resourceLimits = {
+        maxSandboxDiskBytes: 1024,
+        enforceSandboxDiskQuota: false,
+      };
+      const provider = await buildProvider(cfg);
+      await expect(provider.probeDiskQuota!()).resolves.toBe('disabled');
+      expect(createContainer).not.toHaveBeenCalled();
+    });
+
+    it('cleans up the probe container even when it fails', async () => {
+      armProbe(1);
+      containerWait.mockRejectedValueOnce(new Error('wait failed'));
+      const { provider } = await buildQuotaProvider();
+      await provider.probeDiskQuota!();
+      expect(containerRemove).toHaveBeenCalledWith({ force: true, v: true });
+    });
+  });
+  describe('create with a disk quota', () => {
+    const baseCreateConfig = () => ({
+      name: 'sandbox-quota',
+      image: 'node:24',
+      workdir: '/workspace',
+      cpus: 1,
+      memoryMib: 256,
+      env: {},
+    });
+    const quotaConfig = (extra: any = {}) => {
+      const cfg: any = buildConfig();
+      cfg.resourceLimits = { maxSandboxDiskBytes: 8589934592, ...extra };
+      return cfg;
+    };
+    const createArgs = () => createContainer.mock.calls.map((c) => c[0]);
+    const started = () => ({
+      start: jest.fn().mockResolvedValue(undefined),
+      id: 'c1',
+      exec: jest.fn(),
+      inspect: jest.fn().mockResolvedValue({ State: { Running: true } }),
+    });
+
+    beforeEach(() => {
+      // create() resolves the image and clears any same-named container first.
+      getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
+      getContainer.mockReturnValue({
+        remove: jest.fn().mockRejectedValue({ statusCode: 404 }),
+      });
+    });
+
+    it('passes the cap to the runtime as a StorageOpt', async () => {
+      createContainer.mockResolvedValue(started());
+      const provider = await buildProvider(quotaConfig());
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+      expect(createArgs()[0].HostConfig.StorageOpt).toEqual({
+        size: '8589934592',
+      });
+    });
+
+    it('retries without the quota when the daemon refuses it', async () => {
+      // overlay2 on ext4 rejects the option outright. Sandbox creation has to
+      // keep working — the sampled cap stays as the protection.
+      createContainer
+        .mockRejectedValueOnce(
+          new Error(
+            "--storage-opt is supported only for overlay over xfs with 'pquota' mount option",
+          ),
+        )
+        .mockResolvedValue(started());
+
+      const provider = await buildProvider(quotaConfig());
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+
+      const args = createArgs();
+      expect(args).toHaveLength(2);
+      expect(args[0].HostConfig.StorageOpt).toBeDefined();
+      expect(args[1].HostConfig.StorageOpt).toBeUndefined();
+    });
+
+    it('stops asking after the first refusal', async () => {
+      createContainer
+        .mockRejectedValueOnce(new Error('--storage-opt is not supported'))
+        .mockResolvedValue(started());
+      const provider = await buildProvider(quotaConfig());
+
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+      createContainer.mockClear();
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+
+      expect(createArgs()[0].HostConfig.StorageOpt).toBeUndefined();
+    });
+
+    it('surfaces an unrelated create failure instead of retrying', async () => {
+      createContainer.mockRejectedValue(new Error('no such image'));
+      const provider = await buildProvider(quotaConfig());
+      await expect(provider.create(baseCreateConfig())).rejects.toThrow(
+        'no such image',
+      );
+      expect(createContainer).toHaveBeenCalledTimes(1);
+    });
+
+    it('omits the quota when the operator opted out', async () => {
+      createContainer.mockResolvedValue(started());
+      const provider = await buildProvider(
+        quotaConfig({ enforceSandboxDiskQuota: false }),
+      );
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+      expect(createArgs()[0].HostConfig.StorageOpt).toBeUndefined();
+    });
+
+    it('omits the quota when no cap is configured', async () => {
+      createContainer.mockResolvedValue(started());
+      const provider = await buildProvider(buildConfig());
+      await provider.create(baseCreateConfig()).catch(() => undefined);
+      expect(createArgs()[0].HostConfig.StorageOpt).toBeUndefined();
     });
   });
 });

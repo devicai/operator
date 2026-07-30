@@ -221,6 +221,7 @@ resourceLimits:
   # sandboxes, so it is not charged to any of them.
   warnSandboxDiskBytes: 3221225472   # 3 GiB — flagged, not touched
   maxSandboxDiskBytes: 8589934592    # 8 GiB — stopped
+  enforceSandboxDiskQuota: true      # also ask the kernel to enforce it
 ```
 
 #### Per-sandbox disk
@@ -229,7 +230,17 @@ resourceLimits:
 
 Usage is sampled every `maintenance.sandboxDiskCheckIntervalMs` and recorded on each sandbox as `diskBytes` / `diskCheckedAt`, so growth is visible in the API and the UI before anything is enforced. A sandbox that reaches `maxSandboxDiskBytes` is stopped through the regular stop path — persisted to its snapshot if linked, unpublished from ingress — and marked `stoppedReason: 'disk-limit'`, so the owner finds a stopped sandbox with an explanation rather than a vanished one.
 
-This is a **reactive** cap, not a kernel quota: a sandbox can overshoot between two samples. A hard cap needs `--storage-opt size=`, which Docker honors only on overlay2 over XFS mounted with `pquota`; on ext4 the daemon rejects it outright. Set both thresholds to `0` (or omit them) to disable the accounting entirely.
+Sampling alone is **reactive**: a sandbox can overshoot between two samples. With `enforceSandboxDiskQuota` (on by default) the same figure is also handed to the runtime as `StorageOpt`, so the sandbox gets `ENOSPC` at the cap instead of overshooting — but only where that actually works.
+
+Support is not something a daemon can be trusted to self-report. Three outcomes exist, and the module distinguishes them at boot by writing past a small quota in a throwaway container:
+
+| Outcome | What it means | What protects you |
+|---------|---------------|-------------------|
+| `enforced` | overlay2 over XFS with `pquota` | Kernel quota **and** sampling |
+| `accepted-not-enforced` | Daemon takes the option and ignores it (Docker Desktop's overlayfs) | Sampling only — logged as a warning |
+| `unsupported` | Daemon rejects it (overlay2 on ext4) | Sampling only; sandboxes are created without a quota |
+
+The middle row is why the probe writes for real rather than asking: a daemon that silently ignores the option would otherwise look identical to one enforcing it. Creation never waits on the probe, and a refusal is remembered so the option is not retried on every create. Set both thresholds to `0` (or omit them) to disable the accounting entirely, or `enforceSandboxDiskQuota: false` to keep sampling without touching the runtime.
 
 #### Background job cadence
 
