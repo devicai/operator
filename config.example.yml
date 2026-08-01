@@ -22,6 +22,13 @@ defaults:
   defaultTtlSeconds: 1800
   maxTtlSeconds: 7200
   ttlCheckIntervalMs: 30000
+  # How close to its expiry an action must land for a sandbox created with
+  # `autoExtend: true` to renew itself for another ttlSeconds. Only sandboxes
+  # that asked for the flag are affected, and maxTtlSeconds still caps the total
+  # lifetime, so an active sandbox does not live forever. Keep this at or above
+  # ttlCheckIntervalMs, otherwise the reaper can claim the sandbox in the gap
+  # between the last action and the window. Default 30.
+  autoExtendWindowSeconds: 30
   # Per-command budget for the persistent shell (ms). A stuck/interactive command
   # is aborted and the shell is reset so later commands don't queue behind it
   # forever (which would surface as a gateway 504). 0 disables. Default 300000.

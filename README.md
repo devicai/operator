@@ -106,9 +106,43 @@ defaults:
   defaultTtlSeconds: 1800    # 30 minutes
   maxTtlSeconds: 7200        # 2 hours max
   ttlCheckIntervalMs: 30000  # Check every 30s
+  autoExtendWindowSeconds: 30  # Renewal window for autoExtend sandboxes
 ```
 
 > The legacy block name `microsandbox:` is still accepted for backwards compatibility — it is read as `defaults:` if `defaults:` is missing.
+
+#### Keeping a session alive (`autoExtend`)
+
+A sandbox expires on a fixed deadline, which cuts an agent off mid-task whenever
+the work outlasts the TTL it was created with. Pass `autoExtend: true` on
+`POST /sandboxes` (or on the `create_sandbox` MCP tool) to make the sandbox
+renew itself while it is being used:
+
+```json
+{ "ttlSeconds": 1800, "autoExtend": true }
+```
+
+Any command, file read, file write, directory listing, upload or download arriving in the last
+`autoExtendWindowSeconds` (30s by default) before `expiresAt` pushes the expiry
+forward by another full `ttlSeconds`. Actions arriving earlier cost nothing —
+the sandbox already has time left — so a busy session is renewed roughly once
+per TTL rather than on every call.
+
+What it deliberately does not do:
+
+- **Outlive `maxTtlSeconds`.** The ceiling still applies, measured from when the
+  sandbox started serving its owner (the hot-pool claim, when there was one).
+  The final renewal is clamped to it, and past it the sandbox expires normally
+  no matter how busy it is.
+- **Keep an idle sandbox alive.** No activity in the window, no renewal.
+- **Fail your request.** Renewal is best-effort: if it cannot happen, the
+  command or file operation still runs.
+- **Cover the WebSocket terminal.** Terminal traffic talks to the runtime
+  directly and does not renew the sandbox.
+
+`GET /sandboxes/:id/status` reports `autoExtend` alongside `remainingSeconds`,
+and each renewal is logged. `POST /sandboxes/:id/extend-ttl` remains available
+for explicit, caller-driven extensions.
 
 ### Runtime backends
 
@@ -323,6 +357,31 @@ Three properties are worth knowing before enabling it:
 A sandbox restored from a cached image records its base image in a container
 label, so its own snapshots stay diffs against that base rather than against
 the snapshot image it happened to boot from.
+
+#### Saving a big snapshot
+
+Capturing a large filesystem takes minutes — longer than most reverse proxies
+will hold a request open. Two options keep that off the request path:
+
+- `POST /api/v1/sandboxes/:id/stop` with `{"async": true}` — the sandbox goes to
+  `stopping`, the response comes back immediately, and the save runs in the
+  background. The container is torn down **after** the capture finishes; killing
+  it mid-capture SIGKILLs the tar and loses the save. Add `{"save": false}` to
+  close a session without keeping its changes.
+- `POST /api/v1/snapshots` with `{"async": true}` — returns the `creating`
+  document; poll `GET /api/v1/snapshots/:id` for the outcome.
+
+While a save runs, the snapshot carries `saveState: "saving"` and its artifact
+on disk is still the **previous** capture (captures write to a temp file and are
+renamed into place, so a reader never sees a half-written tarball). Restoring
+from it in that window is refused with `409 SNAPSHOT_SAVE_IN_PROGRESS` unless the
+caller passes `force: true`, which starts from that last saved version and
+accepts being out of sync with the save in flight. Stopping or destroying a
+sandbox whose filesystem is being captured is refused the same way.
+
+A capture also rebuilds the image cache, if enabled — scheduled only once the
+tarball is renamed into place, so an image never publishes content that is not
+yet the artifact of record.
 
 ### Sandbox Profiles
 

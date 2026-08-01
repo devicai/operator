@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef, Optional } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException, BadRequestException, ConflictException, forwardRef, Optional } from '@nestjs/common';
 import * as net from 'net';
 import { nanoid } from 'nanoid';
 import { SandboxRegistry } from './sandbox-registry';
@@ -10,6 +10,7 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
+import { StopSandboxDto } from './dto/stop-sandbox.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import { HotPoolService } from '../hot-pool/hot-pool.service';
@@ -31,6 +32,21 @@ import * as posixPath from 'path/posix';
 import { tmpdir } from 'os';
 import { createReadStream, statSync, existsSync, unlinkSync, rm } from 'fs';
 import { Readable } from 'stream';
+
+/**
+ * How close to `expiresAt` an action must land for an auto-extending sandbox
+ * to renew itself, when `defaults.autoExtendWindowSeconds` is not configured.
+ */
+const DEFAULT_AUTO_EXTEND_WINDOW_SECONDS = 30;
+
+/** How often a deferred stop checks whether the capture in flight is over. */
+const CAPTURE_POLL_MS = 2_000;
+/**
+ * Ceiling on that wait. Longer than any realistic capture (the largest observed
+ * is ~3.5 min for 800 MB) but finite, so a capture whose process died without
+ * clearing its flag cannot strand a container.
+ */
+const CAPTURE_WAIT_TIMEOUT_MS = 20 * 60_000;
 
 @Injectable()
 export class SandboxesService {
@@ -62,6 +78,7 @@ export class SandboxesService {
         const claimed = await this.hotPool.claim({
           bindingId: dto.bindingId,
           ttlSeconds,
+          autoExtend: dto.autoExtend,
         });
         this.logger.log(
           `Sandbox ${claimed.sandboxId} served from hot pool (binding=${dto.bindingId ?? '-'})`,
@@ -171,6 +188,7 @@ export class SandboxesService {
         ports,
         ttlSeconds,
         expiresAt,
+        autoExtend: dto.autoExtend ?? false,
         bindingId: dto.bindingId,
         exposedHttpPort,
         commandCount: 0,
@@ -318,11 +336,15 @@ export class SandboxesService {
     bindingId: string,
     profileId: string | undefined,
     scope: ExtensionScope,
+    options?: { autoExtend?: boolean },
   ): Promise<SandboxDocument> {
     const existing = await this.sandboxRepo.findByBinding(bindingId, scope);
     if (existing && existing.status === SandboxStatus.RUNNING) return existing;
 
-    return this.create({ bindingId, profileId }, scope);
+    return this.create(
+      { bindingId, profileId, autoExtend: options?.autoExtend },
+      scope,
+    );
   }
 
   private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
@@ -359,6 +381,8 @@ export class SandboxesService {
     if (doc.status !== SandboxStatus.RUNNING) {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
+
+    await this.maybeAutoExtend(doc);
 
     const sandbox = await this.getSandboxInstance(doc);
 
@@ -442,6 +466,7 @@ export class SandboxesService {
     scope: ExtensionScope,
   ): Promise<void> {
     const doc = await this.findById(id, scope);
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     await sandbox.writeFile(filePath, Buffer.from(content));
   }
@@ -452,6 +477,7 @@ export class SandboxesService {
     scope: ExtensionScope,
   ): Promise<string> {
     const doc = await this.findById(id, scope);
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     const data = await sandbox.readFile(filePath);
     return data.toString('utf-8');
@@ -476,6 +502,9 @@ export class SandboxesService {
         `Sandbox is not running (status: ${doc.status})`,
       );
     }
+    // Browsing the file explorer runs a command in the sandbox like any other
+    // action, so it counts as use too.
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
     const target = dirPath || doc.currentCwd || doc.workdir;
 
@@ -508,6 +537,7 @@ export class SandboxesService {
         `Sandbox is not running (status: ${doc.status})`,
       );
     }
+    await this.maybeAutoExtend(doc);
     const sandbox = await this.getSandboxInstance(doc);
 
     const hostTmp = join(tmpdir(), `operator-dl-${nanoid(10)}`);
@@ -549,6 +579,7 @@ export class SandboxesService {
           `Sandbox is not running (status: ${doc.status})`,
         );
       }
+      await this.maybeAutoExtend(doc);
       const sandbox = await this.getSandboxInstance(doc);
 
       let target = destPath || `${doc.workdir}/`;
@@ -588,16 +619,147 @@ export class SandboxesService {
     id: string,
     scope: ExtensionScope,
     reason?: string,
+    opts: StopSandboxDto = {},
   ): Promise<SandboxDocument> {
     const doc = await this.findById(id, scope);
     if (doc.status !== SandboxStatus.RUNNING) {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
-    if (doc.snapshotId) {
-      await this.snapshotsService.persistToSnapshot(doc);
+    // A capture is already reading this filesystem (a snapshot created with
+    // `async`, or a save from another path). An async caller does not need it
+    // to be over — it asked us to finish off-request, so we wait it out and
+    // tear down after. A synchronous one is refused rather than kept hanging.
+    if (doc.savingSnapshotId && !opts.force) {
+      if (!opts.async) this.assertNotBeingCaptured(doc, opts.force);
+      const stopping = await this.sandboxRepo.updateById(
+        (doc as any)._id.toString(),
+        { $set: { status: SandboxStatus.STOPPING } },
+        scope,
+      );
+      void this.waitForCaptureThenStop(doc, scope, reason);
+      return stopping ?? doc;
     }
 
+    const saveTarget = opts.snapshotId ?? doc.snapshotId;
+    const shouldSave = opts.save !== false && !!saveTarget;
+
+    // Async stop: claim the work, answer now, finish off-request. The save and
+    // the teardown stay in this order and in one place — a caller that saved
+    // over HTTP and then stopped separately used to race its own capture, and
+    // stopping the container SIGKILLs the tar reading its filesystem.
+    if (shouldSave && opts.async) {
+      const stopping = await this.sandboxRepo.updateById(
+        (doc as any)._id.toString(),
+        { $set: { status: SandboxStatus.STOPPING } },
+        scope,
+      );
+      void this.saveThenStop(doc, scope, reason, saveTarget);
+      return stopping ?? doc;
+    }
+
+    if (shouldSave) {
+      const outcome = await this.snapshotsService.persistToSnapshot(
+        doc,
+        saveTarget,
+      );
+      if (outcome === 'conflict') {
+        throw new ConflictException({
+          message:
+            'Another save into this sandbox snapshot is already running. ' +
+            'Retry once it finishes.',
+          code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+          snapshotId: saveTarget,
+        });
+      }
+    }
+
+    return this.finishStop(doc, scope, reason);
+  }
+
+  /**
+   * Background half of an async stop: persist, then tear down no matter how the
+   * save went. A failed save must not leave the sandbox running forever — the
+   * caller already got its answer and nothing else will come back for it.
+   */
+  private async saveThenStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+    targetSnapshotId?: string,
+  ): Promise<void> {
+    try {
+      await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId);
+    } catch (err) {
+      this.logger.error(
+        `Background save for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+    try {
+      await this.finishStop(doc, scope, reason);
+    } catch (err) {
+      this.logger.error(
+        `Background stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Wait for the capture in flight to clear the sandbox's flag, then tear the
+   * container down. No second save: the capture already running IS the save.
+   *
+   * Bounded — a capture that never finishes (its process died without clearing
+   * the flag, which the boot sweep only fixes on restart) must not leave the
+   * container running forever.
+   */
+  private async waitForCaptureThenStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<void> {
+    const deadline = Date.now() + CAPTURE_WAIT_TIMEOUT_MS;
+    try {
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, CAPTURE_POLL_MS));
+        const fresh = await this.sandboxRepo
+          .findOne({ sandboxId: doc.sandboxId } as any, scope)
+          .catch(() => null);
+        if (!fresh) return;
+        if (!fresh.savingSnapshotId) {
+          await this.finishStop(fresh, scope, reason);
+          return;
+        }
+      }
+      this.logger.warn(
+        `Capture of ${doc.sandboxId} did not finish within ` +
+          `${CAPTURE_WAIT_TIMEOUT_MS}ms; stopping anyway`,
+      );
+      await this.finishStop(doc, scope, reason);
+    } catch (err) {
+      this.logger.error(
+        `Deferred stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /** Refuse to tear down a container whose filesystem is being captured. */
+  private assertNotBeingCaptured(doc: SandboxDocument, force?: boolean): void {
+    if (!doc.savingSnapshotId || force) return;
+    throw new ConflictException({
+      message:
+        'A snapshot save is capturing this sandbox. Tearing it down now would ' +
+        'kill the capture and lose the save. Retry once it finishes, or pass ' +
+        'force=true to abandon it.',
+      code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+      snapshotId: doc.savingSnapshotId,
+    });
+  }
+
+  private async finishStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<SandboxDocument> {
     try {
       // Address the container through the document, not the Redis registry:
       // the registry key expires with the TTL and a lapsed key would leave the
@@ -648,8 +810,13 @@ export class SandboxesService {
     return updated!;
   }
 
-  async destroy(id: string, scope: ExtensionScope): Promise<void> {
+  async destroy(
+    id: string,
+    scope: ExtensionScope,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
     const doc = await this.findById(id, scope);
+    this.assertNotBeingCaptured(doc, opts.force);
 
     try {
       await this.runtime.remove(doc.name);
@@ -688,40 +855,149 @@ export class SandboxesService {
     const currentExpiresAtMs = new Date(doc.expiresAt).getTime();
     const newExpiresAtMs = currentExpiresAtMs + additionalSeconds * 1000;
 
-    const maxTtl = this.config.defaults.maxTtlSeconds;
-    const totalTtl =
-      (newExpiresAtMs - new Date((doc as any).createdAt).getTime()) / 1000;
-
-    if (totalTtl > maxTtl) {
+    if (newExpiresAtMs > this.ttlCeilingMs(doc)) {
       throw new BadRequestException(
-        `Total TTL would exceed maximum of ${maxTtl}s`,
+        `Total TTL would exceed maximum of ${this.config.defaults.maxTtlSeconds}s`,
       );
     }
 
     const newExpiresAt = new Date(newExpiresAtMs);
-    // Registry TTL is "seconds remaining from now" (redis EXPIRE), so convert.
-    await this.registry.extendTtl(
-      doc.sandboxId,
-      Math.max(1, Math.ceil((newExpiresAtMs - Date.now()) / 1000)),
-    );
-
     const updated = await this.sandboxRepo.updateById(
       (doc as any)._id.toString(),
       { $set: { expiresAt: newExpiresAt } },
       scope,
     );
 
-    if (this.ingressService?.isEnabled() && updated?.subdomain) {
+    await this.syncTtlSideEffects(updated!, newExpiresAt);
+
+    return updated!;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Auto-extension
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Renew a sandbox that is still being used, so a session does not die under
+   * the caller's hands mid-task.
+   *
+   * Only sandboxes created with `autoExtend: true` are eligible, and only when
+   * the action arrives inside the renewal window — a sandbox with plenty of
+   * time left is not touched, so this costs one date comparison on the hot
+   * path. Every action that reaches the sandbox counts as use: commands, file
+   * reads and writes, uploads and downloads.
+   *
+   * Runs *before* the action rather than after: a command issued with five
+   * seconds left would otherwise be reaped halfway through.
+   *
+   * Best-effort by construction — a sandbox that cannot be renewed (it hit
+   * `maxTtlSeconds`, Redis is down, another action won the race) still serves
+   * the action it was called for, so nothing here is allowed to throw.
+   */
+  private async maybeAutoExtend(doc: SandboxDocument): Promise<void> {
+    if (!doc.autoExtend) return;
+    if (doc.status !== SandboxStatus.RUNNING) return;
+
+    try {
+      const currentExpiresAt = new Date(doc.expiresAt);
+      const remainingMs = currentExpiresAt.getTime() - Date.now();
+      // Past the expiry the reaper owns this document — it may be inside
+      // `atomicExpire` right now — and moving `expiresAt` would leave a
+      // document reading RUNNING with its container already gone.
+      if (remainingMs <= 0 || remainingMs > this.autoExtendWindowMs) return;
+
+      const grantedMs = this.autoExtendGrantMs(doc, currentExpiresAt);
+      if (grantedMs <= 0) {
+        this.logger.debug(
+          `Sandbox ${doc.sandboxId} reached the ${this.config.defaults.maxTtlSeconds}s ` +
+            'TTL ceiling; not auto-extending',
+        );
+        return;
+      }
+
+      const newExpiresAt = new Date(currentExpiresAt.getTime() + grantedMs);
+      const updated = await this.sandboxRepo.atomicExtendExpiry(
+        (doc as any)._id.toString(),
+        currentExpiresAt,
+        newExpiresAt,
+      );
+      // Lost the compare-and-set: a concurrent action already renewed this
+      // sandbox (or the reaper moved it out of RUNNING). Either way there is
+      // nothing left to do.
+      if (!updated) return;
+
+      await this.syncTtlSideEffects(updated, newExpiresAt);
+      this.logger.log(
+        `Sandbox ${doc.sandboxId} auto-extended by ${Math.round(grantedMs / 1000)}s ` +
+          `on activity (expires ${newExpiresAt.toISOString()})`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Auto-extend failed for ${doc.sandboxId}: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  private get autoExtendWindowMs(): number {
+    const seconds =
+      this.config.defaults?.autoExtendWindowSeconds ??
+      DEFAULT_AUTO_EXTEND_WINDOW_SECONDS;
+    return seconds * 1000;
+  }
+
+  /**
+   * Latest instant a sandbox may be extended to, whether the extension was
+   * asked for explicitly or granted automatically.
+   *
+   * Measured from when the sandbox started serving its owner rather than from
+   * `createdAt`: for a sandbox claimed from the hot pool `createdAt` records
+   * when the pod was pre-warmed — potentially days earlier — which would leave
+   * it with no extension budget at all the moment it was handed out.
+   */
+  private ttlCeilingMs(doc: SandboxDocument): number {
+    const anchor = doc.claimedAt ?? (doc as any).createdAt;
+    return new Date(anchor).getTime() + this.config.defaults.maxTtlSeconds * 1000;
+  }
+
+  /**
+   * Milliseconds an auto-extension may add: another full `ttlSeconds`, clamped
+   * to the ceiling above. Zero once the ceiling is reached — the sandbox then
+   * expires normally, however busy it is.
+   */
+  private autoExtendGrantMs(doc: SandboxDocument, currentExpiresAt: Date): number {
+    const desiredMs = currentExpiresAt.getTime() + doc.ttlSeconds * 1000;
+    return Math.max(
+      0,
+      Math.min(desiredMs, this.ttlCeilingMs(doc)) - currentExpiresAt.getTime(),
+    );
+  }
+
+  /**
+   * Carry a new expiry over to everything that caches it: the Redis registry
+   * keyed by sandbox id, and the ingress mapping for a published sandbox.
+   * Neither is the source of truth (the document is), so a failure here is
+   * logged and not propagated.
+   */
+  private async syncTtlSideEffects(
+    doc: SandboxDocument,
+    newExpiresAt: Date,
+  ): Promise<void> {
+    // Registry TTL is "seconds remaining from now" (redis EXPIRE), so convert.
+    const remainingSeconds = Math.max(
+      1,
+      Math.ceil((newExpiresAt.getTime() - Date.now()) / 1000),
+    );
+    await this.registry.extendTtl(doc.sandboxId, remainingSeconds);
+
+    if (this.ingressService?.isEnabled() && doc.subdomain) {
       try {
-        await this.ingressService.refreshTtl(updated);
+        await this.ingressService.refreshTtl(doc);
       } catch (err) {
         this.logger.warn(
           `Ingress TTL refresh failed for ${doc.sandboxId}: ${(err as Error).message}`,
         );
       }
     }
-
-    return updated!;
   }
 
   async getStatus(id: string, scope: ExtensionScope) {
@@ -738,6 +1014,8 @@ export class SandboxesService {
       commandCount: doc.commandCount,
       remainingSeconds: Math.floor(remainingMs / 1000),
       expiresAt: doc.expiresAt,
+      ttlSeconds: doc.ttlSeconds,
+      autoExtend: doc.autoExtend ?? false,
       publicUrl: doc.publicUrl,
       createdAt: (doc as any).createdAt,
     };

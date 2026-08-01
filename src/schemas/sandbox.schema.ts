@@ -66,6 +66,17 @@ export class Sandbox {
   @Prop({ index: true })
   expiresAt: Date;
 
+  @ApiProperty({
+    description:
+      'Keep the session alive while it is being used: any command, file read/' +
+      'write, upload or download landing in the last ' +
+      '`defaults.autoExtendWindowSeconds` before `expiresAt` pushes the expiry ' +
+      'forward by another `ttlSeconds`. Still bounded by ' +
+      '`defaults.maxTtlSeconds`, so an active sandbox does not live forever.',
+  })
+  @Prop({ default: false })
+  autoExtend: boolean;
+
   @ApiProperty()
   @Prop()
   snapshotId: string;
@@ -115,6 +126,17 @@ export class Sandbox {
   })
   @Prop()
   stoppedReason?: string;
+
+  @ApiProperty({
+    description:
+      'Snapshot this sandbox is currently being captured into. Set for the ' +
+      'whole duration of a save so nothing tears the container down mid-tar: ' +
+      'stopping or removing a sandbox with a capture in flight kills the tar ' +
+      'with SIGKILL and loses the save.',
+    required: false,
+  })
+  @Prop()
+  savingSnapshotId?: string;
 
   @ApiProperty({
     description:

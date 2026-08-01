@@ -38,6 +38,18 @@ export class RestoreSnapshotDto {
   linked?: boolean;
 
   @ApiPropertyOptional({
+    default: false,
+    description:
+      'Keep the restored sandbox alive while it is in use. Mirrors ' +
+      '`autoExtend` on /sandboxes: an action arriving within ' +
+      '`defaults.autoExtendWindowSeconds` of the expiry renews it for another ' +
+      '`ttlSeconds`, capped by `defaults.maxTtlSeconds`.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  autoExtend?: boolean;
+
+  @ApiPropertyOptional({
     description:
       'Port inside the restored sandbox the public ingress proxy should ' +
       'forward HTTP traffic to. Defaults to the port captured in the ' +
@@ -48,4 +60,17 @@ export class RestoreSnapshotDto {
   @Min(1)
   @Max(65535)
   exposedHttpPort?: number;
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Restore even while a save into this snapshot is still running. Without ' +
+      'it such a restore is refused with 409 SNAPSHOT_SAVE_IN_PROGRESS, because ' +
+      'the caller would silently get the PREVIOUS contents. With it the restore ' +
+      'proceeds from that previous (complete) artifact and the caller accepts ' +
+      'that the sandbox may be out of sync with the save in flight.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  force?: boolean;
 }

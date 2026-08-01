@@ -55,6 +55,16 @@ export interface SandboxDefaultsConfig {
   maxTtlSeconds: number;
   ttlCheckIntervalMs: number;
   /**
+   * How close to `expiresAt` an action has to land for a sandbox created with
+   * `autoExtend: true` to renew itself. Anything arriving inside this window
+   * pushes the expiry forward by another `ttlSeconds`; anything earlier is
+   * left alone, so a busy sandbox is renewed once per lifetime rather than on
+   * every call. Keep it at or above `ttlCheckIntervalMs`, otherwise the reaper
+   * can claim the sandbox in the gap between the last action and the window.
+   * Default 30.
+   */
+  autoExtendWindowSeconds?: number;
+  /**
    * Per-command wall-clock budget for the persistent shell, in ms. A single
    * shell backs every command for a sandbox (REST exec + WebSocket terminal),
    * and commands are serialized — so a command that never returns (an
