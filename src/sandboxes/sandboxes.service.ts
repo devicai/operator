@@ -39,6 +39,15 @@ import { Readable } from 'stream';
  */
 const DEFAULT_AUTO_EXTEND_WINDOW_SECONDS = 30;
 
+/** How often a deferred stop checks whether the capture in flight is over. */
+const CAPTURE_POLL_MS = 2_000;
+/**
+ * Ceiling on that wait. Longer than any realistic capture (the largest observed
+ * is ~3.5 min for 800 MB) but finite, so a capture whose process died without
+ * clearing its flag cannot strand a container.
+ */
+const CAPTURE_WAIT_TIMEOUT_MS = 20 * 60_000;
+
 @Injectable()
 export class SandboxesService {
   private readonly logger = new Logger(SandboxesService.name);
@@ -617,7 +626,20 @@ export class SandboxesService {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
-    this.assertNotBeingCaptured(doc, opts.force);
+    // A capture is already reading this filesystem (a snapshot created with
+    // `async`, or a save from another path). An async caller does not need it
+    // to be over — it asked us to finish off-request, so we wait it out and
+    // tear down after. A synchronous one is refused rather than kept hanging.
+    if (doc.savingSnapshotId && !opts.force) {
+      if (!opts.async) this.assertNotBeingCaptured(doc, opts.force);
+      const stopping = await this.sandboxRepo.updateById(
+        (doc as any)._id.toString(),
+        { $set: { status: SandboxStatus.STOPPING } },
+        scope,
+      );
+      void this.waitForCaptureThenStop(doc, scope, reason);
+      return stopping ?? doc;
+    }
 
     const shouldSave = opts.save !== false && !!doc.snapshotId;
 
@@ -673,6 +695,44 @@ export class SandboxesService {
     } catch (err) {
       this.logger.error(
         `Background stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Wait for the capture in flight to clear the sandbox's flag, then tear the
+   * container down. No second save: the capture already running IS the save.
+   *
+   * Bounded — a capture that never finishes (its process died without clearing
+   * the flag, which the boot sweep only fixes on restart) must not leave the
+   * container running forever.
+   */
+  private async waitForCaptureThenStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<void> {
+    const deadline = Date.now() + CAPTURE_WAIT_TIMEOUT_MS;
+    try {
+      while (Date.now() < deadline) {
+        await new Promise((r) => setTimeout(r, CAPTURE_POLL_MS));
+        const fresh = await this.sandboxRepo
+          .findOne({ sandboxId: doc.sandboxId } as any, scope)
+          .catch(() => null);
+        if (!fresh) return;
+        if (!fresh.savingSnapshotId) {
+          await this.finishStop(fresh, scope, reason);
+          return;
+        }
+      }
+      this.logger.warn(
+        `Capture of ${doc.sandboxId} did not finish within ` +
+          `${CAPTURE_WAIT_TIMEOUT_MS}ms; stopping anyway`,
+      );
+      await this.finishStop(doc, scope, reason);
+    } catch (err) {
+      this.logger.error(
+        `Deferred stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
       );
     }
   }

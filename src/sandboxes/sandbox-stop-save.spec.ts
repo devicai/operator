@@ -45,6 +45,9 @@ const runningDoc = (over: Record<string, any> = {}) => ({
 });
 
 describe('SandboxesService.stop', () => {
+  beforeEach(() => jest.useFakeTimers({ doNotFake: ['setImmediate'] }));
+  afterEach(() => jest.useRealTimers());
+
   it('answers with "stopping" and finishes the save off-request when async', async () => {
     const { service, snapshotsService, sandboxRepo } = makeService(runningDoc());
 
@@ -92,6 +95,24 @@ describe('SandboxesService.stop', () => {
       response: { code: 'SNAPSHOT_SAVE_IN_PROGRESS' },
     });
     expect(registry.remove).not.toHaveBeenCalled();
+  });
+
+  it('waits out a capture in flight instead of refusing, when async', async () => {
+    // A client that snapshotted with `async` and then asked to stop wants the
+    // teardown to happen *after* the capture, not to be told to come back.
+    const doc = runningDoc({ savingSnapshotId: 'snap1' });
+    const { service, sandboxRepo, registry } = makeService(doc);
+    const fresh = { ...doc, savingSnapshotId: undefined };
+    (sandboxRepo as any).findOne = jest.fn().mockResolvedValue(fresh);
+
+    const result = await service.stop('sbx1', {}, undefined, { async: true });
+
+    expect(result.status).toBe(SandboxStatus.STOPPING);
+    expect(registry.remove).not.toHaveBeenCalled();
+    jest.advanceTimersByTime(2_500);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    expect(registry.remove).toHaveBeenCalled();
   });
 
   it('lets force through to abandon a stuck capture', async () => {
