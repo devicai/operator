@@ -9,6 +9,16 @@ export enum SnapshotStatus {
   FAILED = 'failed',
 }
 
+/**
+ * Whether a capture is currently writing this snapshot. Orthogonal to `status`
+ * because a snapshot being re-saved is still restorable: the previous artifact
+ * stays on disk untouched until the new one is renamed over it.
+ */
+export enum SnapshotSaveState {
+  IDLE = 'idle',
+  SAVING = 'saving',
+}
+
 @Schema({ timestamps: true, collection: 'snapshots' })
 export class Snapshot {
   @ApiProperty()
@@ -94,6 +104,29 @@ export class Snapshot {
   @ApiProperty()
   @Prop({ type: Object, default: {} })
   metadata: Record<string, any>;
+
+  @ApiProperty({
+    enum: SnapshotSaveState,
+    description:
+      "'saving' while a capture is writing this snapshot. The status stays " +
+      "READY throughout: the artifact on disk is the PREVIOUS capture and is " +
+      'complete and restorable (captures write to a temp file and rename), so ' +
+      'a caller that knowingly forces a restore gets the last saved version ' +
+      'rather than a truncated tarball.',
+  })
+  @Prop({ default: SnapshotSaveState.IDLE, enum: SnapshotSaveState })
+  saveState: SnapshotSaveState;
+
+  @ApiProperty({ required: false, description: 'When the current save started.' })
+  @Prop()
+  savingSince?: Date;
+
+  @ApiProperty({
+    required: false,
+    description: 'Sandbox whose filesystem the current save is capturing.',
+  })
+  @Prop()
+  savingSandboxId?: string;
 }
 
 export type SnapshotDocument = Snapshot & Document;

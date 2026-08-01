@@ -22,6 +22,7 @@ import { SandboxesService } from './sandboxes.service';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
 import { WriteFileDto } from './dto/write-file.dto';
+import { StopSandboxDto } from './dto/stop-sandbox.dto';
 import { uploadLimits } from '../config/upload-limits';
 
 /**
@@ -143,9 +144,19 @@ export class SandboxesController {
   }
 
   @Post(':id/stop')
-  @ApiOperation({ summary: 'Stop sandbox' })
-  stop(@Param('id') id: string, @Req() req: any) {
-    return this.service.stop(id, req.extensionScope ?? {});
+  @ApiOperation({
+    summary: 'Stop sandbox',
+    description:
+      'Persists the linked snapshot (unless save=false) and then tears the ' +
+      'container down. Use async=true for snapshots big enough that the ' +
+      'capture outlives an HTTP request.',
+  })
+  stop(
+    @Param('id') id: string,
+    @Body() dto: StopSandboxDto,
+    @Req() req: any,
+  ) {
+    return this.service.stop(id, req.extensionScope ?? {}, undefined, dto ?? {});
   }
 
   @Post(':id/extend-ttl')
@@ -248,7 +259,19 @@ export class SandboxesController {
   @Delete(':id')
   @HttpCode(204)
   @ApiOperation({ summary: 'Destroy sandbox' })
-  destroy(@Param('id') id: string, @Req() req: any) {
-    return this.service.destroy(id, req.extensionScope ?? {});
+  @ApiQuery({
+    name: 'force',
+    required: false,
+    description:
+      'Destroy even while a snapshot save is capturing this sandbox (kills it).',
+  })
+  destroy(
+    @Param('id') id: string,
+    @Req() req: any,
+    @Query('force') force?: string,
+  ) {
+    return this.service.destroy(id, req.extensionScope ?? {}, {
+      force: force === 'true',
+    });
   }
 }

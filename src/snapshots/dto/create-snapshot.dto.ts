@@ -1,5 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
-import { IsString, IsOptional, IsIn } from 'class-validator';
+import { IsString, IsOptional, IsIn, IsBoolean } from 'class-validator';
 
 export type SnapshotScope = 'full' | 'workdir';
 
@@ -29,4 +29,17 @@ export class CreateSnapshotDto {
   @IsOptional()
   @IsIn(['full', 'workdir'])
   scope?: SnapshotScope;
+
+  @ApiPropertyOptional({
+    description:
+      'Return as soon as the snapshot document exists (status "creating") and ' +
+      'capture in the background. A full capture of a large filesystem takes ' +
+      'minutes — longer than a typical reverse proxy will hold a request open ' +
+      '— so a synchronous call gets cut and the client cannot tell whether the ' +
+      'capture is still running. Poll GET /snapshots/:id for the final status.',
+    default: false,
+  })
+  @IsOptional()
+  @IsBoolean()
+  async?: boolean;
 }

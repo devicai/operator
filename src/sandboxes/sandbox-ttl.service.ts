@@ -93,13 +93,31 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
       this.logger.log(`Found ${expired.length} expired sandbox(es)`);
 
       for (const doc of expired) {
+        // Something is already capturing this filesystem (an async stop, a
+        // create). Leave it alone: expiring it here would remove the container
+        // out from under the tar. It reappears next tick, once the flag clears.
+        if (doc.savingSnapshotId) {
+          this.logger.log(
+            `Sandbox ${doc.sandboxId} expired but a snapshot save is in ` +
+              `flight; deferring reap`,
+          );
+          continue;
+        }
+
         const claimed = await this.sandboxRepo.atomicExpire(
           (doc as any)._id.toString(),
         );
         if (!claimed) continue;
 
         if (doc.snapshotId) {
-          await this.snapshotsService.persistToSnapshot(doc);
+          // Expiry saves too: a session that runs out of time keeps whatever
+          // it did, same as one closed on purpose.
+          const outcome = await this.snapshotsService.persistToSnapshot(doc);
+          if (outcome !== 'saved') {
+            this.logger.warn(
+              `Expiry save for ${doc.sandboxId} into ${doc.snapshotId}: ${outcome}`,
+            );
+          }
         }
 
         try {
