@@ -464,6 +464,23 @@ export class SnapshotsService implements OnModuleInit {
     options: { skipMemoryCheck: boolean; hotReserved: boolean },
   ): Promise<SandboxDocument> {
     const snapshot = await this.findById(snapshotId, scope);
+
+    // Its very first capture is still running: same situation as a re-save,
+    // except there is no previous version to fall back on — say so with the
+    // same code so callers handle one case, and let `force` fall through to the
+    // "not ready" error below rather than pretending there is something to
+    // restore.
+    if (snapshot.status === SnapshotStatus.CREATING && !dto.force) {
+      throw new ConflictException({
+        message:
+          'This snapshot is still being captured for the first time. There is ' +
+          'no previous version to start from yet.',
+        code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+        firstCapture: true,
+        snapshotId: snapshot.snapshotId,
+      });
+    }
+
     if (snapshot.status !== SnapshotStatus.READY) {
       throw new BadRequestException(
         `Snapshot is not ready (status: ${snapshot.status})`,
