@@ -94,6 +94,23 @@ describe('persistToSnapshot', () => {
     );
   });
 
+  it('records a failed background save on the snapshot itself', async () => {
+    // Nobody is waiting on the call by then: without this the session's work
+    // is lost with only a log line to show for it.
+    const { service, snapshotRepo } = makeService();
+    (service as any).captureFullToHost = jest
+      .fn()
+      .mockRejectedValue(new Error('tar failed (code=137)'));
+
+    await service.persistToSnapshot(sandboxDoc());
+
+    const recorded = snapshotRepo.updateById.mock.calls
+      .map(([, u]) => u?.$set ?? {})
+      .find((set: any) => set['metadata.lastSaveError']);
+    expect(recorded['metadata.lastSaveError']).toMatch(/137/);
+    expect(recorded['metadata.lastSaveErrorFrom']).toBe('sbx1');
+  });
+
   it('writes to a temp file and renames, leaving the old artifact readable', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'snap-save-'));
     const target = join(dir, 'snap1.tar.gz');

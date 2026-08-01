@@ -1007,6 +1007,9 @@ export class SnapshotsService implements OnModuleInit {
             'metadata.lastPersistedFrom': sandboxDoc.sandboxId,
             'metadata.lastPersistedAt': new Date().toISOString(),
             'metadata.currentCwd': sandboxDoc.currentCwd,
+            // A previous failure is history now.
+            'metadata.lastSaveError': null,
+            'metadata.lastSaveErrorAt': null,
             ...(persistScope === 'full'
               ? {
                   'metadata.deletes': this.capDeletes(deletes),
@@ -1023,9 +1026,26 @@ export class SnapshotsService implements OnModuleInit {
       );
       return 'saved';
     } catch (err) {
+      const message = (err as Error).message;
       this.logger.error(
-        `Failed to persist snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
+        `Failed to persist snapshot ${snapshotDoc.snapshotId}: ${message}`,
       );
+      // Nobody is waiting on this call any more — it runs after the response
+      // went out — so the failure has to be readable from the snapshot itself,
+      // or the session's work is lost without anyone being told.
+      try {
+        await this.snapshotRepo.updateById(
+          (snapshotDoc as any)._id.toString(),
+          {
+            $set: {
+              'metadata.lastSaveError': message,
+              'metadata.lastSaveErrorAt': new Date().toISOString(),
+              'metadata.lastSaveErrorFrom': sandboxDoc.sandboxId,
+            },
+          },
+          {},
+        );
+      } catch {}
       return 'failed';
     } finally {
       this.discardCapture(tmpPath);

@@ -1,0 +1,9 @@
+# Local E2E only: keep infra off the host ports the workstation already uses
+# for its own mongo/redis, and skip the frontend (nothing here drives the UI).
+services:
+  mongo:
+    ports: !override []
+  redis:
+    ports: !override []
+  frontend:
+    profiles: [never]
