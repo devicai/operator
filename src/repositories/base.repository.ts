@@ -109,6 +109,19 @@ export abstract class BaseRepository<T> {
     return this.updateOne({ _id: id } as FilterQuery<T>, update, scope);
   }
 
+  /**
+   * Unscoped bulk update, for maintenance that is inherently cross-tenant
+   * (e.g. reclaiming work a restart interrupted, where there is no request
+   * scope to apply). Returns how many documents changed.
+   */
+  async updateMany(
+    filter: FilterQuery<T>,
+    update: UpdateQuery<T>,
+  ): Promise<number> {
+    const result = await this.model.updateMany(filter, update).exec();
+    return result.modifiedCount ?? 0;
+  }
+
   async deleteOne(filter: FilterQuery<T>, scope: ExtensionScope): Promise<boolean> {
     const result = await this.model.deleteOne(this.applyScope(filter, scope)).exec();
     return result.deletedCount > 0;

@@ -4,6 +4,8 @@ import {
   Logger,
   NotFoundException,
   BadRequestException,
+  ConflictException,
+  OnModuleInit,
   Optional,
 } from '@nestjs/common';
 import { nanoid } from 'nanoid';
@@ -12,6 +14,8 @@ import { join } from 'path';
 import {
   existsSync,
   mkdirSync,
+  readdirSync,
+  renameSync,
   statSync,
   unlinkSync,
   createReadStream,
@@ -24,7 +28,11 @@ import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from '../sandboxes/sandbox-registry';
 import { IngressService } from '../ingress/ingress.service';
-import { SnapshotDocument, SnapshotStatus } from '../schemas/snapshot.schema';
+import {
+  SnapshotDocument,
+  SnapshotSaveState,
+  SnapshotStatus,
+} from '../schemas/snapshot.schema';
 import { SandboxDocument, SandboxStatus } from '../schemas/sandbox.schema';
 import { ExtensionScope, PaginatedResponse } from '../interfaces';
 import { ModuleConfig } from '../config/config.types';
@@ -60,10 +68,23 @@ const GZIP_LEVEL = 9;
  */
 const MAX_PERSISTED_DELETES = 20000;
 
+/**
+ * Suffix of the file a capture writes to before it is renamed over the real
+ * artifact. Also the marker the boot sweep uses to reclaim leftovers.
+ */
+const SAVING_SUFFIX = '.saving-';
+
 type Codec = 'zstd' | 'gzip';
 
+/**
+ * What a save attempt did. Persisting is best-effort by design (a failed save
+ * must never block a stop), so callers that DO care — the stop endpoint — read
+ * this instead of relying on an exception.
+ */
+export type SnapshotSaveOutcome = 'saved' | 'skipped' | 'conflict' | 'failed';
+
 @Injectable()
-export class SnapshotsService {
+export class SnapshotsService implements OnModuleInit {
   private readonly logger = new Logger(SnapshotsService.name);
 
   constructor(
@@ -78,6 +99,94 @@ export class SnapshotsService {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
     }
+  }
+
+  /**
+   * Reclaim captures that a restart interrupted. Nothing survives the process
+   * that was running them, so any `saving` snapshot or `creating` document
+   * found at boot is dead: its temp file is garbage and its flag would
+   * otherwise block every future save and force-less restore forever.
+   *
+   * Safe because the module owns its captures in-process — there is no other
+   * writer that could legitimately be mid-save while we boot.
+   */
+  async onModuleInit(): Promise<void> {
+    try {
+      const stale = await this.snapshotRepo.updateMany(
+        { saveState: SnapshotSaveState.SAVING } as any,
+        {
+          $set: { saveState: SnapshotSaveState.IDLE },
+          $unset: { savingSince: '', savingSandboxId: '' },
+        },
+      );
+      const orphanedCreates = await this.snapshotRepo.updateMany(
+        { status: SnapshotStatus.CREATING } as any,
+        { $set: { status: SnapshotStatus.FAILED } },
+      );
+      const files = this.sweepPartialCaptures();
+      if (stale || orphanedCreates || files) {
+        this.logger.log(
+          `Reclaimed interrupted captures at boot: ${stale} saving, ` +
+            `${orphanedCreates} creating, ${files} partial file(s) removed`,
+        );
+      }
+    } catch (err) {
+      // Never keep the module from booting over a cleanup.
+      this.logger.warn(
+        `Could not reclaim interrupted captures: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /** Delete `*.saving-*` leftovers in the snapshots dir. Returns how many. */
+  private sweepPartialCaptures(): number {
+    let removed = 0;
+    for (const dir of [SNAPSHOTS_DIR]) {
+      if (!existsSync(dir)) continue;
+      for (const entry of readdirSync(dir)) {
+        if (!entry.includes(SAVING_SUFFIX)) continue;
+        try {
+          unlinkSync(join(dir, entry));
+          removed++;
+        } catch {}
+      }
+    }
+    return removed;
+  }
+
+  /**
+   * Where a capture writes before it becomes the artifact of record. Captures
+   * must never write the final path directly: a restore that lands mid-write
+   * would read a truncated tarball, and a crash would leave one behind. The
+   * rename at the end is atomic, so readers see either the previous capture or
+   * the new one, never a half-written file.
+   */
+  private tempCapturePath(targetPath: string, id: string): string {
+    return `${targetPath}${SAVING_SUFFIX}${id}`;
+  }
+
+  /** Rename a finished capture over its final path, failing if it is empty. */
+  private commitCapture(tmpPath: string, targetPath: string): number {
+    let size = 0;
+    try {
+      size = statSync(tmpPath).size;
+    } catch {
+      throw new Error('capture produced no artifact');
+    }
+    if (size === 0) throw new Error('capture produced an empty artifact');
+    renameSync(tmpPath, targetPath);
+    return size;
+  }
+
+  private discardCapture(tmpPath: string): void {
+    try {
+      if (existsSync(tmpPath)) unlinkSync(tmpPath);
+    } catch {}
+    // zstd stages an uncompressed tar next to the target before compressing.
+    try {
+      const raw = `${tmpPath}.rawtar`;
+      if (existsSync(raw)) unlinkSync(raw);
+    } catch {}
   }
 
   /**
@@ -190,6 +299,50 @@ export class SnapshotsService {
       scope,
     );
 
+    // Async mode hands back the `creating` document straight away and captures
+    // in the background: a full capture of a large filesystem runs for minutes,
+    // and a proxy that times the request out mid-capture leaves the caller
+    // guessing (and, if it then stops the sandbox, kills the tar). Callers poll
+    // GET /snapshots/:id for the outcome.
+    if (dto.async) {
+      void this.runCreateCapture(
+        doc,
+        sandbox,
+        sandboxDoc,
+        captureScope,
+        codec,
+        snapshotPath,
+        scope,
+      ).catch(() => undefined);
+      return doc;
+    }
+
+    return this.runCreateCapture(
+      doc,
+      sandbox,
+      sandboxDoc,
+      captureScope,
+      codec,
+      snapshotPath,
+      scope,
+    );
+  }
+
+  private async runCreateCapture(
+    doc: SnapshotDocument,
+    sandbox: RuntimeSandbox,
+    sandboxDoc: SandboxDocument,
+    captureScope: SnapshotScope,
+    codec: Codec,
+    snapshotPath: string,
+    scope: ExtensionScope,
+  ): Promise<SnapshotDocument> {
+    const snapshotId = doc.snapshotId;
+    const tmpPath = this.tempCapturePath(snapshotPath, snapshotId);
+    // Same protection as a persist: while we read this container's filesystem,
+    // nothing may stop or remove it.
+    await this.markSandboxSaving(sandboxDoc, snapshotId);
+
     try {
       this.logger.log(
         `Creating ${captureScope} snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
@@ -204,7 +357,7 @@ export class SnapshotsService {
           sandboxDoc.workdir,
           snapshotId,
           codec,
-          snapshotPath,
+          tmpPath,
         );
         deletes = result.deletes;
         captureMeta = result.stats;
@@ -213,14 +366,11 @@ export class SnapshotsService {
           sandbox,
           sandboxDoc.workdir,
           snapshotId,
-          snapshotPath,
+          tmpPath,
         );
       }
 
-      let sizeBytes = 0;
-      try {
-        sizeBytes = statSync(snapshotPath).size;
-      } catch {}
+      const sizeBytes = this.commitCapture(tmpPath, snapshotPath);
 
       const updated = await this.snapshotRepo.updateById(
         (doc as any)._id.toString(),
@@ -251,6 +401,7 @@ export class SnapshotsService {
         scope,
       );
       // Best-effort cleanup of a partially written artifact.
+      this.discardCapture(tmpPath);
       try {
         if (existsSync(snapshotPath)) unlinkSync(snapshotPath);
       } catch {}
@@ -258,6 +409,8 @@ export class SnapshotsService {
         `Snapshot ${snapshotId} failed: ${(err as Error).message}`,
       );
       throw err;
+    } finally {
+      await this.clearSandboxSaving(sandboxDoc);
     }
   }
 
@@ -315,6 +468,22 @@ export class SnapshotsService {
       throw new BadRequestException(
         `Snapshot is not ready (status: ${snapshot.status})`,
       );
+    }
+
+    // A save in flight means the artifact on disk is still the PREVIOUS
+    // capture. Restoring from it is a legitimate choice (it is complete and
+    // consistent), but never a silent one: the caller would get a sandbox that
+    // is missing whatever the running save is about to commit.
+    if (snapshot.saveState === SnapshotSaveState.SAVING && !dto.force) {
+      throw new ConflictException({
+        message:
+          'A save into this snapshot is still in progress. Restore with ' +
+          'force=true to start from the last saved version instead.',
+        code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+        snapshotId: snapshot.snapshotId,
+        savingSince: snapshot.savingSince,
+        savingSandboxId: snapshot.savingSandboxId,
+      });
     }
 
     const onDiskPath = this.resolveSnapshotPath(snapshot.snapshotPath);
@@ -683,8 +852,10 @@ export class SnapshotsService {
    * Called automatically when a snapshot-linked sandbox is stopped or expires.
    * Re-captures with the same scope/codec the snapshot was created with.
    */
-  async persistToSnapshot(sandboxDoc: SandboxDocument): Promise<void> {
-    if (!sandboxDoc.snapshotId) return;
+  async persistToSnapshot(
+    sandboxDoc: SandboxDocument,
+  ): Promise<SnapshotSaveOutcome> {
+    if (!sandboxDoc.snapshotId) return 'skipped';
 
     let snapshotDoc: SnapshotDocument | null;
     try {
@@ -700,12 +871,55 @@ export class SnapshotsService {
       this.logger.warn(
         `Snapshot ${sandboxDoc.snapshotId} not found or not ready, skipping persist`,
       );
-      return;
+      return 'skipped';
     }
+
+    // Claim the snapshot before touching anything. Two sessions saving into the
+    // same snapshot would interleave their tars over one file; the loser is
+    // told so rather than silently corrupting the winner's artifact.
+    const claimed = await this.snapshotRepo.updateOne(
+      {
+        snapshotId: snapshotDoc.snapshotId,
+        saveState: { $ne: SnapshotSaveState.SAVING },
+      } as any,
+      {
+        $set: {
+          saveState: SnapshotSaveState.SAVING,
+          savingSince: new Date(),
+          savingSandboxId: sandboxDoc.sandboxId,
+        },
+      },
+      {},
+    );
+    if (!claimed) {
+      this.logger.warn(
+        `Snapshot ${snapshotDoc.snapshotId} is already being saved by ` +
+          `${snapshotDoc.savingSandboxId ?? 'another sandbox'}; skipping ` +
+          `persist from ${sandboxDoc.sandboxId}`,
+      );
+      return 'conflict';
+    }
+    snapshotDoc = claimed;
+
+    // Mirrored on the sandbox so stop/destroy can refuse to tear down a
+    // container whose filesystem is being read right now.
+    await this.markSandboxSaving(sandboxDoc, snapshotDoc.snapshotId);
 
     const persistScope: SnapshotScope =
       (snapshotDoc.scope as SnapshotScope) ?? 'workdir';
     const codec: Codec = (snapshotDoc.compression as Codec) ?? 'gzip';
+
+    // Always write to the canonical (current) location even if the snapshot
+    // was originally created under the legacy path.
+    const targetPath = snapshotDoc.snapshotPath.includes(
+      '/.microsandbox/snapshots/',
+    )
+      ? snapshotDoc.snapshotPath.replace(
+          '/.microsandbox/snapshots/',
+          '/.devic-sandbox/snapshots/',
+        )
+      : snapshotDoc.snapshotPath;
+    const tmpPath = this.tempCapturePath(targetPath, sandboxDoc.sandboxId);
 
     try {
       this.logger.log(
@@ -719,20 +933,9 @@ export class SnapshotsService {
         this.logger.warn(
           `Sandbox ${sandboxDoc.sandboxId} not running (status: ${handle?.status ?? 'missing'}), skipping persist`,
         );
-        return;
+        return 'skipped';
       }
       const sandbox = await handle.connect();
-
-      // Always write to the canonical (current) location even if the snapshot
-      // was originally created under the legacy path.
-      const targetPath = snapshotDoc.snapshotPath.includes(
-        '/.microsandbox/snapshots/',
-      )
-        ? snapshotDoc.snapshotPath.replace(
-            '/.microsandbox/snapshots/',
-            '/.devic-sandbox/snapshots/',
-          )
-        : snapshotDoc.snapshotPath;
 
       if (targetPath !== snapshotDoc.snapshotPath && !existsSync(SNAPSHOTS_DIR)) {
         mkdirSync(SNAPSHOTS_DIR, { recursive: true });
@@ -747,7 +950,7 @@ export class SnapshotsService {
           sandboxDoc.workdir,
           sandboxDoc.sandboxId,
           codec,
-          targetPath,
+          tmpPath,
         );
         deletes = result.deletes;
         captureMeta = result.stats;
@@ -756,9 +959,13 @@ export class SnapshotsService {
           sandbox,
           sandboxDoc.workdir,
           sandboxDoc.sandboxId,
-          targetPath,
+          tmpPath,
         );
       }
+
+      // The previous artifact stays readable until this rename: anything that
+      // restored (with force) while we were capturing got a whole tarball.
+      const sizeBytes = this.commitCapture(tmpPath, targetPath);
 
       // If we migrated the path, drop the legacy file to avoid drift.
       if (
@@ -769,11 +976,6 @@ export class SnapshotsService {
           unlinkSync(snapshotDoc.snapshotPath);
         } catch {}
       }
-
-      let sizeBytes = 0;
-      try {
-        sizeBytes = statSync(targetPath).size;
-      } catch {}
 
       await this.snapshotRepo.updateById(
         (snapshotDoc as any)._id.toString(),
@@ -798,11 +1000,65 @@ export class SnapshotsService {
       this.logger.log(
         `Snapshot ${snapshotDoc.snapshotId} updated from sandbox ${sandboxDoc.sandboxId} (${(sizeBytes / 1024).toFixed(1)} KB)`,
       );
+      return 'saved';
     } catch (err) {
       this.logger.error(
         `Failed to persist snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
       );
+      return 'failed';
+    } finally {
+      this.discardCapture(tmpPath);
+      await this.releaseSnapshotSave(snapshotDoc, sandboxDoc);
     }
+  }
+
+  /** Flag the sandbox as being captured, so stop/destroy refuse to kill it. */
+  private async markSandboxSaving(
+    sandboxDoc: SandboxDocument,
+    snapshotId: string,
+  ): Promise<void> {
+    try {
+      await this.sandboxRepo.updateById(
+        (sandboxDoc as any)._id.toString(),
+        { $set: { savingSnapshotId: snapshotId } },
+        {},
+      );
+      (sandboxDoc as any).savingSnapshotId = snapshotId;
+    } catch {}
+  }
+
+  /** Clear the capture flag on the sandbox. Never throws. */
+  private async clearSandboxSaving(sandboxDoc: SandboxDocument): Promise<void> {
+    try {
+      await this.sandboxRepo.updateById(
+        (sandboxDoc as any)._id.toString(),
+        { $unset: { savingSnapshotId: '' } },
+        {},
+      );
+      (sandboxDoc as any).savingSnapshotId = undefined;
+    } catch {}
+  }
+
+  /** Release the save claim on both documents. Never throws. */
+  private async releaseSnapshotSave(
+    snapshotDoc: SnapshotDocument,
+    sandboxDoc: SandboxDocument,
+  ): Promise<void> {
+    try {
+      await this.snapshotRepo.updateById(
+        (snapshotDoc as any)._id.toString(),
+        {
+          $set: { saveState: SnapshotSaveState.IDLE },
+          $unset: { savingSince: '', savingSandboxId: '' },
+        },
+        {},
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not clear save state on snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
+      );
+    }
+    await this.clearSandboxSaving(sandboxDoc);
   }
 
   // ---------------------------------------------------------------------------

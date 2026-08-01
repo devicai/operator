@@ -317,6 +317,27 @@ The restore endpoint accepts a `linked` flag:
 - **`linked: true`** (default) — Sandbox stays linked to the snapshot. On stop or TTL expiry, changes are automatically persisted back to the snapshot.
 - **`linked: false`** — Fully independent sandbox (fork). The snapshot remains unchanged regardless of what happens in the sandbox.
 
+#### Saving a big snapshot
+
+Capturing a large filesystem takes minutes — longer than most reverse proxies
+will hold a request open. Two options keep that off the request path:
+
+- `POST /api/v1/sandboxes/:id/stop` with `{"async": true}` — the sandbox goes to
+  `stopping`, the response comes back immediately, and the save runs in the
+  background. The container is torn down **after** the capture finishes; killing
+  it mid-capture SIGKILLs the tar and loses the save. Add `{"save": false}` to
+  close a session without keeping its changes.
+- `POST /api/v1/snapshots` with `{"async": true}` — returns the `creating`
+  document; poll `GET /api/v1/snapshots/:id` for the outcome.
+
+While a save runs, the snapshot carries `saveState: "saving"` and its artifact
+on disk is still the **previous** capture (captures write to a temp file and are
+renamed into place, so a reader never sees a half-written tarball). Restoring
+from it in that window is refused with `409 SNAPSHOT_SAVE_IN_PROGRESS` unless the
+caller passes `force: true`, which starts from that last saved version and
+accepts being out of sync with the save in flight. Stopping or destroying a
+sandbox whose filesystem is being captured is refused the same way.
+
 ### Sandbox Profiles
 
 | Method | Endpoint | Description |

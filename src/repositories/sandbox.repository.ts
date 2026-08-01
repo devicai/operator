@@ -133,14 +133,22 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
     const rows = await this.model
       .find(
         {
-          status: {
-            $in: [
-              SandboxStatus.PENDING,
-              SandboxStatus.CREATING,
-              SandboxStatus.RUNNING,
-              SandboxStatus.STOPPING,
-            ],
-          },
+          $or: [
+            {
+              status: {
+                $in: [
+                  SandboxStatus.PENDING,
+                  SandboxStatus.CREATING,
+                  SandboxStatus.RUNNING,
+                  SandboxStatus.STOPPING,
+                ],
+              },
+            },
+            // A sandbox being captured must survive the sweep whatever its
+            // status says: the TTL reaper marks it `expired` BEFORE persisting,
+            // and removing the container mid-tar kills the save.
+            { savingSnapshotId: { $exists: true, $ne: null } },
+          ],
         },
         { name: 1 },
       )

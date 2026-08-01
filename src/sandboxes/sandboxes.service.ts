@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger, NotFoundException, BadRequestException, forwardRef, Optional } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException, BadRequestException, ConflictException, forwardRef, Optional } from '@nestjs/common';
 import * as net from 'net';
 import { nanoid } from 'nanoid';
 import { SandboxRegistry } from './sandbox-registry';
@@ -10,6 +10,7 @@ import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
 import { CreateSandboxDto } from './dto/create-sandbox.dto';
 import { RunCommandDto } from './dto/run-command.dto';
+import { StopSandboxDto } from './dto/stop-sandbox.dto';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ResourceUsageService } from '../providers/resource-usage.service';
 import { HotPoolService } from '../hot-pool/hot-pool.service';
@@ -609,16 +610,91 @@ export class SandboxesService {
     id: string,
     scope: ExtensionScope,
     reason?: string,
+    opts: StopSandboxDto = {},
   ): Promise<SandboxDocument> {
     const doc = await this.findById(id, scope);
     if (doc.status !== SandboxStatus.RUNNING) {
       throw new BadRequestException(`Sandbox is not running (status: ${doc.status})`);
     }
 
-    if (doc.snapshotId) {
-      await this.snapshotsService.persistToSnapshot(doc);
+    this.assertNotBeingCaptured(doc, opts.force);
+
+    const shouldSave = opts.save !== false && !!doc.snapshotId;
+
+    // Async stop: claim the work, answer now, finish off-request. The save and
+    // the teardown stay in this order and in one place — a caller that saved
+    // over HTTP and then stopped separately used to race its own capture, and
+    // stopping the container SIGKILLs the tar reading its filesystem.
+    if (shouldSave && opts.async) {
+      const stopping = await this.sandboxRepo.updateById(
+        (doc as any)._id.toString(),
+        { $set: { status: SandboxStatus.STOPPING } },
+        scope,
+      );
+      void this.saveThenStop(doc, scope, reason);
+      return stopping ?? doc;
     }
 
+    if (shouldSave) {
+      const outcome = await this.snapshotsService.persistToSnapshot(doc);
+      if (outcome === 'conflict') {
+        throw new ConflictException({
+          message:
+            'Another save into this sandbox snapshot is already running. ' +
+            'Retry once it finishes.',
+          code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+          snapshotId: doc.snapshotId,
+        });
+      }
+    }
+
+    return this.finishStop(doc, scope, reason);
+  }
+
+  /**
+   * Background half of an async stop: persist, then tear down no matter how the
+   * save went. A failed save must not leave the sandbox running forever — the
+   * caller already got its answer and nothing else will come back for it.
+   */
+  private async saveThenStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<void> {
+    try {
+      await this.snapshotsService.persistToSnapshot(doc);
+    } catch (err) {
+      this.logger.error(
+        `Background save for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+    try {
+      await this.finishStop(doc, scope, reason);
+    } catch (err) {
+      this.logger.error(
+        `Background stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /** Refuse to tear down a container whose filesystem is being captured. */
+  private assertNotBeingCaptured(doc: SandboxDocument, force?: boolean): void {
+    if (!doc.savingSnapshotId || force) return;
+    throw new ConflictException({
+      message:
+        'A snapshot save is capturing this sandbox. Tearing it down now would ' +
+        'kill the capture and lose the save. Retry once it finishes, or pass ' +
+        'force=true to abandon it.',
+      code: 'SNAPSHOT_SAVE_IN_PROGRESS',
+      snapshotId: doc.savingSnapshotId,
+    });
+  }
+
+  private async finishStop(
+    doc: SandboxDocument,
+    scope: ExtensionScope,
+    reason?: string,
+  ): Promise<SandboxDocument> {
     try {
       // Address the container through the document, not the Redis registry:
       // the registry key expires with the TTL and a lapsed key would leave the
@@ -669,8 +745,13 @@ export class SandboxesService {
     return updated!;
   }
 
-  async destroy(id: string, scope: ExtensionScope): Promise<void> {
+  async destroy(
+    id: string,
+    scope: ExtensionScope,
+    opts: { force?: boolean } = {},
+  ): Promise<void> {
     const doc = await this.findById(id, scope);
+    this.assertNotBeingCaptured(doc, opts.force);
 
     try {
       await this.runtime.remove(doc.name);
