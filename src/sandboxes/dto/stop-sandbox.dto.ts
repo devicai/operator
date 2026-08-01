@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsOptional } from 'class-validator';
+import { IsBoolean, IsOptional, IsString } from 'class-validator';
 
 export class StopSandboxDto {
   @ApiPropertyOptional({
@@ -12,6 +12,16 @@ export class StopSandboxDto {
   @IsOptional()
   @IsBoolean()
   save?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Snapshot to save into, when the caller wants to name it rather than ' +
+      'rely on the link the sandbox was restored with. Required to save a ' +
+      'sandbox that was restored unlinked; must otherwise match the linked one.',
+  })
+  @IsOptional()
+  @IsString()
+  snapshotId?: string;
 
   @ApiPropertyOptional({
     default: false,

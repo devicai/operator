@@ -871,13 +871,17 @@ export class SnapshotsService implements OnModuleInit {
    */
   async persistToSnapshot(
     sandboxDoc: SandboxDocument,
+    targetSnapshotId?: string,
   ): Promise<SnapshotSaveOutcome> {
-    if (!sandboxDoc.snapshotId) return 'skipped';
+    // Callers may name the snapshot instead of relying on the link the sandbox
+    // was restored with — the only way to save a sandbox restored unlinked.
+    const snapshotId = targetSnapshotId ?? sandboxDoc.snapshotId;
+    if (!snapshotId) return 'skipped';
 
     let snapshotDoc: SnapshotDocument | null;
     try {
       snapshotDoc = await this.snapshotRepo.findOne(
-        { snapshotId: sandboxDoc.snapshotId } as any,
+        { snapshotId } as any,
         {},
       );
     } catch {
@@ -886,7 +890,7 @@ export class SnapshotsService implements OnModuleInit {
 
     if (!snapshotDoc || snapshotDoc.status !== SnapshotStatus.READY) {
       this.logger.warn(
-        `Snapshot ${sandboxDoc.snapshotId} not found or not ready, skipping persist`,
+        `Snapshot ${snapshotId} not found or not ready, skipping persist`,
       );
       return 'skipped';
     }

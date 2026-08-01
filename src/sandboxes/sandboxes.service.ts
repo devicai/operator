@@ -641,7 +641,8 @@ export class SandboxesService {
       return stopping ?? doc;
     }
 
-    const shouldSave = opts.save !== false && !!doc.snapshotId;
+    const saveTarget = opts.snapshotId ?? doc.snapshotId;
+    const shouldSave = opts.save !== false && !!saveTarget;
 
     // Async stop: claim the work, answer now, finish off-request. The save and
     // the teardown stay in this order and in one place — a caller that saved
@@ -653,19 +654,22 @@ export class SandboxesService {
         { $set: { status: SandboxStatus.STOPPING } },
         scope,
       );
-      void this.saveThenStop(doc, scope, reason);
+      void this.saveThenStop(doc, scope, reason, saveTarget);
       return stopping ?? doc;
     }
 
     if (shouldSave) {
-      const outcome = await this.snapshotsService.persistToSnapshot(doc);
+      const outcome = await this.snapshotsService.persistToSnapshot(
+        doc,
+        saveTarget,
+      );
       if (outcome === 'conflict') {
         throw new ConflictException({
           message:
             'Another save into this sandbox snapshot is already running. ' +
             'Retry once it finishes.',
           code: 'SNAPSHOT_SAVE_IN_PROGRESS',
-          snapshotId: doc.snapshotId,
+          snapshotId: saveTarget,
         });
       }
     }
@@ -682,9 +686,10 @@ export class SandboxesService {
     doc: SandboxDocument,
     scope: ExtensionScope,
     reason?: string,
+    targetSnapshotId?: string,
   ): Promise<void> {
     try {
-      await this.snapshotsService.persistToSnapshot(doc);
+      await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId);
     } catch (err) {
       this.logger.error(
         `Background save for ${doc.sandboxId} failed: ${(err as Error).message}`,
