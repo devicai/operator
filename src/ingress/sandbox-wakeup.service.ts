@@ -1,4 +1,5 @@
 import { Inject, Injectable, Logger } from '@nestjs/common';
+import * as net from 'net';
 import { CONFIG } from '../config/config.loader';
 import { ModuleConfig } from '../config/config.types';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
@@ -10,6 +11,8 @@ const DEFAULT_CLAIM_SECONDS = 300;
 const DEFAULT_TIMEOUT_SECONDS = 120;
 /** How long an error is shown to visitors before a retry may claim again. */
 const ERROR_TTL_SECONDS = 30;
+/** Budget for the "is anything listening yet?" probe. Runs on every poll. */
+const PROBE_TIMEOUT_MS = 1000;
 
 /**
  * Restores a snapshot when someone visits its public URL and nothing is
@@ -150,16 +153,33 @@ export class SandboxWakeupService {
   }
 
   /**
-   * What the waiting page should do next. `ready` is decided by the routing
-   * registry rather than by our own bookkeeping: the sandbox is reachable
-   * exactly when the proxy can route to it.
+   * What the waiting page should do next.
+   *
+   * `ready` means a TCP connection to the upstream succeeds — NOT merely that a
+   * route exists. The route is written the moment the sandbox is published,
+   * which happens well before anything inside it listens; reporting ready then
+   * makes the page reload straight into a 502. Since a snapshot restores files
+   * and not processes, that gap is the normal case rather than a race.
    */
   async status(subdomain: string): Promise<WakeStatus> {
     const entry = await this.registry.lookup(subdomain).catch(() => null);
-    if (entry) return { state: 'ready' };
+    if (entry) {
+      const answering = await this.isAnswering(
+        entry.upstreamHost,
+        entry.upstreamPort,
+      );
+      if (answering) return { state: 'ready' };
+      // Routed but silent: keep waiting. Someone may still start the service,
+      // and the page reloads as soon as they do.
+    }
 
     const wakeup = await this.registry.getWakeup(subdomain).catch(() => null);
-    if (!wakeup) return { state: 'idle' };
+    if (!wakeup) {
+      // No route answering and no wake-up recorded. When a sandbox IS routed
+      // the visitor is simply waiting on a service that has not come up, which
+      // reads as 'starting' — the page's own timeout ends the wait.
+      return entry ? { state: 'starting' } : { state: 'idle' };
+    }
     if (wakeup.state === 'error') {
       return { state: 'error', message: wakeup.message };
     }
@@ -170,5 +190,21 @@ export class SandboxWakeupService {
         Math.round((Date.now() - new Date(wakeup.startedAt).getTime()) / 1000),
       ),
     };
+  }
+
+  /** Whether anything accepts a TCP connection on the sandbox's HTTP port. */
+  private isAnswering(host: string, port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const socket = net.connect({ host, port });
+      const done = (result: boolean) => {
+        socket.removeAllListeners();
+        socket.destroy();
+        resolve(result);
+      };
+      socket.setTimeout(PROBE_TIMEOUT_MS);
+      socket.once('connect', () => done(true));
+      socket.once('timeout', () => done(false));
+      socket.once('error', () => done(false));
+    });
   }
 }

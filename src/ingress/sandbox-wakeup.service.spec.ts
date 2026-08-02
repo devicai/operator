@@ -1,4 +1,6 @@
 import { Test, TestingModule } from '@nestjs/testing';
+import { Server, createServer } from 'net';
+import { AddressInfo } from 'net';
 import { CONFIG } from '../config/config.loader';
 import { ModuleConfig } from '../config/config.types';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
@@ -198,9 +200,43 @@ describe('SandboxWakeupService', () => {
   });
 
   describe('status', () => {
-    it('reports ready from the routing table, not from its own bookkeeping', async () => {
-      routes.set('my-app', { sandboxId: 'box', upstreamHost: 'h', upstreamPort: 80 });
+    /** A listening socket, so 'ready' can be told apart from 'merely routed'. */
+    const listeners: Server[] = [];
+    const listen = async (): Promise<number> => {
+      const server = createServer(() => undefined);
+      await new Promise<void>((r) => server.listen(0, '127.0.0.1', r));
+      listeners.push(server);
+      return (server.address() as AddressInfo).port;
+    };
+
+    afterEach(async () => {
+      await Promise.all(
+        listeners.splice(0).map((s) => new Promise((r) => s.close(r))),
+      );
+    });
+
+    it('reports ready only once the port actually answers', async () => {
+      const port = await listen();
+      routes.set('my-app', {
+        sandboxId: 'box',
+        upstreamHost: '127.0.0.1',
+        upstreamPort: port,
+      });
       expect(await service.status('my-app')).toEqual({ state: 'ready' });
+    });
+
+    // The route is written when the sandbox is published, which is well before
+    // anything inside it listens. Reporting ready there sends the waiting page
+    // reloading straight into a 502 — and since a snapshot restores files, not
+    // processes, that is the normal case rather than a race.
+    it('keeps waiting when the sandbox is routed but nothing is listening', async () => {
+      routes.set('my-app', {
+        sandboxId: 'box',
+        // Port 1 on loopback: nothing binds it, so the connection is refused.
+        upstreamHost: '127.0.0.1',
+        upstreamPort: 1,
+      });
+      expect(await service.status('my-app')).toEqual({ state: 'starting' });
     });
 
     it('reports idle when nothing is happening', async () => {
