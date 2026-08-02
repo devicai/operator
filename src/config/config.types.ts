@@ -418,4 +418,38 @@ export interface IngressConfig {
    * `expiresAt`, capped at 24h.
    */
   registryMaxTtlSeconds?: number;
+
+  /**
+   * Restore a snapshot automatically when its public URL is visited and no
+   * sandbox is serving it, showing a waiting page until the service answers.
+   *
+   * Master switch for the behaviour; individual snapshots opt out with their
+   * own `autoRestart: false`. Default true — a URL that silently 404s once the
+   * sandbox stops is the behaviour this replaces.
+   *
+   * Note this makes an unauthenticated request able to allocate a sandbox
+   * (memory, disk, a container). It is bounded by `resourceLimits` like any
+   * other restore, and by `autoRestartTtlSeconds` below, but on a host whose
+   * subdomains are guessable it is a lever worth knowing about.
+   */
+  autoRestart?: boolean;
+  /**
+   * TTL (s) granted to a sandbox restored by a visit. Deliberately shorter than
+   * `defaults.defaultTtlSeconds`: nobody asked for this sandbox explicitly, so
+   * it should not outlive the interest that woke it. Default 1800.
+   */
+  autoRestartTtlSeconds?: number;
+  /**
+   * How long (s) a wake-up may hold its claim before another visitor may retry.
+   * Must exceed the slowest restore — a tarball replay of a large snapshot runs
+   * to a minute or more, while an image-backed one is a couple of seconds.
+   * Default 300.
+   */
+  autoRestartClaimSeconds?: number;
+  /**
+   * How long (s) the waiting page keeps polling before it gives up and shows an
+   * error. A restore that finishes later still works; this only bounds the wait
+   * the visitor is asked to sit through. Default 120.
+   */
+  autoRestartTimeoutSeconds?: number;
 }

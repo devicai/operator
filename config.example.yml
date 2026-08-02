@@ -253,6 +253,29 @@ ingress:
   defaultUpstreamPort: 80
   upstreamTimeoutMs: 30000
 
+  # A sandbox restored from a snapshot is published under the SNAPSHOT's
+  # subdomain (its `slug`, or a label derived from its id), so the URL of a
+  # service running inside it survives across sessions. Sandboxes with no
+  # snapshot keep being published under their own id.
+  #
+  # With autoRestart on, visiting that URL while nothing is running restores
+  # the snapshot and shows a waiting page until the service answers. Individual
+  # snapshots opt out with their own `autoRestart: false` (PATCH /snapshots/:id).
+  #
+  # Note: this lets an unauthenticated visitor allocate a sandbox. It is bounded
+  # by `resourceLimits` and by the short TTL below, but on a host with guessable
+  # subdomains it is worth knowing about.
+  autoRestart: true
+  # TTL granted to a sandbox nobody explicitly asked for. Shorter than
+  # defaults.defaultTtlSeconds on purpose.
+  autoRestartTtlSeconds: 1800
+  # How long one wake-up holds its claim before another visitor may retry.
+  # Must exceed the slowest restore (a large tarball replay runs to a minute+;
+  # an image-backed restore is a couple of seconds).
+  autoRestartClaimSeconds: 300
+  # How long the waiting page polls before showing an error.
+  autoRestartTimeoutSeconds: 120
+
 mcp:
   enabled: true
 

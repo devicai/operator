@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   Body,
   Param,
@@ -22,6 +23,7 @@ import { SnapshotsService } from './snapshots.service';
 import { CreateSnapshotDto } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ImportSnapshotDto } from './dto/import-snapshot.dto';
+import { UpdateSnapshotDto } from './dto/update-snapshot.dto';
 import { uploadLimits } from '../config/upload-limits';
 
 @ApiTags('Snapshots')
@@ -104,6 +106,22 @@ export class SnapshotsController {
     @Req() req: any,
   ) {
     return this.service.restore(id, dto, req.extensionScope ?? {});
+  }
+
+  @Patch(':id')
+  @ApiOperation({
+    summary: 'Update a snapshot subdomain and auto-restart setting',
+    description:
+      'Sets the subdomain this snapshot is served under and whether visiting ' +
+      'that URL restores it when nothing is running. Takes effect on the next ' +
+      'publish; a sandbox already serving this snapshot keeps its current URL.',
+  })
+  update(
+    @Param('id') id: string,
+    @Body() dto: UpdateSnapshotDto,
+    @Req() req: any,
+  ) {
+    return this.service.update(id, dto, req.extensionScope ?? {});
   }
 
   @Delete(':id')

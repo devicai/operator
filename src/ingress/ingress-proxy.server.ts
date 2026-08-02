@@ -11,6 +11,14 @@ import { Duplex } from 'stream';
 import { CONFIG } from '../config/config.loader';
 import { IngressConfig, ModuleConfig } from '../config/config.types';
 import { IngressRegistry } from './ingress-registry';
+import { SandboxWakeupService } from './sandbox-wakeup.service';
+import {
+  STATUS_PATH,
+  disabledPage,
+  errorPage,
+  notFoundPage,
+  waitingPage,
+} from './wakeup-page';
 
 /**
  * Embedded HTTP reverse proxy that routes requests to running sandboxes by
@@ -32,6 +40,7 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
   constructor(
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly registry: IngressRegistry,
+    private readonly wakeup: SandboxWakeupService,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -141,13 +150,30 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
     res: http.ServerResponse,
     cfg: ReturnType<IngressProxyServer['resolved']>,
   ): Promise<void> {
-    const upstream = await this.resolveUpstream(req, cfg.wildcardDomain);
-    if (!upstream) {
-      res.statusCode = 404;
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.end('Sandbox not found');
+    const subdomain = this.extractSubdomain(req.headers.host, cfg.wildcardDomain);
+    if (!subdomain) {
+      this.sendHtml(req, res, 404, notFoundPage(), 'Sandbox not found');
       return;
     }
+
+    // Reserved path: the waiting page polls it to learn when to reload. Served
+    // before the upstream lookup so it keeps answering while nothing is
+    // running — which is precisely when it is needed.
+    if (this.isStatusRequest(req)) {
+      await this.sendStatus(res, subdomain);
+      return;
+    }
+
+    const entry = await this.registry.lookup(subdomain).catch(() => null);
+    if (!entry) {
+      await this.serveDormant(req, res, subdomain);
+      return;
+    }
+    const upstream = {
+      host: entry.upstreamHost,
+      port: entry.upstreamPort,
+      sandboxId: entry.sandboxId,
+    };
 
     const headers = { ...req.headers };
     delete headers['connection'];
@@ -202,6 +228,119 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
 
     req.on('aborted', () => proxyReq.destroy());
     req.pipe(proxyReq);
+  }
+
+  /** Whether this request is the waiting page asking whether to reload. */
+  private isStatusRequest(req: http.IncomingMessage): boolean {
+    const path = (req.url ?? '').split('?')[0];
+    return path === STATUS_PATH;
+  }
+
+  private async sendStatus(
+    res: http.ServerResponse,
+    subdomain: string,
+  ): Promise<void> {
+    const status = await this.wakeup
+      .status(subdomain)
+      .catch(() => ({ state: 'starting' as const }));
+    const body = JSON.stringify(status);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(body);
+  }
+
+  /**
+   * Nothing is routing for this subdomain. Either a snapshot is behind it and
+   * we wake it, or there is genuinely nothing here.
+   */
+  private async serveDormant(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    subdomain: string,
+  ): Promise<void> {
+    const outcome = await this.wakeup.wake(subdomain).catch((err) => {
+      this.logger.warn(
+        `Wake-up failed for ${subdomain}: ${(err as Error).message}`,
+      );
+      return { kind: 'unknown' as const };
+    });
+
+    switch (outcome.kind) {
+      case 'unknown':
+        this.sendHtml(req, res, 404, notFoundPage(), 'Sandbox not found');
+        return;
+
+      case 'disabled':
+        // 503 rather than 404: the sandbox exists and could serve this address,
+        // it is just not allowed to start itself.
+        this.sendHtml(req, res, 503, disabledPage(), 'Sandbox is stopped');
+        return;
+
+      case 'waking':
+      case 'already-waking': {
+        const state = await this.wakeup
+          .status(subdomain)
+          .catch(() => ({ state: 'starting' as const }));
+        if (state.state === 'ready') {
+          // It came up between the lookup and now. Send the visitor round again
+          // rather than making them watch a spinner for a live sandbox.
+          res.statusCode = 307;
+          res.setHeader('Location', req.url ?? '/');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end();
+          return;
+        }
+        if (state.state === 'error') {
+          this.sendHtml(
+            req,
+            res,
+            503,
+            errorPage(state.message ?? ''),
+            `Sandbox failed to start: ${state.message ?? ''}`,
+          );
+          return;
+        }
+        this.sendHtml(
+          req,
+          res,
+          503,
+          waitingPage({ timeoutSeconds: this.wakeup.timeoutSeconds }),
+          'Sandbox is starting',
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * Serve a page to a browser, or a terse equivalent to anything else.
+   *
+   * A page load asks for far more than the document — assets, favicon, XHR — and
+   * answering those with HTML would corrupt them. Only a request that says it
+   * accepts HTML gets the page; everything else gets the status code and a
+   * plain-text line, which is what the old behaviour always was.
+   */
+  private sendHtml(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    statusCode: number,
+    html: string,
+    plain: string,
+  ): void {
+    if (res.headersSent) return;
+    res.statusCode = statusCode;
+    res.setHeader('Cache-Control', 'no-store');
+    if (statusCode === 503) res.setHeader('Retry-After', '5');
+
+    const accept = String(req.headers['accept'] ?? '');
+    if (!accept.includes('text/html')) {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end(plain);
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(html);
   }
 
   private async handleUpgrade(
