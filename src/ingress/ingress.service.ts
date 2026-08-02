@@ -155,6 +155,23 @@ export class IngressService {
   }
 
   /**
+   * The public URL a snapshot is served at, or null when ingress is off.
+   *
+   * Callers (Devic, the UI) need this without a sandbox running: the address
+   * belongs to the snapshot, so it is valid — and worth showing — even while
+   * nothing is up. Only this module knows the wildcard domain, so deriving it
+   * here keeps that configuration in one place.
+   */
+  publicUrlForSnapshot(snapshot: {
+    slug?: string | null;
+    snapshotId: string;
+  }): string | null {
+    if (!this.isEnabled()) return null;
+    const cfg = this.requireConfig();
+    return `${cfg.publicScheme}://${subdomainForSnapshot(snapshot)}.${cfg.wildcardDomain}`;
+  }
+
+  /**
    * The subdomain a sandbox is published under.
    *
    * A sandbox restored from a snapshot answers on the SNAPSHOT's subdomain, so
