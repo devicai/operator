@@ -110,11 +110,17 @@ const SandboxesPage: React.FC = () => {
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
 
-  const handleStop = async (id: string) => {
+  const handleStop = async (id: string, snapshotId?: string) => {
     setStoppingIds((prev) => new Set(prev).add(id));
     try {
-      await stopSandbox.mutateAsync(id);
-      message.success('Sandbox stopped');
+      // Linked: the save is a full capture, so let it run off-request and say
+      // so, rather than holding the browser open for minutes.
+      await stopSandbox.mutateAsync({ id, async: Boolean(snapshotId) });
+      message.success(
+        snapshotId
+          ? `Saving to snapshot ${snapshotId} in the background. The sandbox stops once the capture finishes.`
+          : 'Sandbox stopped',
+      );
     } catch (e: any) {
       message.error(e?.message ?? 'Stop failed');
     } finally {
@@ -391,19 +397,34 @@ const SandboxesPage: React.FC = () => {
                   onClick={() => setSnapshotSandbox(row)}
                 />
               </Tooltip>
-              <Tooltip title={stoppingIds.has(row.sandboxId) ? 'Stopping…' : 'Stop'}>
+              <Tooltip
+                title={
+                  stoppingIds.has(row.sandboxId)
+                    ? 'Stopping…'
+                    : row.snapshotId
+                      ? `Stop and save: the filesystem is written back to snapshot ${row.snapshotId}`
+                      : 'Stop. This sandbox is not linked to a snapshot, so its changes are discarded'
+                }
+              >
                 <Button
                   size="small"
                   icon={<FontAwesomeIcon icon={faStop} />}
                   loading={stoppingIds.has(row.sandboxId)}
                   disabled={stoppingIds.has(row.sandboxId)}
-                  onClick={() => handleStop(row.sandboxId)}
+                  onClick={() => handleStop(row.sandboxId, row.snapshotId)}
                 />
               </Tooltip>
             </>
           )}
           <Popconfirm
             title="Destroy this sandbox?"
+            description={
+              row.snapshotId
+                ? `Nothing is saved. Snapshot ${row.snapshotId} keeps its last saved version, and everything done in this sandbox since it started is lost. Use Stop to keep it.`
+                : 'The sandbox and its filesystem are removed.'
+            }
+            okText={row.snapshotId ? 'Destroy, losing the changes' : 'Destroy'}
+            okButtonProps={{ danger: true }}
             onConfirm={() => handleDestroy(row.sandboxId)}
             disabled={destroyingIds.has(row.sandboxId)}
           >

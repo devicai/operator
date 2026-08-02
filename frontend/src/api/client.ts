@@ -84,8 +84,12 @@ export const sandboxesApi = {
   runCommand(id: string, command: string, cwd?: string): Promise<AxiosResponse<CommandResult>> {
     return api.post(`/sandboxes/${id}/command`, { command, cwd });
   },
-  stop(id: string): Promise<AxiosResponse<SandboxDto>> {
-    return api.post(`/sandboxes/${id}/stop`);
+  // `async` matters for a sandbox linked to a snapshot: the save is a full
+  // filesystem capture that can run for minutes, and a synchronous stop holds
+  // the request open for all of it — long enough for a reverse proxy to give up
+  // and report a failure for work that is in fact still running and will finish.
+  stop(id: string, opts?: { async?: boolean }): Promise<AxiosResponse<SandboxDto>> {
+    return api.post(`/sandboxes/${id}/stop`, opts ?? {});
   },
   destroy(id: string): Promise<AxiosResponse<void>> {
     return api.delete(`/sandboxes/${id}`);
