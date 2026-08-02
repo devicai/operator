@@ -82,11 +82,11 @@ export function waitingPage(opts: {
   var el = document.getElementById('detail');
   function fail(msg){
     document.getElementById('spin').style.display='none';
-    document.getElementById('title').textContent='This sandbox could not be started';
+    document.getElementById('title').textContent='The sandbox is up, but nothing is serving';
     document.getElementById('lead').textContent =
-      'It was restored, but nothing is listening on its HTTP port. A snapshot ' +
-      'restores files, not running processes, so a server started by hand does ' +
-      'not come back on its own.';
+      'The files were restored and the sandbox is running, but no process is ' +
+      'listening on its HTTP port. Start the service from Devic and reload ' +
+      'this page.';
     el.textContent = msg || '';
   }
   function tick(){
@@ -110,7 +110,7 @@ export function waitingPage(opts: {
     'Starting sandbox…',
     `<div class="spinner" id="spin"></div>
 <h1 id="title">Starting this sandbox</h1>
-<p id="lead">It was stopped, so it is being restored from its latest snapshot. This page will reload by itself.</p>
+<p id="lead">It was stopped, so it is being restored from its latest snapshot. This page reloads as soon as something answers on its HTTP port.</p>
 <p class="detail" id="detail"></p>`,
     script,
   );

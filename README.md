@@ -349,10 +349,21 @@ starts one restore, not one per asset.
 Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
 `ingress.autoRestart: false`.
 
-**A snapshot restores files, not processes.** A server left running by hand does
-not come back; only something started by the image entrypoint or a supervisor
-inside the snapshot does. When the port never answers the waiting page says so
-after `ingress.autoRestartTimeoutSeconds`.
+**Known limitation: the restored sandbox serves nothing on its own.** A snapshot
+restores files, not processes, and there is currently no path that starts a
+service afterwards:
+
+- `initScript` runs on `create` only, never on `restore` (`sandboxes.service.ts:214`);
+- every container is created with `Cmd: ['/bin/sh','-c','sleep infinity']`
+  (`docker.runtime-provider.ts:278`), which overrides the image's own `CMD`.
+
+So an auto-restart brings the sandbox **up** — useful, since a terminal session
+can then attach to it — but the waiting page will report that nothing is
+listening once `ingress.autoRestartTimeoutSeconds` passes, unless someone starts
+the service in the meantime (the page reloads as soon as the port answers).
+
+Making the URL serve on its own needs a start command stored on the snapshot and
+run after restore. That is deliberately not built yet.
 
 #### Snapshot Image Cache
 
