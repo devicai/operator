@@ -318,4 +318,87 @@ describe('SnapshotImageService', () => {
       expect(runtime.listSnapshotImages).not.toHaveBeenCalled();
     });
   });
+
+  describe('reclaimOrphans', () => {
+    it('removes an image whose snapshot is gone and keeps the rest', async () => {
+      const runtime = baseRuntime({
+        listSnapshotImages: jest.fn().mockResolvedValue([
+          { ref: 'devic-snapshot:gone', tag: 'gone', uniqueSizeBytes: 500, inUse: false },
+          { ref: 'devic-snapshot:live', tag: 'live', uniqueSizeBytes: 700, inUse: false },
+        ]),
+      });
+      // Only 'live' still has a snapshot behind it.
+      const repo = baseRepo({
+        find: jest.fn().mockResolvedValue({
+          data: [{ snapshotId: 'live' }],
+        }),
+      });
+      const svc = await build(buildConfig({ enabled: true }), runtime, repo);
+
+      await svc.reclaimOrphans();
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('devic-snapshot:gone');
+      expect(runtime.removeImage).not.toHaveBeenCalledWith('devic-snapshot:live');
+    });
+
+    it('collects garbage even with no cap configured', async () => {
+      // The whole point: enforceCap returns early without a cap, so orphans
+      // would otherwise be kept forever.
+      const runtime = baseRuntime({
+        listSnapshotImages: jest.fn().mockResolvedValue([
+          { ref: 'devic-snapshot:gone', tag: 'gone', uniqueSizeBytes: 500, inUse: false },
+        ]),
+      });
+      const svc = await build(
+        buildConfig({ enabled: true }),
+        runtime,
+        baseRepo({ find: jest.fn().mockResolvedValue({ data: [] }) }),
+      );
+
+      await svc.reclaimOrphans();
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('devic-snapshot:gone');
+    });
+
+    it('leaves an orphan a container still holds, for the next sweep', async () => {
+      // Exactly what was observed on dev: the snapshot was deleted while its
+      // stopped sandbox container still referenced the image. The daemon would
+      // refuse, so do not even ask — and do not log a failure every sweep.
+      const runtime = baseRuntime({
+        listSnapshotImages: jest.fn().mockResolvedValue([
+          { ref: 'devic-snapshot:gone', tag: 'gone', uniqueSizeBytes: 500, inUse: true },
+        ]),
+      });
+      const svc = await build(
+        buildConfig({ enabled: true }),
+        runtime,
+        baseRepo({ find: jest.fn().mockResolvedValue({ data: [] }) }),
+      );
+
+      await svc.reclaimOrphans();
+
+      expect(runtime.removeImage).not.toHaveBeenCalled();
+    });
+
+    it('does nothing when the cache is off', async () => {
+      const runtime = baseRuntime();
+      const svc = await build(
+        buildConfig({ enabled: false }),
+        runtime,
+        baseRepo(),
+      );
+      await svc.reclaimOrphans();
+      expect(runtime.listSnapshotImages).not.toHaveBeenCalled();
+    });
+
+    it('survives a daemon that fails mid-reclaim', async () => {
+      const runtime = baseRuntime({
+        listSnapshotImages: jest
+          .fn()
+          .mockRejectedValue(new Error('daemon unreachable')),
+      });
+      const svc = await build(buildConfig({ enabled: true }), runtime, baseRepo());
+      await expect(svc.reclaimOrphans()).resolves.toBeUndefined();
+    });
+  });
 });

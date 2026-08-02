@@ -343,7 +343,10 @@ Three properties are worth knowing before enabling it:
   instantly). Only the delta over the base image is charged to the cache, since
   the base is shared by every sandbox on the host regardless. Set
   `maxTotalBytes`; the least recently restored images are evicted to stay under
-  it, and an image backing a live sandbox is never evicted.
+  it, and an image backing a live sandbox is never evicted. Independently of the
+  cap, every five minutes the module drops images whose snapshot no longer
+  exists — deleting a snapshot cannot always remove its image, because the
+  daemon refuses while any container (even a stopped one) still references it.
 - **Capture cost.** Each capture writes the tarball and then, in the
   background, rebuilds the image (~23 s for a 200 MB snapshot). Nothing waits
   on it: the snapshot is `ready` as soon as the tarball is.

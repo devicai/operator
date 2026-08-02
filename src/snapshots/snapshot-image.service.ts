@@ -17,7 +17,7 @@ import {
 
 const DEFAULT_REPOSITORY = 'devic-snapshot';
 const DEFAULT_BUILD_TIMEOUT_MS = 600_000;
-/** How often the cache is reconciled against its cap. */
+/** How often orphaned images are collected and the cache reconciled with its cap. */
 const SWEEP_INTERVAL_MS = 300_000;
 
 export type ApplyTarball = (
@@ -79,8 +79,10 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
       );
       return;
     }
+    // Collect garbage first, then trade off what is left against the cap: an
+    // image with no snapshot must never cost a live one its place.
     this.sweepTimer = setInterval(() => {
-      void this.enforceCap();
+      void this.reclaimOrphans().then(() => this.enforceCap());
     }, SWEEP_INTERVAL_MS);
     this.logger.log(
       `Snapshot image cache on (repository=${this.repository}, ` +
@@ -276,6 +278,71 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     await this.applyTarball!(helper, snapshot);
     // The commit itself happens in build(), after re-reading the version, so a
     // build that was superseded mid-flight never publishes a tag.
+  }
+
+  /**
+   * Drop images whose snapshot no longer exists.
+   *
+   * `destroy()` already asks for this, but the daemon refuses to remove an
+   * image while ANY container still references it — a stopped one counts — so
+   * deleting a snapshot whose sandboxes are still around always leaves its
+   * image behind. Once those containers go, nothing can ever restore from it:
+   * a restore reads the snapshot document, and that is gone.
+   *
+   * So this is not cache to be traded against the cap, it is garbage, and it is
+   * collected unconditionally. Leaving it to `enforceCap` means it survives
+   * until the cache is under pressure — and with `maxTotalBytes` unset, which
+   * the config allows, it means forever.
+   */
+  async reclaimOrphans(): Promise<void> {
+    if (
+      !this.isEnabled() ||
+      !this.runtime.listSnapshotImages ||
+      !this.runtime.removeImage
+    ) {
+      return;
+    }
+
+    try {
+      const images = await this.runtime.listSnapshotImages(this.repository);
+      // An image still held by a container cannot be removed anyway, and the
+      // holder may be a sandbox that is about to be reclaimed — try again next
+      // sweep rather than logging a failure every five minutes.
+      const free = images.filter((i) => !i.inUse);
+      if (!free.length) return;
+
+      // The tag IS the snapshotId (see refFor), so one query answers the whole
+      // batch instead of one lookup per image.
+      const tags = free.map((i) => i.tag);
+      const known = await this.snapshotRepo.find(
+        { snapshotId: { $in: tags } } as any,
+        {},
+        { limit: tags.length },
+      );
+      const alive = new Set((known.data ?? []).map((d) => d.snapshotId));
+
+      let dropped = 0;
+      let freed = 0;
+      for (const img of free) {
+        if (alive.has(img.tag)) continue;
+        if (!(await this.runtime.removeImage!(img.ref))) continue;
+        dropped++;
+        freed += img.uniqueSizeBytes;
+      }
+
+      if (dropped) {
+        this.logger.log(
+          `Reclaimed ${dropped} snapshot image(s) whose snapshot is gone, ` +
+            `freeing ${fmt(freed)}`,
+        );
+      }
+    } catch (err) {
+      // Same contract as the rest of this service: never let cache maintenance
+      // take anything down.
+      this.logger.warn(
+        `Orphan image reclaim failed: ${(err as Error).message}`,
+      );
+    }
   }
 
   /**
