@@ -2,6 +2,7 @@ import { ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsBoolean,
   IsOptional,
+  IsString,
   Matches,
   MaxLength,
   ValidateIf,
@@ -37,4 +38,17 @@ export class UpdateSnapshotDto {
   @IsOptional()
   @IsBoolean()
   autoRestart?: boolean;
+
+  @ApiPropertyOptional({
+    description:
+      'Command run after each restore to bring this snapshot\'s service back ' +
+      'up, e.g. "cd /workspace && npm start". Send null or an empty string to ' +
+      'clear it.',
+    nullable: true,
+  })
+  @IsOptional()
+  @ValidateIf((o) => o.startCommand !== null)
+  @IsString()
+  @MaxLength(4096)
+  startCommand?: string | null;
 }

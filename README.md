@@ -308,7 +308,7 @@ Live values are exposed via `GET /api/v1/usage` (see [Usage](#usage) below). The
 | GET | `/api/v1/snapshots` | List snapshots (filter by `sandboxId`) |
 | GET | `/api/v1/snapshots/:id` | Get snapshot |
 | POST | `/api/v1/snapshots/:id/restore` | Restore sandbox from snapshot |
-| PATCH | `/api/v1/snapshots/:id` | Set the public subdomain (`slug`) and `autoRestart` |
+| PATCH | `/api/v1/snapshots/:id` | Set the public subdomain (`slug`), `autoRestart` and `startCommand` |
 | DELETE | `/api/v1/snapshots/:id` | Delete snapshot |
 
 #### Snapshot Restore Modes
@@ -349,21 +349,28 @@ starts one restore, not one per asset.
 Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
 `ingress.autoRestart: false`.
 
-**Known limitation: the restored sandbox serves nothing on its own.** A snapshot
-restores files, not processes, and there is currently no path that starts a
-service afterwards:
+**A snapshot restores files, not processes**, so nothing listens in a freshly
+restored sandbox unless the snapshot says what to start:
 
-- `initScript` runs on `create` only, never on `restore` (`sandboxes.service.ts:214`);
-- every container is created with `Cmd: ['/bin/sh','-c','sleep infinity']`
-  (`docker.runtime-provider.ts:278`), which overrides the image's own `CMD`.
+```
+PATCH /api/v1/snapshots/:id   { "startCommand": "cd /workspace && npm start" }
+```
 
-So an auto-restart brings the sandbox **up** — useful, since a terminal session
-can then attach to it — but the waiting page will report that nothing is
-listening once `ingress.autoRestartTimeoutSeconds` passes, unless someone starts
-the service in the meantime (the page reloads as soon as the port answers).
+It runs after every restore, detached and best-effort — a sandbox whose service
+fails to start is still a working sandbox, and the waiting page reports that
+nothing is listening rather than the restore erroring out. Output goes to
+`/tmp/.devic-start.log` inside the sandbox.
 
-Making the URL serve on its own needs a start command stored on the snapshot and
-run after restore. That is deliberately not built yet.
+It deliberately runs **after the filesystem is in place**, not through the
+container entrypoint. A tarball restore creates the container, starts it, and
+only *then* unpacks into it, so anything the snapshot changed about the boot
+path has already been skipped by the time it lands — measured: the same snapshot
+self-started from its image and did not from its tarball. Running it here is the
+only point that behaves identically on both paths.
+
+Note `initScript` is not this: it belongs to whoever creates a sandbox and runs
+on `create` only (`sandboxes.service.ts:214`). `startCommand` belongs to the
+snapshot, which is what a URL actually points at.
 
 #### Snapshot Image Cache
 

@@ -116,6 +116,29 @@ export class Snapshot {
   @Prop()
   autoRestart?: boolean;
 
+  /**
+   * Shell command that brings this snapshot's service up, run after every
+   * restore.
+   *
+   * A snapshot captures files, not processes, so nothing is listening in a
+   * freshly restored sandbox. This is where a snapshot says how to get its
+   * service back — a property of the snapshot itself, not of whichever sandbox
+   * happened to create it, which is why it lives here and not in the caller's
+   * own configuration.
+   *
+   * Run detached and best-effort: a sandbox whose start command fails is still
+   * a working sandbox, and the waiting page reports that nothing is serving.
+   */
+  @ApiProperty({
+    description:
+      'Command run after each restore to bring the service back up, e.g. ' +
+      '"cd /workspace && npm start". A snapshot restores files, not processes, ' +
+      'so without it nothing is listening in a restored sandbox.',
+    required: false,
+  })
+  @Prop()
+  startCommand?: string;
+
   @ApiProperty()
   @Prop({ required: true })
   snapshotPath: string;

@@ -722,6 +722,16 @@ export class SnapshotsService implements OnModuleInit {
           (fromImage ? ' (image)' : ' (tarball)'),
       );
 
+      // Bring the snapshot's service back up.
+      //
+      // Deliberately here, AFTER the filesystem is in place, rather than
+      // relying on the container's entrypoint: a tarball restore starts the
+      // container and only then unpacks into it, so anything the snapshot
+      // changed about the boot path has already been skipped by the time it
+      // lands. Running it here is the only point that behaves the same whether
+      // the restore came from the image or the tarball.
+      await this.runStartCommand(sandbox, snapshot, sandboxId);
+
       const updated = await this.sandboxRepo.findById(
         (sandboxDoc as any)._id.toString(),
         scope,
@@ -855,6 +865,12 @@ export class SnapshotsService implements OnModuleInit {
     }
 
     if (dto.autoRestart !== undefined) set.autoRestart = dto.autoRestart;
+
+    if (dto.startCommand !== undefined) {
+      const cmd = dto.startCommand?.trim();
+      if (cmd) set.startCommand = cmd;
+      else unset.startCommand = '';
+    }
 
     if (!Object.keys(set).length && !Object.keys(unset).length) return doc;
 
@@ -1486,6 +1502,50 @@ export class SnapshotsService implements OnModuleInit {
         where: 'host',
       },
     };
+  }
+
+  /**
+   * Run a snapshot's `startCommand` in a freshly restored sandbox.
+   *
+   * Detached and not awaited for completion: a start command is a server, so it
+   * does not return, and holding the restore open on it would turn every
+   * restore into a hang. `nohup` + `&` inside a subshell so the process
+   * survives the exec channel closing, and output goes to a log inside the
+   * sandbox where it can be read afterwards.
+   *
+   * Best-effort: a sandbox whose service fails to start is still a working
+   * sandbox. The failure surfaces where it is actionable — the waiting page
+   * reports that nothing is listening, rather than the restore erroring out.
+   */
+  private async runStartCommand(
+    sandbox: RuntimeSandbox,
+    snapshot: SnapshotDocument,
+    sandboxId: string,
+  ): Promise<void> {
+    const command = snapshot.startCommand?.trim();
+    if (!command) return;
+
+    const log = '/tmp/.devic-start.log';
+    const script =
+      `( nohup sh -c ${sh(command)} </dev/null >${log} 2>&1 & ) ; echo started`;
+
+    try {
+      const res = await sandbox.exec(script);
+      if (res.code !== 0) {
+        this.logger.warn(
+          `Start command for ${sandboxId} (snapshot ${snapshot.snapshotId}) ` +
+            `exited ${res.code}: ${res.stderr || res.stdout}`,
+        );
+        return;
+      }
+      this.logger.log(
+        `Start command launched in ${sandboxId} (snapshot ${snapshot.snapshotId})`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not launch the start command in ${sandboxId}: ${(err as Error).message}`,
+      );
+    }
   }
 
   /** Restore a workdir-only snapshot (legacy path): extract tar.gz into workdir. */
