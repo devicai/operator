@@ -412,6 +412,20 @@ Tools exposed:
 
 Connect to `ws://host/ws/terminal` for interactive terminal sessions.
 
+> **This endpoint is not authenticated, and must not be exposed to a network
+> you do not trust.** The gateway registers a raw `ws.on('message')` handler
+> inside `handleConnection`, and Nest applies the global `ApiKeyGuard` to
+> *handlers*, so the guard never runs here: `auth.enabled: true` protects the
+> REST API and leaves this open. Attaching needs only a sandbox id, which is
+> public by construction — it is the label of the sandbox's own ingress
+> hostname — so anyone given a preview URL can open a root shell in it.
+>
+> The bundled frontend therefore serves the UI but refuses `/ws/` (see
+> `frontend/nginx.conf`); it runs commands over the REST API instead. Reach the
+> terminal from a trusted network, against the API port directly. If you put
+> the API port behind a public proxy, terminate it there until the gateway
+> validates a key on connect.
+
 ### Health
 
 | Endpoint | Description |
