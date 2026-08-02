@@ -74,6 +74,71 @@ export class Snapshot {
   @Prop()
   exposedHttpPort?: number;
 
+  // ---------------------------------------------------------------------------
+  // Stable public identity
+  //
+  // A sandbox restored from this snapshot gets a fresh `sandboxId` every time,
+  // so publishing it under that id gives a URL that changes on every session.
+  // These two fields move the public identity from the sandbox to the snapshot,
+  // which is what actually survives: the URL of a service published inside a
+  // sandbox stays the same across restores, and it keeps working while nothing
+  // is running (see the ingress proxy's dormant-sandbox path).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Subdomain this snapshot is served under. Optional: when absent the ingress
+   * derives one from `snapshotId`, so every snapshot has a stable URL without
+   * anyone configuring anything. Unique (sparse) because the subdomain is the
+   * routing key — two snapshots answering the same hostname would be a silent
+   * hijack, and `toDnsLabel` lowercases a nanoid that is case-sensitive, so
+   * collisions are reachable rather than theoretical.
+   */
+  @ApiProperty({
+    description:
+      'Subdomain serving this snapshot, e.g. "my-app" for my-app.sandbox.devic.ai. ' +
+      'Defaults to a label derived from snapshotId when unset.',
+    required: false,
+  })
+  @Prop({ index: true, unique: true, sparse: true })
+  slug?: string;
+
+  /**
+   * Whether visiting this snapshot's URL while nothing is running restores it
+   * automatically. Opt-out: absent means enabled, so the feature applies to
+   * snapshots that predate it without a migration.
+   */
+  @ApiProperty({
+    description:
+      'Restore this snapshot automatically when its public URL is visited and ' +
+      'no sandbox is serving it. Enabled unless explicitly set to false.',
+    required: false,
+  })
+  @Prop()
+  autoRestart?: boolean;
+
+  /**
+   * Shell command that brings this snapshot's service up, run after every
+   * restore.
+   *
+   * A snapshot captures files, not processes, so nothing is listening in a
+   * freshly restored sandbox. This is where a snapshot says how to get its
+   * service back — a property of the snapshot itself, not of whichever sandbox
+   * happened to create it, which is why it lives here and not in the caller's
+   * own configuration.
+   *
+   * Run detached and best-effort: a sandbox whose start command fails is still
+   * a working sandbox, and the waiting page reports that nothing is serving.
+   */
+  @ApiProperty({
+    description:
+      'Command run after each restore to bring the service back up, e.g. ' +
+      '"cd /workspace && npm start". A snapshot restores files, not processes, ' +
+      'so without it nothing is listening in a restored sandbox.',
+    required: false,
+  })
+  @Prop()
+  startCommand?: string;
+
   @ApiProperty()
   @Prop({ required: true })
   snapshotPath: string;

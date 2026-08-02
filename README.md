@@ -308,6 +308,7 @@ Live values are exposed via `GET /api/v1/usage` (see [Usage](#usage) below). The
 | GET | `/api/v1/snapshots` | List snapshots (filter by `sandboxId`) |
 | GET | `/api/v1/snapshots/:id` | Get snapshot |
 | POST | `/api/v1/snapshots/:id/restore` | Restore sandbox from snapshot |
+| PATCH | `/api/v1/snapshots/:id` | Set the public subdomain (`slug`), `autoRestart` and `startCommand` |
 | DELETE | `/api/v1/snapshots/:id` | Delete snapshot |
 
 #### Snapshot Restore Modes
@@ -316,6 +317,71 @@ The restore endpoint accepts a `linked` flag:
 
 - **`linked: true`** (default) — Sandbox stays linked to the snapshot. On stop or TTL expiry, changes are automatically persisted back to the snapshot.
 - **`linked: false`** — Fully independent sandbox (fork). The snapshot remains unchanged regardless of what happens in the sandbox.
+
+#### Stable URLs and auto-restart
+
+Restoring mints a new `sandboxId` every time, so publishing a sandbox under its
+own id gives a URL that dies with the session — no good for a service someone
+wants to link to. Instead, **a sandbox restored from a snapshot is published
+under the snapshot's subdomain**:
+
+```
+PATCH /api/v1/snapshots/:id   { "slug": "my-app" }
+    → https://my-app.sandbox.devic.ai
+```
+
+Without a slug the subdomain is derived from the snapshot id, so every snapshot
+has a stable address with nothing to configure. The slug only makes it
+memorable. Sandboxes not born of a snapshot keep being published under their own
+id, exactly as before.
+
+Because the address belongs to the snapshot, it can be served when nothing is
+running: a visit to a dormant URL restores the snapshot and returns a waiting
+page that polls `/__devic/status` and reloads when the service answers. With the
+image cache that takes a couple of seconds.
+
+The restore is **unlinked** — opening a URL must never be able to write back
+into the snapshot it was served from — and gets `ingress.autoRestartTtlSeconds`
+rather than the usual default, since nobody asked for that sandbox explicitly.
+Concurrent visits are deduplicated through a Redis claim, so one page load
+starts one restore, not one per asset.
+
+Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
+`ingress.autoRestart: false`.
+
+**A snapshot restores files, not processes**, so nothing listens in a freshly
+restored sandbox unless the snapshot says what to start:
+
+```
+PATCH /api/v1/snapshots/:id   { "startCommand": "cd /workspace && npm start" }
+```
+
+It runs after every restore, detached and best-effort — a sandbox whose service
+fails to start is still a working sandbox, and the waiting page reports that
+nothing is listening rather than the restore erroring out. Output goes to
+`/tmp/.devic-start.log` inside the sandbox.
+
+It deliberately runs **after the filesystem is in place**, not through the
+container entrypoint. A tarball restore creates the container, starts it, and
+only *then* unpacks into it, so anything the snapshot changed about the boot
+path has already been skipped by the time it lands — measured: the same snapshot
+self-started from its image and did not from its tarball. Running it here is the
+only point that behaves identically on both paths.
+
+`initScript` is not this, and the split is by owner:
+
+- **`initScript` belongs to whoever manages the environment** — a developer
+  preparing a sandbox: installing packages, wiring credentials, laying out the
+  workspace. It runs on `create` only (`sandboxes.service.ts:214`).
+- **`startCommand` belongs to whoever consumes the snapshot** — typically the
+  agent working inside it, which is the party that knows how its own service
+  starts. It runs on every restore, including the ones a visitor triggers, where
+  no init script is in play.
+
+They can overlap: a session started through a caller that also runs an init
+script will run both, and if each starts the same server the second one hits
+`Address already in use`. Keep the service start in `startCommand` and leave
+preparation to `initScript`.
 
 #### Snapshot Image Cache
 

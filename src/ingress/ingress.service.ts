@@ -6,7 +6,9 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 import { SandboxDocument } from '../schemas/sandbox.schema';
+import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { IngressEntry, IngressRegistry } from './ingress-registry';
+import { subdomainForSnapshot, toDnsLabel } from './subdomain.util';
 
 export interface PublishResult {
   /** Subdomain assigned to the sandbox (label only, no domain). */
@@ -30,6 +32,7 @@ export class IngressService {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
     private readonly registry: IngressRegistry,
+    private readonly snapshotRepo: SnapshotRepository,
   ) {}
 
   /** Whether the ingress feature is enabled in the loaded config. */
@@ -97,7 +100,7 @@ export class IngressService {
       return null;
     }
 
-    const subdomain = toDnsLabel(sandbox.sandboxId);
+    const subdomain = await this.resolveSubdomain(sandbox);
     const entry: IngressEntry = {
       sandboxId: sandbox.sandboxId,
       upstreamHost: address.host,
@@ -151,6 +154,64 @@ export class IngressService {
     await this.registry.extendTtl(sandbox.subdomain.toLowerCase(), ttl);
   }
 
+  /**
+   * The public URL a snapshot is served at, or null when ingress is off.
+   *
+   * Callers (Devic, the UI) need this without a sandbox running: the address
+   * belongs to the snapshot, so it is valid — and worth showing — even while
+   * nothing is up. Only this module knows the wildcard domain, so deriving it
+   * here keeps that configuration in one place.
+   */
+  publicUrlForSnapshot(snapshot: {
+    slug?: string | null;
+    snapshotId: string;
+  }): string | null {
+    if (!this.isEnabled()) return null;
+    const cfg = this.requireConfig();
+    return `${cfg.publicScheme}://${subdomainForSnapshot(snapshot)}.${cfg.wildcardDomain}`;
+  }
+
+  /**
+   * The subdomain a sandbox is published under.
+   *
+   * A sandbox restored from a snapshot answers on the SNAPSHOT's subdomain, so
+   * the URL of whatever it serves survives across sessions — `restoreInternal`
+   * mints a new `sandboxId` every time, and publishing by that id would hand
+   * out a different URL on every restore. Anything not born of a snapshot keeps
+   * the historical behaviour of being published under its own id.
+   *
+   * The origin is read from `metadata.restoredFrom`, not from `snapshotId`:
+   * the latter is only set for LINKED restores, and an unlinked sandbox (a
+   * fork, or one revived by visiting its URL) still belongs at the same
+   * address.
+   *
+   * If two sandboxes of the same snapshot are alive at once they both claim
+   * this subdomain and the last to publish wins — the registry entry is a
+   * single key. That is the intended trade-off: the address identifies the
+   * snapshot, not the process serving it.
+   */
+  private async resolveSubdomain(sandbox: SandboxDocument): Promise<string> {
+    const origin =
+      sandbox.snapshotId ?? (sandbox.metadata?.restoredFrom as string | undefined);
+    if (!origin) return toDnsLabel(sandbox.sandboxId);
+
+    try {
+      const snapshot = await this.snapshotRepo.findOne(
+        { snapshotId: origin } as any,
+        {},
+      );
+      if (snapshot) return subdomainForSnapshot(snapshot);
+    } catch (err) {
+      this.logger.warn(
+        `Could not resolve the subdomain of snapshot ${origin}, falling back ` +
+          `to the sandbox id: ${(err as Error).message}`,
+      );
+    }
+    // The snapshot was deleted while this sandbox was running, or the lookup
+    // failed. Publishing under the sandbox id keeps it reachable.
+    return toDnsLabel(sandbox.sandboxId);
+  }
+
   private computeTtlSeconds(
     sandbox: Pick<SandboxDocument, 'expiresAt'>,
     maxTtl: number,
@@ -162,20 +223,3 @@ export class IngressService {
   }
 }
 
-/**
- * Turn a sandboxId into a valid DNS label. nanoid's URL-safe alphabet
- * includes `-` and `_`, but RFC 952/1123 forbid labels that start or end
- * with a hyphen, and most resolvers (libc getaddrinfo, browsers) refuse
- * such hostnames even if the authoritative DNS would return an answer.
- *
- * - Lowercases the id.
- * - Replaces `_` with `-` (underscore is invalid in hostnames at all).
- * - Prefixes `s-` if the result would otherwise start with `-`.
- * - Suffixes `-x` if it would otherwise end with `-`.
- */
-function toDnsLabel(sandboxId: string): string {
-  let label = sandboxId.toLowerCase().replace(/_/g, '-');
-  if (label.startsWith('-')) label = `s${label}`;
-  if (label.endsWith('-')) label = `${label}x`;
-  return label;
-}

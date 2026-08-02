@@ -14,6 +14,7 @@ import type {
   UpdateMcpProfileDto,
   SnapshotDto,
   CreateSnapshotDto,
+  UpdateSnapshotDto,
   RestoreSnapshotDto,
   ImportSnapshotDto,
   ListFilesResult,
@@ -176,6 +177,10 @@ export const snapshotsApi = {
   },
   restore(id: string, dto: RestoreSnapshotDto = {}): Promise<AxiosResponse<SandboxDto>> {
     return api.post(`/snapshots/${id}/restore`, dto);
+  },
+  /** How the snapshot is served: subdomain, restart-on-visit, start command. */
+  update(id: string, dto: UpdateSnapshotDto): Promise<AxiosResponse<SnapshotDto>> {
+    return api.patch(`/snapshots/${id}`, dto);
   },
   delete(id: string): Promise<AxiosResponse<void>> {
     return api.delete(`/snapshots/${id}`);

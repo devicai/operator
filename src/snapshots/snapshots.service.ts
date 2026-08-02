@@ -28,6 +28,7 @@ import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from '../sandboxes/sandbox-registry';
 import { IngressService } from '../ingress/ingress.service';
+import { SandboxWakeupService } from '../ingress/sandbox-wakeup.service';
 import {
   SnapshotDocument,
   SnapshotSaveState,
@@ -40,6 +41,7 @@ import { CONFIG } from '../config/config.loader';
 import { CreateSnapshotDto, SnapshotScope } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ImportSnapshotDto } from './dto/import-snapshot.dto';
+import { UpdateSnapshotDto } from './dto/update-snapshot.dto';
 import { tarballToZipStream, zipToTarGz } from './snapshot-zip.util';
 import { Readable } from 'stream';
 import { ResourceUsageService } from '../providers/resource-usage.service';
@@ -97,6 +99,7 @@ export class SnapshotsService implements OnModuleInit {
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
     private readonly imageService: SnapshotImageService,
     @Optional() private readonly ingressService?: IngressService,
+    @Optional() private readonly wakeupService?: SandboxWakeupService,
   ) {
     if (!existsSync(SNAPSHOTS_DIR)) {
       mkdirSync(SNAPSHOTS_DIR, { recursive: true });
@@ -160,6 +163,23 @@ export class SnapshotsService implements OnModuleInit {
     this.imageService.registerTarballApplier((containerName, snapshot) =>
       this.applyTarballTo(containerName, snapshot),
     );
+
+    // Same reason the image cache gets its applier injected rather than
+    // importing this service: the ingress already sits below us (we publish
+    // through it), so it cannot depend on us without closing a cycle.
+    //
+    // `linked: false` is deliberate. Waking a sandbox is something a VISITOR
+    // triggered, not the owner, and a linked sandbox writes itself back into
+    // the snapshot when it stops or expires. Opening a URL must not be able to
+    // overwrite the snapshot it was served from.
+    this.wakeupService?.registerRestorer(async (snapshotId, ttlSeconds) => {
+      const sandbox = await this.restore(
+        snapshotId,
+        { ttlSeconds, linked: false },
+        {},
+      );
+      return { sandboxId: sandbox.sandboxId };
+    });
 
     try {
       const stale = await this.snapshotRepo.updateMany(
@@ -702,6 +722,16 @@ export class SnapshotsService implements OnModuleInit {
           (fromImage ? ' (image)' : ' (tarball)'),
       );
 
+      // Bring the snapshot's service back up.
+      //
+      // Deliberately here, AFTER the filesystem is in place, rather than
+      // relying on the container's entrypoint: a tarball restore starts the
+      // container and only then unpacks into it, so anything the snapshot
+      // changed about the boot path has already been skipped by the time it
+      // lands. Running it here is the only point that behaves the same whether
+      // the restore came from the image or the tarball.
+      await this.runStartCommand(sandbox, snapshot, sandboxId);
+
       const updated = await this.sandboxRepo.findById(
         (sandboxDoc as any)._id.toString(),
         scope,
@@ -793,6 +823,76 @@ export class SnapshotsService implements OnModuleInit {
       (await this.snapshotRepo.findById(id, scope));
     if (!doc) throw new NotFoundException(`Snapshot ${id} not found`);
     return doc;
+  }
+
+  /**
+   * Update a snapshot's public identity: its subdomain and whether visiting it
+   * revives it. Both are metadata about how the snapshot is served, so nothing
+   * here touches the artifact or any running sandbox.
+   *
+   * A slug change only takes effect on the NEXT publish. A sandbox already
+   * serving this snapshot keeps answering on the old subdomain until it is
+   * republished, because the live route lives in Redis and rewriting it here
+   * would need the sandbox's upstream address, which is the ingress's business
+   * and not this service's.
+   */
+  async update(
+    id: string,
+    dto: UpdateSnapshotDto,
+    scope: ExtensionScope,
+  ): Promise<SnapshotDocument> {
+    const doc = await this.findById(id, scope);
+
+    const set: Record<string, any> = {};
+    const unset: Record<string, any> = {};
+
+    if (dto.slug !== undefined) {
+      if (dto.slug === null || dto.slug.trim() === '') {
+        // Releasing the slug is not "no subdomain": it falls back to the label
+        // derived from the id, so the snapshot stays reachable.
+        unset.slug = '';
+      } else {
+        const slug = dto.slug.trim().toLowerCase();
+        const clash = await this.snapshotRepo.findBySubdomain(slug);
+        if (clash && clash.snapshotId !== doc.snapshotId) {
+          throw new ConflictException({
+            code: 'SUBDOMAIN_TAKEN',
+            message: `Subdomain "${slug}" is already serving snapshot ${clash.snapshotId}`,
+          });
+        }
+        set.slug = slug;
+      }
+    }
+
+    if (dto.autoRestart !== undefined) set.autoRestart = dto.autoRestart;
+
+    if (dto.startCommand !== undefined) {
+      const cmd = dto.startCommand?.trim();
+      if (cmd) set.startCommand = cmd;
+      else unset.startCommand = '';
+    }
+
+    if (!Object.keys(set).length && !Object.keys(unset).length) return doc;
+
+    const update: Record<string, any> = {};
+    if (Object.keys(set).length) update.$set = set;
+    if (Object.keys(unset).length) update.$unset = unset;
+
+    try {
+      await this.snapshotRepo.updateById((doc as any)._id.toString(), update, scope);
+    } catch (err) {
+      // The unique index is the real arbiter: two concurrent updates can both
+      // pass the check above and only one can win.
+      if ((err as any)?.code === 11000) {
+        throw new ConflictException({
+          code: 'SUBDOMAIN_TAKEN',
+          message: `Subdomain "${set.slug}" is already taken`,
+        });
+      }
+      throw err;
+    }
+
+    return this.findById(id, scope);
   }
 
   async destroy(id: string, scope: ExtensionScope): Promise<void> {
@@ -1402,6 +1502,50 @@ export class SnapshotsService implements OnModuleInit {
         where: 'host',
       },
     };
+  }
+
+  /**
+   * Run a snapshot's `startCommand` in a freshly restored sandbox.
+   *
+   * Detached and not awaited for completion: a start command is a server, so it
+   * does not return, and holding the restore open on it would turn every
+   * restore into a hang. `nohup` + `&` inside a subshell so the process
+   * survives the exec channel closing, and output goes to a log inside the
+   * sandbox where it can be read afterwards.
+   *
+   * Best-effort: a sandbox whose service fails to start is still a working
+   * sandbox. The failure surfaces where it is actionable — the waiting page
+   * reports that nothing is listening, rather than the restore erroring out.
+   */
+  private async runStartCommand(
+    sandbox: RuntimeSandbox,
+    snapshot: SnapshotDocument,
+    sandboxId: string,
+  ): Promise<void> {
+    const command = snapshot.startCommand?.trim();
+    if (!command) return;
+
+    const log = '/tmp/.devic-start.log';
+    const script =
+      `( nohup sh -c ${sh(command)} </dev/null >${log} 2>&1 & ) ; echo started`;
+
+    try {
+      const res = await sandbox.exec(script);
+      if (res.code !== 0) {
+        this.logger.warn(
+          `Start command for ${sandboxId} (snapshot ${snapshot.snapshotId}) ` +
+            `exited ${res.code}: ${res.stderr || res.stdout}`,
+        );
+        return;
+      }
+      this.logger.log(
+        `Start command launched in ${sandboxId} (snapshot ${snapshot.snapshotId})`,
+      );
+    } catch (err) {
+      this.logger.warn(
+        `Could not launch the start command in ${sandboxId}: ${(err as Error).message}`,
+      );
+    }
   }
 
   /** Restore a workdir-only snapshot (legacy path): extract tar.gz into workdir. */

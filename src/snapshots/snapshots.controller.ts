@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Patch,
   Delete,
   Body,
   Param,
@@ -9,10 +10,12 @@ import {
   Req,
   Res,
   HttpCode,
+  Optional,
   StreamableFile,
   UseInterceptors,
   UploadedFile,
 } from '@nestjs/common';
+import { IngressService } from '../ingress/ingress.service';
 import { ApiTags, ApiOperation, ApiConsumes } from '@nestjs/swagger';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { diskStorage } from 'multer';
@@ -22,26 +25,31 @@ import { SnapshotsService } from './snapshots.service';
 import { CreateSnapshotDto } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ImportSnapshotDto } from './dto/import-snapshot.dto';
+import { UpdateSnapshotDto } from './dto/update-snapshot.dto';
 import { uploadLimits } from '../config/upload-limits';
 
 @ApiTags('Snapshots')
 @Controller('snapshots')
 export class SnapshotsController {
-  constructor(private readonly service: SnapshotsService) {}
+  constructor(
+    private readonly service: SnapshotsService,
+    @Optional() private readonly ingress?: IngressService,
+  ) {}
 
   @Get()
   @ApiOperation({ summary: 'List snapshots' })
-  findAll(
+  async findAll(
     @Req() req: any,
     @Query('limit') limit?: number,
     @Query('offset') offset?: number,
     @Query('sandboxId') sandboxId?: string,
   ) {
-    return this.service.findAll(req.extensionScope ?? {}, {
+    const page = await this.service.findAll(req.extensionScope ?? {}, {
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
       sandboxId,
     });
+    return { ...page, data: (page.data ?? []).map((d) => this.withPublicUrl(d)) };
   }
 
   @Post('import')
@@ -68,8 +76,10 @@ export class SnapshotsController {
 
   @Get(':id')
   @ApiOperation({ summary: 'Get snapshot by ID' })
-  findById(@Param('id') id: string, @Req() req: any) {
-    return this.service.findById(id, req.extensionScope ?? {});
+  async findById(@Param('id') id: string, @Req() req: any) {
+    return this.withPublicUrl(
+      await this.service.findById(id, req.extensionScope ?? {}),
+    );
   }
 
   @Get(':id/download')
@@ -104,6 +114,35 @@ export class SnapshotsController {
     @Req() req: any,
   ) {
     return this.service.restore(id, dto, req.extensionScope ?? {});
+  }
+
+  @Patch(':id')
+  @ApiOperation({
+    summary: 'Update a snapshot subdomain and auto-restart setting',
+    description:
+      'Sets the subdomain this snapshot is served under and whether visiting ' +
+      'that URL restores it when nothing is running. Takes effect on the next ' +
+      'publish; a sandbox already serving this snapshot keeps its current URL.',
+  })
+  async update(
+    @Param('id') id: string,
+    @Body() dto: UpdateSnapshotDto,
+    @Req() req: any,
+  ) {
+    return this.withPublicUrl(
+      await this.service.update(id, dto, req.extensionScope ?? {}),
+    );
+  }
+
+  /**
+   * Attach the address this snapshot is served at. Derived, not stored: only
+   * the ingress knows the wildcard domain, and callers should not have to
+   * configure it a second time to render a link.
+   */
+  private withPublicUrl(doc: any): any {
+    const plain = typeof doc?.toObject === 'function' ? doc.toObject() : doc;
+    const publicUrl = this.ingress?.publicUrlForSnapshot(plain) ?? null;
+    return publicUrl ? { ...plain, publicUrl } : plain;
   }
 
   @Delete(':id')
