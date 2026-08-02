@@ -12,6 +12,7 @@ import {
   Modal,
   Form,
   InputNumber,
+  Alert,
 } from 'antd';
 import { FontAwesomeIcon } from '@fortawesome/react-fontawesome';
 import {
@@ -19,11 +20,13 @@ import {
   faCodeBranch,
   faFileArrowDown,
   faFileArrowUp,
+  faGlobe,
   faPlay,
   faTrash,
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
 import { useSnapshots, useRestoreSnapshot, useDeleteSnapshot } from '../../hooks/useSnapshots';
+import ServingSettingsModal from './ServingSettingsModal';
 import { useUsage } from '../../hooks/useUsage';
 import { snapshotsApi } from '../../api/client';
 import type { SnapshotDto } from '../../api/types';
@@ -53,6 +56,7 @@ const SnapshotsPage: React.FC = () => {
   const [modalMode, setModalMode] = useState<'restore' | 'fork'>('restore');
   const [selectedSnapshot, setSelectedSnapshot] = useState<SnapshotDto | null>(null);
   const [importOpen, setImportOpen] = useState(false);
+  const [servingSnapshot, setServingSnapshot] = useState<SnapshotDto | null>(null);
   const [downloadingIds, setDownloadingIds] = useState<Set<string>>(new Set());
   const [form] = Form.useForm();
 
@@ -168,6 +172,50 @@ const SnapshotsPage: React.FC = () => {
       render: (img: string) => <code style={{ fontSize: 11 }}>{img}</code>,
     },
     {
+      title: 'Served at',
+      key: 'serving',
+      width: 200,
+      render: (_: any, row) => {
+        if (!row.publicUrl) {
+          return <span style={{ fontSize: 11, opacity: 0.5 }}>-</span>;
+        }
+        const host = row.publicUrl.replace(/^https?:\/\//, '');
+        return (
+          <div>
+            <Tooltip title={row.publicUrl}>
+              <a
+                href={row.publicUrl}
+                target="_blank"
+                rel="noreferrer"
+                style={{ fontSize: 11 }}
+              >
+                {host}
+              </a>
+            </Tooltip>
+            <div style={{ marginTop: 2 }}>
+              {row.autoRestart === false ? (
+                <Tag color="default" style={{ fontSize: 10 }}>
+                  no auto-restart
+                </Tag>
+              ) : row.startCommand ? (
+                <Tooltip title={row.startCommand}>
+                  <Tag color="green" style={{ fontSize: 10 }}>
+                    starts on visit
+                  </Tag>
+                </Tooltip>
+              ) : (
+                <Tooltip title="Visiting the URL restores the snapshot, but no start command is set, so nothing will be listening.">
+                  <Tag color="orange" style={{ fontSize: 10 }}>
+                    no start command
+                  </Tag>
+                </Tooltip>
+              )}
+            </div>
+          </div>
+        );
+      },
+    },
+    {
       title: 'Size',
       dataIndex: 'sizeBytes',
       key: 'size',
@@ -219,7 +267,7 @@ const SnapshotsPage: React.FC = () => {
     {
       title: '',
       key: 'actions',
-      width: 160,
+      width: 190,
       align: 'right',
       render: (_: any, row) => (
         <Space size={4}>
@@ -237,6 +285,13 @@ const SnapshotsPage: React.FC = () => {
                   size="small"
                   icon={<FontAwesomeIcon icon={faCodeBranch} />}
                   onClick={() => openModal(row, 'fork')}
+                />
+              </Tooltip>
+              <Tooltip title="Serving settings (URL, restart on visit, start command)">
+                <Button
+                  size="small"
+                  icon={<FontAwesomeIcon icon={faGlobe} />}
+                  onClick={() => setServingSnapshot(row)}
                 />
               </Tooltip>
               <Tooltip title="Download ZIP">
@@ -356,6 +411,48 @@ const SnapshotsPage: React.FC = () => {
                   : 'Fully independent — snapshot stays unchanged'}
               </Tag>
             </div>
+
+            {/* What will actually be running once this finishes. A snapshot
+                restores files, not processes, so the start command is the
+                difference between a sandbox that serves and one that does
+                not — and it is not obvious from anywhere else in this dialog. */}
+            {selectedSnapshot.startCommand ? (
+              <Alert
+                type="success"
+                showIcon
+                style={{ marginTop: 12, fontSize: 12 }}
+                message="Starts automatically"
+                description={
+                  <span style={{ fontSize: 12 }}>
+                    After restoring, this runs:{' '}
+                    <code style={{ fontSize: 11 }}>{selectedSnapshot.startCommand}</code>
+                    {selectedSnapshot.publicUrl && (
+                      <>
+                        {' '}
+                        Served at{' '}
+                        <a href={selectedSnapshot.publicUrl} target="_blank" rel="noreferrer">
+                          {selectedSnapshot.publicUrl.replace(/^https?:\/\//, '')}
+                        </a>
+                        .
+                      </>
+                    )}
+                  </span>
+                }
+              />
+            ) : (
+              <Alert
+                type="warning"
+                showIcon
+                style={{ marginTop: 12, fontSize: 12 }}
+                message="No start command"
+                description={
+                  <span style={{ fontSize: 12 }}>
+                    Files are restored, but no process is — the sandbox will come
+                    up with nothing listening. Set one in the serving settings.
+                  </span>
+                }
+              />
+            )}
           </div>
         )}
         <Form form={form} layout="vertical" size="small">
@@ -370,6 +467,11 @@ const SnapshotsPage: React.FC = () => {
           </Form.Item>
         </Form>
       </Modal>
+
+      <ServingSettingsModal
+        snapshot={servingSnapshot}
+        onClose={() => setServingSnapshot(null)}
+      />
 
       <ImportSnapshotModal open={importOpen} onClose={() => setImportOpen(false)} />
     </div>

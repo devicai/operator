@@ -38,17 +38,18 @@ export class SnapshotsController {
 
   @Get()
   @ApiOperation({ summary: 'List snapshots' })
-  findAll(
+  async findAll(
     @Req() req: any,
     @Query('limit') limit?: number,
     @Query('offset') offset?: number,
     @Query('sandboxId') sandboxId?: string,
   ) {
-    return this.service.findAll(req.extensionScope ?? {}, {
+    const page = await this.service.findAll(req.extensionScope ?? {}, {
       limit: limit ? Number(limit) : undefined,
       offset: offset ? Number(offset) : undefined,
       sandboxId,
     });
+    return { ...page, data: (page.data ?? []).map((d) => this.withPublicUrl(d)) };
   }
 
   @Post('import')
