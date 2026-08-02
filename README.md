@@ -368,9 +368,20 @@ path has already been skipped by the time it lands — measured: the same snapsh
 self-started from its image and did not from its tarball. Running it here is the
 only point that behaves identically on both paths.
 
-Note `initScript` is not this: it belongs to whoever creates a sandbox and runs
-on `create` only (`sandboxes.service.ts:214`). `startCommand` belongs to the
-snapshot, which is what a URL actually points at.
+`initScript` is not this, and the split is by owner:
+
+- **`initScript` belongs to whoever manages the environment** — a developer
+  preparing a sandbox: installing packages, wiring credentials, laying out the
+  workspace. It runs on `create` only (`sandboxes.service.ts:214`).
+- **`startCommand` belongs to whoever consumes the snapshot** — typically the
+  agent working inside it, which is the party that knows how its own service
+  starts. It runs on every restore, including the ones a visitor triggers, where
+  no init script is in play.
+
+They can overlap: a session started through a caller that also runs an init
+script will run both, and if each starts the same server the second one hits
+`Address already in use`. Keep the service start in `startCommand` and leave
+preparation to `initScript`.
 
 #### Snapshot Image Cache
 
