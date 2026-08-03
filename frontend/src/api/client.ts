@@ -15,6 +15,7 @@ import type {
   SnapshotDto,
   CreateSnapshotDto,
   UpdateSnapshotDto,
+  UpdatedSnapshotDto,
   RestoreSnapshotDto,
   ImportSnapshotDto,
   ListFilesResult,
@@ -179,7 +180,7 @@ export const snapshotsApi = {
     return api.post(`/snapshots/${id}/restore`, dto);
   },
   /** How the snapshot is served: subdomain, restart-on-visit, start command. */
-  update(id: string, dto: UpdateSnapshotDto): Promise<AxiosResponse<SnapshotDto>> {
+  update(id: string, dto: UpdateSnapshotDto): Promise<AxiosResponse<UpdatedSnapshotDto>> {
     return api.patch(`/snapshots/${id}`, dto);
   },
   delete(id: string): Promise<AxiosResponse<void>> {

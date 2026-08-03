@@ -340,11 +340,14 @@ running: a visit to a dormant URL restores the snapshot and returns a waiting
 page that polls `/__devic/status` and reloads when the service answers. With the
 image cache that takes a couple of seconds.
 
-The restore is **unlinked** — opening a URL must never be able to write back
-into the snapshot it was served from — and gets `ingress.autoRestartTtlSeconds`
-rather than the usual default, since nobody asked for that sandbox explicitly.
-Concurrent visits are deduplicated through a Redis claim, so one page load
-starts one restore, not one per asset.
+The restore is **linked**, like any other: what gets served this way is an app
+with users, and an unlinked sandbox would drop everything they wrote when its
+TTL ran out. The snapshot is the thing that persists, so it is written back to
+when the sandbox stops or expires. Note what that means — anyone who can reach
+the public URL can change the snapshot through the app being served. It gets
+`ingress.autoRestartTtlSeconds` rather than the usual default, since nobody
+asked for that sandbox explicitly. Concurrent visits are deduplicated through a
+Redis claim, so one page load starts one restore, not one per asset.
 
 Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
 `ingress.autoRestart: false`.
@@ -360,6 +363,34 @@ It runs after every restore, detached and best-effort — a sandbox whose servic
 fails to start is still a working sandbox, and the waiting page reports that
 nothing is listening rather than the restore erroring out. Output goes to
 `/tmp/.devic-start.log` inside the sandbox.
+
+Because it is launched detached, the shell reports success whether or not the
+command goes on to start anything — a broken one is invisible until someone
+visits the URL and gets a 502. So `PATCH` reads the command back and returns
+what it found:
+
+```json
+{ "startCommandWarnings": [ { "code": "PGREP_SELF_MATCH", "message": "…", "fix": "…" } ] }
+```
+
+The command is saved either way; these are advisory. Three checks, each exact
+rather than heuristic:
+
+- **`SYNTAX_ERROR`** — the command is parsed with `sh -n`, the real shell
+  parser, which reads without executing. Unbalanced quotes, an unclosed `if`.
+- **`PGREP_SELF_MATCH`** — `pgrep -f PAT` searches whole command lines,
+  *including the one of the shell evaluating it*, whose command line is the
+  start command itself. The pattern is written right there, so it finds itself,
+  the guard concludes the service is already up, and nothing starts — silently,
+  with an empty log. This is not a matter of writing the pattern better:
+  `"[n]ode app.js"` fails too, because `node app.js` is spelled out later in the
+  same line. A restore always begins from a fresh container, so the guard has
+  nothing to protect against; drop it, or test the port instead.
+- **`PKILL_SELF_MATCH`** — same mechanism, worse outcome: it kills the shell
+  running the command, so nothing after that point runs.
+
+The same check runs at restore time and logs what it finds, tying the problem to
+a specific sandbox.
 
 It deliberately runs **after the filesystem is in place**, not through the
 container entrypoint. A tarball restore creates the container, starts it, and

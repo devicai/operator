@@ -26,6 +26,7 @@ import { CreateSnapshotDto } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ImportSnapshotDto } from './dto/import-snapshot.dto';
 import { UpdateSnapshotDto } from './dto/update-snapshot.dto';
+import { inspectStartCommand } from './start-command.validation';
 import { uploadLimits } from '../config/upload-limits';
 
 @ApiTags('Snapshots')
@@ -118,20 +119,30 @@ export class SnapshotsController {
 
   @Patch(':id')
   @ApiOperation({
-    summary: 'Update a snapshot subdomain and auto-restart setting',
+    summary: 'Update a snapshot subdomain, auto-restart and start command',
     description:
-      'Sets the subdomain this snapshot is served under and whether visiting ' +
-      'that URL restores it when nothing is running. Takes effect on the next ' +
-      'publish; a sandbox already serving this snapshot keeps its current URL.',
+      'Sets the subdomain this snapshot is served under, whether visiting ' +
+      'that URL restores it when nothing is running, and what to run once it ' +
+      'is back. Takes effect on the next publish; a sandbox already serving ' +
+      'this snapshot keeps its current URL. When a start command is given, ' +
+      'the response carries startCommandWarnings: static problems found in it ' +
+      'that would otherwise only show up as a 502 on the public URL. They are ' +
+      'advisory — the command is saved either way.',
   })
   async update(
     @Param('id') id: string,
     @Body() dto: UpdateSnapshotDto,
     @Req() req: any,
   ) {
-    return this.withPublicUrl(
+    const updated = this.withPublicUrl(
       await this.service.update(id, dto, req.extensionScope ?? {}),
     );
+    if (dto.startCommand === undefined) return updated;
+
+    const startCommandWarnings = await inspectStartCommand(
+      dto.startCommand ?? '',
+    );
+    return { ...updated, startCommandWarnings };
   }
 
   /**
