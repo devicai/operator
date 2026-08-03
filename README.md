@@ -360,6 +360,23 @@ losing exactly the writes the save exists to keep.
 Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
 `ingress.autoRestart: false`.
 
+**Reachability does not live in Redis.** Docker puts each sandbox on its own
+bridge network and `publish` joins *this* container to it — an attachment that
+dies when the container is replaced. After a restart or a redeploy the routes
+still resolve, but the addresses they name are no longer routable from here:
+packets vanish and requests hang until the upstream timeout. Two things keep
+that from stranding a sandbox:
+
+- On startup, every running sandbox holding a subdomain is republished, which
+  reattaches the network and refreshes its address.
+- A route whose upstream cannot be connected to (refused, unreachable, or no
+  answer within `CONNECT_TIMEOUT_MS`) is **dropped** and the address is served
+  as dormant, so the wake-up can replace it. This matters beyond restarts: a
+  route that exists suppresses the wake-up, so without it a stale entry would
+  keep the address dead until the sandbox expired. An upstream that *accepts*
+  the connection and then misbehaves still gets a plain 502 — that is the
+  service's problem, not the route's.
+
 **A snapshot restores files, not processes**, so nothing listens in a freshly
 restored sandbox unless the snapshot says what to start:
 

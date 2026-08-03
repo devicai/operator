@@ -19,6 +19,9 @@ describe('IngressProxyServer — dormant subdomains', () => {
   const routes = new Map<string, any>();
   const registry = {
     lookup: jest.fn(async (sub: string) => routes.get(sub) ?? null),
+    unpublish: jest.fn(async (sub: string) => {
+      routes.delete(sub);
+    }),
   };
 
   const wakeOutcomes = new Map<string, any>();
@@ -195,6 +198,67 @@ describe('IngressProxyServer — dormant subdomains', () => {
       expect(res.status).toBe(200);
       expect(res.body).toBe('hello from the sandbox');
       expect(wakeup.wake).not.toHaveBeenCalled();
+    } finally {
+      await new Promise<void>((r) => upstream.close(() => r()));
+    }
+  });
+
+  // A published route is a claim that can stop being true — the sandbox removed
+  // behind our back, the network attachment lost with a restart. Left in place
+  // it is worse than no route at all: it suppresses the wake-up that would
+  // replace it, so the address stays dead until the sandbox expires.
+  describe('when the route points at nothing', () => {
+    // Port 1 on loopback: nothing binds it, so connecting is refused at once.
+    const deadRoute = () =>
+      routes.set('my-app', {
+        sandboxId: 'goneBox',
+        upstreamHost: '127.0.0.1',
+        upstreamPort: 1,
+      });
+
+    it('drops the route and wakes the snapshot behind it', async () => {
+      deadRoute();
+      wakeOutcomes.set('my-app', { kind: 'waking', snapshot: {} });
+      statuses.set('my-app', { state: 'starting' });
+
+      const res = await get('/', BROWSER);
+
+      expect(registry.unpublish).toHaveBeenCalledWith('my-app');
+      expect(wakeup.wake).toHaveBeenCalledWith('my-app');
+      expect(res.status).toBe(503);
+      expect(res.body).toContain('Starting this sandbox');
+    });
+
+    it('reports 404 when there is no snapshot to fall back on', async () => {
+      deadRoute();
+      wakeOutcomes.set('my-app', { kind: 'unknown' });
+
+      const res = await get('/', BROWSER);
+
+      expect(registry.unpublish).toHaveBeenCalledWith('my-app');
+      expect(res.status).toBe(404);
+    });
+  });
+
+  // An upstream that accepts the connection and then misbehaves is the
+  // upstream's own problem: dropping its route would replace a running sandbox
+  // over a bad response.
+  it('keeps a 502 for an upstream that answers badly', async () => {
+    const upstream = http.createServer((_req, socket) => {
+      socket.destroy();
+    });
+    await new Promise<void>((r) => upstream.listen(0, '127.0.0.1', r));
+    const upstreamPort = (upstream.address() as AddressInfo).port;
+    routes.set('my-app', {
+      sandboxId: 'box1',
+      upstreamHost: '127.0.0.1',
+      upstreamPort,
+    });
+
+    try {
+      const res = await get('/', BROWSER);
+      expect(res.status).toBe(502);
+      expect(registry.unpublish).not.toHaveBeenCalled();
     } finally {
       await new Promise<void>((r) => upstream.close(() => r()));
     }
