@@ -208,6 +208,21 @@ export interface UpdateSnapshotDto {
   startCommand?: string | null;
 }
 
+/**
+ * A problem found in a start command by reading it, not by running it. The
+ * command is saved regardless — this is what the caller could not have seen,
+ * since a detached launch reports success either way.
+ */
+export interface StartCommandWarning {
+  code: 'PGREP_SELF_MATCH' | 'PKILL_SELF_MATCH' | 'SYNTAX_ERROR';
+  message: string;
+  fix?: string;
+}
+
+export interface UpdatedSnapshotDto extends SnapshotDto {
+  startCommandWarnings?: StartCommandWarning[];
+}
+
 export interface CreateSnapshotDto {
   sandboxId: string;
   name?: string;

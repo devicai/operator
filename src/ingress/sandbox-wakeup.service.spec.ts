@@ -40,12 +40,28 @@ describe('SandboxWakeupService', () => {
         message,
       });
     }),
+    noteWakeupWaiting: jest.fn(
+      async (
+        sub: string,
+        snapshotId: string,
+        startedAt: string,
+        message: string,
+      ) => {
+        wakeups.set(sub, { state: 'starting', startedAt, snapshotId, message });
+      },
+    ),
     clearWakeup: jest.fn(async (sub: string) => {
       wakeups.delete(sub);
       claims.delete(sub);
     }),
     lookup: jest.fn(async (sub: string) => routes.get(sub) ?? null),
   };
+
+  /** What the restore throws while a capture into the snapshot is running. */
+  const saveInProgressError = (): Error =>
+    Object.assign(new Error('A save into this snapshot is still in progress.'), {
+      response: { code: 'SNAPSHOT_SAVE_IN_PROGRESS' },
+    });
 
   const snapshots = new Map<string, any>();
   const snapshotRepo = {
@@ -101,7 +117,7 @@ describe('SandboxWakeupService', () => {
     expect(restore).toHaveBeenCalledTimes(1);
   });
 
-  it('restores UNLINKED, so a visit can never write back into the snapshot', async () => {
+  it('restores with the auto-restart TTL, not the ordinary default', async () => {
     snapshots.set('my-app', readySnapshot());
     const restore = jest.fn(async () => ({ sandboxId: 'newBox' }));
     service.registerRestorer(restore);
@@ -109,7 +125,8 @@ describe('SandboxWakeupService', () => {
     await service.wake('my-app');
     await new Promise((r) => setImmediate(r));
 
-    // The service decides the TTL; linkage is the caller's contract and is
+    // Nobody asked for this sandbox explicitly, so it gets its own budget. The
+    // service decides only that; linkage is the caller's contract and is
     // asserted where the restorer is registered (snapshots.service).
     expect(restore).toHaveBeenCalledWith('snap1', 1800);
   });
@@ -185,6 +202,63 @@ describe('SandboxWakeupService', () => {
     expect(await service.status('my-app')).toEqual({
       state: 'error',
       message: 'not enough memory',
+      routed: false,
+    });
+  });
+
+  // The aftermath of the previous session expiring: its TTL fires, the sandbox
+  // writes itself back into the snapshot, and that capture runs for minutes on
+  // a large one. A visitor arriving in that window used to be told the site had
+  // failed, when it was busy saving exactly the state they came to see.
+  describe('while a save into the snapshot is running', () => {
+    it('waits for the save instead of reporting a failure', async () => {
+      jest.useFakeTimers();
+      snapshots.set('my-app', readySnapshot());
+
+      let attempts = 0;
+      service.registerRestorer(async () => {
+        attempts += 1;
+        if (attempts < 3) throw saveInProgressError();
+        return { sandboxId: 'newBox' };
+      });
+
+      await service.wake('my-app');
+      await jest.advanceTimersByTimeAsync(10_000);
+      jest.useRealTimers();
+
+      expect(attempts).toBe(3);
+      expect(registry.failWakeup).not.toHaveBeenCalled();
+      // Cleared on success, which is what lets a later stop wake it again.
+      expect(wakeups.get('my-app')).toBeUndefined();
+    });
+
+    it('says what it is waiting on, so the page shows progress not a bare spinner', async () => {
+      jest.useFakeTimers();
+      snapshots.set('my-app', readySnapshot());
+      service.registerRestorer(async () => {
+        throw saveInProgressError();
+      });
+
+      await service.wake('my-app');
+      await jest.advanceTimersByTimeAsync(5000);
+
+      const status = await service.status('my-app');
+      expect(status.state).toBe('starting');
+      expect(status.message).toMatch(/saving/i);
+      jest.useRealTimers();
+    });
+
+    // Anything else is a real failure and must not be retried forever.
+    it('still reports an ordinary restore failure straight away', async () => {
+      snapshots.set('my-app', readySnapshot());
+      service.registerRestorer(async () => {
+        throw new Error('not enough memory');
+      });
+
+      await service.wake('my-app');
+      await new Promise((r) => setImmediate(r));
+
+      expect((await service.status('my-app')).state).toBe('error');
     });
   });
 
@@ -236,11 +310,19 @@ describe('SandboxWakeupService', () => {
         upstreamHost: '127.0.0.1',
         upstreamPort: 1,
       });
-      expect(await service.status('my-app')).toEqual({ state: 'starting' });
+      // `routed` is what lets the page say "up but not serving" instead of
+      // "did not come up" — two different problems with two different fixes.
+      expect(await service.status('my-app')).toEqual({
+        state: 'starting',
+        routed: true,
+      });
     });
 
     it('reports idle when nothing is happening', async () => {
-      expect(await service.status('my-app')).toEqual({ state: 'idle' });
+      expect(await service.status('my-app')).toEqual({
+        state: 'idle',
+        routed: false,
+      });
     });
 
     it('reports how long a wake-up has been running', async () => {

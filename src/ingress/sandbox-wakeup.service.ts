@@ -13,6 +13,27 @@ const DEFAULT_TIMEOUT_SECONDS = 120;
 const ERROR_TTL_SECONDS = 30;
 /** Budget for the "is anything listening yet?" probe. Runs on every poll. */
 const PROBE_TIMEOUT_MS = 1000;
+/**
+ * How long a wake-up waits for a save into the snapshot to finish. Generous on
+ * purpose: a full capture of a multi-gigabyte snapshot runs for minutes, and
+ * giving up means telling a visitor the site is broken when it is merely busy.
+ */
+const SAVE_WAIT_BUDGET_MS = 10 * 60 * 1000;
+const SAVE_POLL_INTERVAL_MS = 3000;
+
+const delay = (ms: number): Promise<void> =>
+  new Promise((resolve) => setTimeout(resolve, ms));
+
+/**
+ * Whether a restore was refused because a save into the snapshot is running.
+ * Nest wraps the thrown payload, so the code can sit at either level.
+ */
+function isSaveInProgress(err: unknown): boolean {
+  const res = (err as { response?: unknown; code?: unknown })?.response;
+  const code =
+    (res as { code?: unknown })?.code ?? (err as { code?: unknown })?.code;
+  return code === 'SNAPSHOT_SAVE_IN_PROGRESS';
+}
 
 /**
  * Restores a snapshot when someone visits its public URL and nothing is
@@ -46,6 +67,13 @@ export interface WakeStatus {
   message?: string;
   /** Seconds since the wake-up began, when one is in flight. */
   elapsedSeconds?: number;
+  /**
+   * Whether a sandbox is published on this subdomain. It is the difference
+   * between "running but nothing listening" and "never came up", which are
+   * different problems with different fixes — and the page can only tell them
+   * apart if it is told.
+   */
+  routed?: boolean;
 }
 
 @Injectable()
@@ -130,25 +158,56 @@ export class SandboxWakeupService {
     snapshot: SnapshotDocument,
   ): Promise<void> {
     const started = Date.now();
-    try {
-      const { sandboxId } = await this.restorer!(
-        snapshot.snapshotId,
-        this.ttlSeconds,
-      );
-      this.logger.log(
-        `Woke ${subdomain} → sandbox ${sandboxId} from snapshot ` +
-          `${snapshot.snapshotId} (${Math.round((Date.now() - started) / 1000)}s)`,
-      );
-      // The restore published the sandbox, so the registry now answers for this
-      // subdomain and the claim has done its job. Dropping it lets a later stop
-      // be followed by a fresh wake-up.
-      await this.registry.clearWakeup(subdomain).catch(() => undefined);
-    } catch (err) {
-      const message = (err as Error).message ?? 'restore failed';
-      this.logger.warn(`Waking ${subdomain} failed: ${message}`);
-      await this.registry
-        .failWakeup(subdomain, snapshot.snapshotId, message, ERROR_TTL_SECONDS)
-        .catch(() => undefined);
+    const startedAt = new Date(started).toISOString();
+
+    for (;;) {
+      try {
+        const { sandboxId } = await this.restorer!(
+          snapshot.snapshotId,
+          this.ttlSeconds,
+        );
+        this.logger.log(
+          `Woke ${subdomain} → sandbox ${sandboxId} from snapshot ` +
+            `${snapshot.snapshotId} (${Math.round((Date.now() - started) / 1000)}s)`,
+        );
+        // The restore published the sandbox, so the registry now answers for
+        // this subdomain and the claim has done its job. Dropping it lets a
+        // later stop be followed by a fresh wake-up.
+        await this.registry.clearWakeup(subdomain).catch(() => undefined);
+        return;
+      } catch (err) {
+        const message = (err as Error).message ?? 'restore failed';
+        const waited = Date.now() - started;
+
+        // A save in progress is the normal aftermath of the previous session
+        // expiring: it is writing back exactly the state this visitor is about
+        // to ask for. Restoring with force would serve the version before it
+        // and then overwrite the save with that older filesystem — losing the
+        // very writes the save exists to keep. So wait for it.
+        if (isSaveInProgress(err) && waited < SAVE_WAIT_BUDGET_MS) {
+          await this.registry
+            .noteWakeupWaiting(
+              subdomain,
+              snapshot.snapshotId,
+              startedAt,
+              'Saving the previous session before it can be restored.',
+              this.claimSeconds,
+            )
+            .catch(() => undefined);
+          this.logger.debug?.(
+            `Waking ${subdomain}: waiting for the save into ` +
+              `${snapshot.snapshotId} to finish (${Math.round(waited / 1000)}s)`,
+          );
+          await delay(SAVE_POLL_INTERVAL_MS);
+          continue;
+        }
+
+        this.logger.warn(`Waking ${subdomain} failed: ${message}`);
+        await this.registry
+          .failWakeup(subdomain, snapshot.snapshotId, message, ERROR_TTL_SECONDS)
+          .catch(() => undefined);
+        return;
+      }
     }
   }
 
@@ -173,18 +232,24 @@ export class SandboxWakeupService {
       // and the page reloads as soon as they do.
     }
 
+    const routed = Boolean(entry);
     const wakeup = await this.registry.getWakeup(subdomain).catch(() => null);
     if (!wakeup) {
       // No route answering and no wake-up recorded. When a sandbox IS routed
       // the visitor is simply waiting on a service that has not come up, which
       // reads as 'starting' — the page's own timeout ends the wait.
-      return entry ? { state: 'starting' } : { state: 'idle' };
+      return entry ? { state: 'starting', routed } : { state: 'idle', routed };
     }
     if (wakeup.state === 'error') {
-      return { state: 'error', message: wakeup.message };
+      return { state: 'error', message: wakeup.message, routed };
     }
     return {
       state: 'starting',
+      // Set while waiting on something specific, e.g. a save that has to finish
+      // first. A wait with a reason reads as progress; a bare spinner past the
+      // usual couple of seconds reads as broken.
+      message: wakeup.message,
+      routed,
       elapsedSeconds: Math.max(
         0,
         Math.round((Date.now() - new Date(wakeup.startedAt).getTime()) / 1000),

@@ -19,7 +19,7 @@ export interface WakeupState {
   startedAt: string;
   /** Snapshot being restored. */
   snapshotId: string;
-  /** Present when `state` is 'error'. */
+  /** Why it failed, or what it is waiting on while still starting. */
   message?: string;
 }
 
@@ -150,6 +150,36 @@ export class IngressRegistry implements OnModuleDestroy {
     const payload: WakeupState = {
       state: 'error',
       startedAt: new Date().toISOString(),
+      snapshotId,
+      message,
+    };
+    await this.redis.set(
+      this.wakeupKey(subdomain),
+      JSON.stringify(payload),
+      'EX',
+      Math.max(1, Math.floor(ttlSeconds)),
+    );
+  }
+
+  /**
+   * Say what a still-running wake-up is waiting on, and hold the claim open for
+   * as long as it takes.
+   *
+   * Waiting is a legitimate outcome, not a failure: a snapshot being saved
+   * cannot be restored yet, and the save is what makes the restore worth doing.
+   * The claim would otherwise expire mid-wait and let a second visitor start a
+   * competing restore.
+   */
+  async noteWakeupWaiting(
+    subdomain: string,
+    snapshotId: string,
+    startedAt: string,
+    message: string,
+    ttlSeconds: number,
+  ): Promise<void> {
+    const payload: WakeupState = {
+      state: 'starting',
+      startedAt,
       snapshotId,
       message,
     };

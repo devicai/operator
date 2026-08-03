@@ -78,15 +78,23 @@ export function waitingPage(opts: {
   const poll = opts.pollIntervalMs ?? 1500;
   const script = `
 (function(){
-  var deadline = Date.now() + ${opts.timeoutSeconds * 1000};
+  var budget = ${opts.timeoutSeconds * 1000};
+  var deadline = Date.now() + budget;
   var el = document.getElementById('detail');
-  function fail(msg){
+  // Only claim the sandbox is up when the server says it is routed. Saying so
+  // after a restore that never happened sends the reader looking for a process
+  // inside a sandbox that does not exist.
+  function fail(msg, routed){
     document.getElementById('spin').style.display='none';
-    document.getElementById('title').textContent='The sandbox is up, but nothing is serving';
-    document.getElementById('lead').textContent =
-      'The files were restored and the sandbox is running, but no process is ' +
-      'listening on its HTTP port. Start the service from Devic and reload ' +
-      'this page.';
+    document.getElementById('title').textContent = routed
+      ? 'The sandbox is up, but nothing is serving'
+      : 'The sandbox did not come up';
+    document.getElementById('lead').textContent = routed
+      ? 'The files were restored and the sandbox is running, but no process is ' +
+        'listening on its HTTP port. Start the service from Devic and reload ' +
+        'this page.'
+      : 'Nothing is serving this address yet. Reload to try again, or start it ' +
+        'from Devic.';
     el.textContent = msg || '';
   }
   function tick(){
@@ -94,8 +102,22 @@ export function waitingPage(opts: {
       .then(function(r){return r.json()})
       .then(function(s){
         if(s.state==='ready'){ location.reload(); return; }
-        if(s.state==='error'){ fail(s.message); return; }
-        if(Date.now()>deadline){ fail('Timed out after ${opts.timeoutSeconds}s.'); return; }
+        if(s.state==='error'){ fail(s.message, s.routed); return; }
+        // A message on a still-starting wake-up means it is blocked on
+        // something known and finite — a save that has to finish first, which
+        // runs for minutes on a large snapshot. Keep waiting: giving up here
+        // would report a failure for work that is going to succeed.
+        if(s.message){
+          deadline = Date.now() + budget;
+          el.textContent = s.message +
+            (typeof s.elapsedSeconds==='number' ? ' (' + s.elapsedSeconds + 's)' : '');
+          setTimeout(tick, ${poll});
+          return;
+        }
+        if(Date.now()>deadline){
+          fail('Timed out after ${opts.timeoutSeconds}s.', s.routed);
+          return;
+        }
         if(typeof s.elapsedSeconds==='number' && s.elapsedSeconds>3){
           el.textContent = s.elapsedSeconds + 's';
         }

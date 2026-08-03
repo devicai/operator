@@ -403,7 +403,14 @@ const SandboxesPage: React.FC = () => {
                     ? 'Stopping…'
                     : row.snapshotId
                       ? `Stop and save: the filesystem is written back to snapshot ${row.snapshotId}`
-                      : 'Stop. This sandbox is not linked to a snapshot, so its changes are discarded'
+                      : // A forked sandbox does come from a snapshot, it just
+                        // does not write back to it. Saying "not linked to a
+                        // snapshot" reads as "unrelated to any snapshot",
+                        // which the snapshot's own URL on this same row
+                        // contradicts.
+                        row.metadata?.restoredFrom
+                        ? `Stop. This sandbox was forked from snapshot ${row.metadata.restoredFrom} and is not linked to it, so its changes are discarded`
+                        : 'Stop. This sandbox does not come from a snapshot, so its changes are discarded'
                 }
               >
                 <Button

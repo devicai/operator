@@ -42,6 +42,7 @@ import { CreateSnapshotDto, SnapshotScope } from './dto/create-snapshot.dto';
 import { RestoreSnapshotDto } from './dto/restore-snapshot.dto';
 import { ImportSnapshotDto } from './dto/import-snapshot.dto';
 import { UpdateSnapshotDto } from './dto/update-snapshot.dto';
+import { validateStartCommand } from './start-command.validation';
 import { tarballToZipStream, zipToTarGz } from './snapshot-zip.util';
 import { Readable } from 'stream';
 import { ResourceUsageService } from '../providers/resource-usage.service';
@@ -168,16 +169,13 @@ export class SnapshotsService implements OnModuleInit {
     // importing this service: the ingress already sits below us (we publish
     // through it), so it cannot depend on us without closing a cycle.
     //
-    // `linked: false` is deliberate. Waking a sandbox is something a VISITOR
-    // triggered, not the owner, and a linked sandbox writes itself back into
-    // the snapshot when it stops or expires. Opening a URL must not be able to
-    // overwrite the snapshot it was served from.
+    // Linked, like any other restore. What gets served this way is an app with
+    // users — a form, a database, anything that writes — and an unlinked
+    // sandbox drops every one of those writes when its TTL runs out. Waking on
+    // a visit is only useful if what visitors do then survives, so the snapshot
+    // is the thing that persists and it has to be written back to.
     this.wakeupService?.registerRestorer(async (snapshotId, ttlSeconds) => {
-      const sandbox = await this.restore(
-        snapshotId,
-        { ttlSeconds, linked: false },
-        {},
-      );
+      const sandbox = await this.restore(snapshotId, { ttlSeconds }, {});
       return { sandboxId: sandbox.sandboxId };
     });
 
@@ -1524,6 +1522,16 @@ export class SnapshotsService implements OnModuleInit {
   ): Promise<void> {
     const command = snapshot.startCommand?.trim();
     if (!command) return;
+
+    // Launching detached means the shell reports success no matter what the
+    // command then does, so a command that cannot work is invisible here. Say
+    // so at the one moment the logs tie it to a specific restore.
+    for (const w of validateStartCommand(command)) {
+      this.logger.warn(
+        `Start command for snapshot ${snapshot.snapshotId} looks broken ` +
+          `(${w.code}): ${w.message}`,
+      );
+    }
 
     const log = '/tmp/.devic-start.log';
     const script =

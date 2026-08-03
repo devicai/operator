@@ -1,7 +1,7 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { Alert, Form, Input, Modal, Switch, Typography, message } from 'antd';
 import { useUpdateSnapshot } from '../../hooks/useSnapshots';
-import type { SnapshotDto } from '../../api/types';
+import type { SnapshotDto, StartCommandWarning } from '../../api/types';
 
 const { Text } = Typography;
 
@@ -23,10 +23,12 @@ interface Props {
  */
 const ServingSettingsModal: React.FC<Props> = ({ snapshot, onClose }) => {
   const [form] = Form.useForm();
+  const [warnings, setWarnings] = useState<StartCommandWarning[]>([]);
   const update = useUpdateSnapshot();
 
   useEffect(() => {
     if (!snapshot) return;
+    setWarnings([]);
     form.setFieldsValue({
       slug: snapshot.slug ?? '',
       autoRestart: snapshot.autoRestart !== false,
@@ -38,7 +40,7 @@ const ServingSettingsModal: React.FC<Props> = ({ snapshot, onClose }) => {
     if (!snapshot) return;
     try {
       const values = await form.validateFields();
-      await update.mutateAsync({
+      const saved = await update.mutateAsync({
         id: snapshot.snapshotId,
         dto: {
           // Empty releases the subdomain and falls back to the derived label,
@@ -48,6 +50,16 @@ const ServingSettingsModal: React.FC<Props> = ({ snapshot, onClose }) => {
           startCommand: values.startCommand?.trim() || null,
         },
       });
+
+      // Saved either way — these are things the command cannot do, not reasons
+      // to reject it. Keep the modal open so the text is still there to fix:
+      // otherwise the next sign of trouble is a 502 on the public URL.
+      const found = saved?.startCommandWarnings ?? [];
+      setWarnings(found);
+      if (found.length) {
+        message.warning('Saved, but the start command looks broken');
+        return;
+      }
       message.success('Serving settings saved');
       onClose();
     } catch (e: any) {
@@ -124,13 +136,43 @@ const ServingSettingsModal: React.FC<Props> = ({ snapshot, onClose }) => {
         </Form.Item>
       </Form>
 
-      <Alert
-        type="info"
-        showIcon
-        message="A snapshot restores files, not processes"
-        description="Without a start command a restored sandbox comes up with nothing listening, and the URL will report exactly that."
-        style={{ fontSize: 12 }}
-      />
+      {warnings.length > 0 ? (
+        <Alert
+          type="warning"
+          showIcon
+          message={
+            warnings.length === 1
+              ? 'This start command will not do what it looks like'
+              : `${warnings.length} problems in this start command`
+          }
+          description={
+            <div style={{ fontSize: 12 }}>
+              {warnings.map((w, i) => (
+                <div key={w.code + i} style={{ marginTop: i ? 8 : 0 }}>
+                  <div>{w.message}</div>
+                  {w.fix && (
+                    <div style={{ marginTop: 4, opacity: 0.85 }}>
+                      <strong>Fix:</strong> {w.fix}
+                    </div>
+                  )}
+                </div>
+              ))}
+              <div style={{ marginTop: 8, opacity: 0.7 }}>
+                Saved anyway — edit above and save again, or close to keep it.
+              </div>
+            </div>
+          }
+          style={{ fontSize: 12 }}
+        />
+      ) : (
+        <Alert
+          type="info"
+          showIcon
+          message="A snapshot restores files, not processes"
+          description="Without a start command a restored sandbox comes up with nothing listening, and the URL will report exactly that."
+          style={{ fontSize: 12 }}
+        />
+      )}
     </Modal>
   );
 };
