@@ -4,12 +4,15 @@ import {
   Logger,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import * as http from 'http';
 import * as net from 'net';
 import { Duplex } from 'stream';
 import { CONFIG } from '../config/config.loader';
 import { IngressConfig, ModuleConfig } from '../config/config.types';
+import { SandboxRepository } from '../repositories/sandbox.repository';
+import { SandboxStatus } from '../schemas/sandbox.schema';
 import { IngressRegistry } from './ingress-registry';
 import { SandboxWakeupService } from './sandbox-wakeup.service';
 import {
@@ -63,6 +66,9 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly registry: IngressRegistry,
     private readonly wakeup: SandboxWakeupService,
+    // Optional so the proxy still runs where no repository is wired; without it
+    // a route is simply trusted, which is the conservative half of the choice.
+    @Optional() private readonly sandboxRepo?: SandboxRepository,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -262,14 +268,11 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
         return;
       }
 
-      // The route named an address nothing answers at. Publishing it was a
-      // claim that stopped being true — a sandbox removed behind our back, a
-      // network attachment lost with a restart — and leaving it in place is
-      // worse than having no route at all, because a route suppresses the
-      // wake-up that would replace it. Drop it and treat the address as
-      // dormant, which restores it if a snapshot is behind it.
+      // Nothing answered at the address. Either the sandbox behind it is gone
+      // — a route that outlived what it pointed at — or it is alive and simply
+      // has no service listening. Only the first is the route's fault.
       if (isUnreachable(err)) {
-        void this.recoverDeadRoute(req, res, subdomain, upstream.sandboxId);
+        void this.handleUnreachable(req, res, subdomain, upstream.sandboxId);
         return;
       }
 
@@ -283,30 +286,70 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
   }
 
   /**
-   * Forget a route whose upstream cannot be reached, then serve the address as
-   * if nothing had been published — which is now the truth.
+   * Decide what an unanswered upstream means, and act on it.
+   *
+   * A live sandbox with no service listening is the normal state right after a
+   * restore — a snapshot restores files, not processes — and replacing it would
+   * be the wrong move twice over: it abandons a sandbox someone may be working
+   * in, and it leaves two linked sandboxes of the same snapshot racing to write
+   * themselves back into it. So the route stands, and the visitor gets the
+   * waiting page, which reloads the moment anything starts listening.
+   *
+   * A route pointing at a sandbox that is gone is the opposite: it is a claim
+   * that stopped being true, and worse than no route at all, because a route
+   * suppresses the wake-up that would replace it.
    */
-  private async recoverDeadRoute(
+  private async handleUnreachable(
     req: http.IncomingMessage,
     res: http.ServerResponse,
     subdomain: string,
     sandboxId: string,
   ): Promise<void> {
-    this.logger.warn(
-      `Dropping route ${subdomain} → sandbox ${sandboxId}: upstream unreachable`,
-    );
-    await this.registry.unpublish(subdomain).catch(() => undefined);
     try {
+      if (await this.isSandboxAlive(sandboxId)) {
+        this.logger.debug(
+          `${subdomain} → sandbox ${sandboxId} is running but nothing is listening`,
+        );
+        this.sendHtml(
+          req,
+          res,
+          503,
+          waitingPage({ timeoutSeconds: this.wakeup.timeoutSeconds }),
+          'Sandbox is running but no service is listening',
+        );
+        return;
+      }
+
+      this.logger.warn(
+        `Dropping route ${subdomain} → sandbox ${sandboxId}: upstream unreachable`,
+      );
+      await this.registry.unpublish(subdomain).catch(() => undefined);
       await this.serveDormant(req, res, subdomain);
     } catch (err) {
       this.logger.warn(
-        `Could not serve ${subdomain} after dropping its route: ${(err as Error).message}`,
+        `Could not serve ${subdomain} after an unreachable upstream: ${(err as Error).message}`,
       );
       if (!res.headersSent) {
         res.statusCode = 502;
         res.setHeader('Content-Type', 'text/plain; charset=utf-8');
         res.end('Bad Gateway');
       }
+    }
+  }
+
+  /**
+   * Whether the sandbox a route names still exists and is running. Without a
+   * repository (the proxy can run standalone) nothing is known, and the safe
+   * answer is yes: keeping a route costs a waiting page, dropping one that was
+   * fine costs a duplicate sandbox.
+   */
+  private async isSandboxAlive(sandboxId: string): Promise<boolean> {
+    if (!this.sandboxRepo) return true;
+    try {
+      const doc = await this.sandboxRepo.findOne({ sandboxId } as any, {});
+      return doc?.status === SandboxStatus.RUNNING;
+    } catch {
+      return true;
     }
   }
 
