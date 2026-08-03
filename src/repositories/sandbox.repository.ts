@@ -124,6 +124,27 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
   }
 
   /**
+   * The most recent running sandbox restored from a snapshot, whether it is
+   * linked to it or was forked from it.
+   *
+   * A snapshot's public URL is answered by whichever sandbox is serving it, so
+   * before restoring another one there has to be a way to ask whether one is
+   * already up. Two sandboxes of one snapshot would compete for the address and,
+   * when linked, race to write themselves back into it.
+   */
+  async findRunningFromSnapshot(
+    snapshotId: string,
+  ): Promise<SandboxDocument | null> {
+    return this.model
+      .findOne({
+        status: SandboxStatus.RUNNING,
+        $or: [{ snapshotId }, { 'metadata.restoredFrom': snapshotId }],
+      })
+      .sort({ createdAt: -1 })
+      .exec() as Promise<SandboxDocument | null>;
+  }
+
+  /**
    * Running sandboxes that hold a public subdomain. Used on startup to make
    * them reachable again: the network attachment that carries traffic to them
    * belongs to this container and does not survive its restart.

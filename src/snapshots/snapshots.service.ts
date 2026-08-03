@@ -174,10 +174,9 @@ export class SnapshotsService implements OnModuleInit {
     // sandbox drops every one of those writes when its TTL runs out. Waking on
     // a visit is only useful if what visitors do then survives, so the snapshot
     // is the thing that persists and it has to be written back to.
-    this.wakeupService?.registerRestorer(async (snapshotId, ttlSeconds) => {
-      const sandbox = await this.restore(snapshotId, { ttlSeconds }, {});
-      return { sandboxId: sandbox.sandboxId };
-    });
+    this.wakeupService?.registerRestorer((snapshotId, ttlSeconds) =>
+      this.wakeRestore(snapshotId, ttlSeconds),
+    );
 
     try {
       const stale = await this.snapshotRepo.updateMany(
@@ -1500,6 +1499,40 @@ export class SnapshotsService implements OnModuleInit {
         where: 'host',
       },
     };
+  }
+
+  /**
+   * Bring a snapshot's public address back to life after a visit found it
+   * dormant.
+   *
+   * Restoring is the second choice, not the first. A sandbox of this snapshot
+   * may already be running and have merely lost the address — its route
+   * evicted, or deleted by an older sibling of its own snapshot expiring, since
+   * the subdomain belongs to the snapshot and every sandbox from it shares the
+   * key. Restoring another then puts two sandboxes of one snapshot in the air:
+   * they compete for the address and, being linked, race to write themselves
+   * back into the snapshot. Republishing the one already up costs nothing and
+   * is the entire repair.
+   */
+  private async wakeRestore(
+    snapshotId: string,
+    ttlSeconds: number,
+  ): Promise<{ sandboxId: string }> {
+    const existing = await this.sandboxRepo
+      .findRunningFromSnapshot(snapshotId)
+      .catch(() => null);
+
+    if (existing) {
+      this.logger.log(
+        `Republishing running sandbox ${existing.sandboxId} for snapshot ` +
+          `${snapshotId} instead of restoring another`,
+      );
+      await this.publishIfEnabled(existing, {});
+      return { sandboxId: existing.sandboxId };
+    }
+
+    const sandbox = await this.restore(snapshotId, { ttlSeconds }, {});
+    return { sandboxId: sandbox.sandboxId };
   }
 
   /**
