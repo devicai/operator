@@ -370,12 +370,19 @@ that from stranding a sandbox:
 - On startup, every running sandbox holding a subdomain is republished, which
   reattaches the network and refreshes its address.
 - A route whose upstream cannot be connected to (refused, unreachable, or no
-  answer within `CONNECT_TIMEOUT_MS`) is **dropped** and the address is served
-  as dormant, so the wake-up can replace it. This matters beyond restarts: a
-  route that exists suppresses the wake-up, so without it a stale entry would
-  keep the address dead until the sandbox expired. An upstream that *accepts*
-  the connection and then misbehaves still gets a plain 502 — that is the
-  service's problem, not the route's.
+  answer within `CONNECT_TIMEOUT_MS`) is checked against the sandbox record:
+  - **Sandbox gone or stopped** → the route is dropped and the address served
+    as dormant, so the wake-up can replace it. This matters beyond restarts: a
+    route that exists suppresses the wake-up, so a stale entry would otherwise
+    keep the address dead until the sandbox expired.
+  - **Sandbox running but silent** → the route stands and the visitor gets the
+    waiting page, which reloads the moment anything starts listening. This is
+    the normal state right after a restore, and replacing it would be wrong
+    twice: it abandons a sandbox someone may be working in, and it leaves two
+    linked sandboxes of one snapshot racing to write themselves back into it.
+
+  An upstream that *accepts* the connection and then misbehaves still gets a
+  plain 502 — that is the service's problem, not the route's.
 
 **A snapshot restores files, not processes**, so nothing listens in a freshly
 restored sandbox unless the snapshot says what to start:
