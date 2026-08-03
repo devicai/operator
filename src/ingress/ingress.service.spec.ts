@@ -3,6 +3,7 @@ import { CONFIG } from '../config/config.loader';
 import { ModuleConfig } from '../config/config.types';
 import { RUNTIME_PROVIDER } from '../runtime/runtime-provider.interface';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
+import { SandboxRepository } from '../repositories/sandbox.repository';
 import { IngressEntry, IngressRegistry } from './ingress-registry';
 import { IngressService } from './ingress.service';
 
@@ -12,6 +13,11 @@ describe('IngressService', () => {
   const snapshots = new Map<string, { snapshotId: string; slug?: string }>();
   const snapshotRepo = {
     findOne: jest.fn(async (filter: any) => snapshots.get(filter.snapshotId) ?? null),
+  };
+  /** Sandboxes that were already published when the process started. */
+  const published: any[] = [];
+  const sandboxRepo = {
+    findPublished: jest.fn(async () => published),
   };
   const registryStore = new Map<string, IngressEntry>();
   const registry: Pick<IngressRegistry, 'publish' | 'unpublish' | 'extendTtl' | 'lookup'> = {
@@ -52,6 +58,7 @@ describe('IngressService', () => {
   beforeEach(async () => {
     registryStore.clear();
     snapshots.clear();
+    published.length = 0;
     jest.clearAllMocks();
 
     const moduleRef: TestingModule = await Test.createTestingModule({
@@ -61,6 +68,7 @@ describe('IngressService', () => {
         { provide: RUNTIME_PROVIDER, useValue: runtime },
         { provide: IngressRegistry, useValue: registry },
         { provide: SnapshotRepository, useValue: snapshotRepo },
+        { provide: SandboxRepository, useValue: sandboxRepo },
       ],
     }).compile();
     service = moduleRef.get(IngressService);
@@ -248,6 +256,60 @@ describe('IngressService', () => {
     });
   });
 
+  // Reachability lives in the container: Docker puts each sandbox on its own
+  // bridge and `publish` joins THIS container to it, an attachment that dies
+  // with the container. After a restart the routes in Redis still resolve but
+  // name addresses nothing here can reach — and a route that exists suppresses
+  // the wake-up that would replace it, so nothing recovers on its own.
+  describe('on startup', () => {
+    it('reattaches to sandboxes that were already published', async () => {
+      published.push(
+        { sandboxId: 'BoxOne', name: 'sandbox-BoxOne', subdomain: 'boxone' },
+        { sandboxId: 'BoxTwo', name: 'sandbox-BoxTwo', subdomain: 'boxtwo' },
+      );
+      runtime.getAddress.mockResolvedValue({ host: '172.21.0.2', port: 80 });
+
+      await service.onModuleInit();
+      await new Promise((r) => setImmediate(r));
+
+      expect(runtime.attachLocal).toHaveBeenCalledWith('sandbox-BoxOne');
+      expect(runtime.attachLocal).toHaveBeenCalledWith('sandbox-BoxTwo');
+      expect(registry.publish).toHaveBeenCalledTimes(2);
+    });
+
+    it('keeps going when one sandbox cannot be reattached', async () => {
+      published.push(
+        { sandboxId: 'Broken', name: 'sandbox-Broken', subdomain: 'broken' },
+        { sandboxId: 'Fine', name: 'sandbox-Fine', subdomain: 'fine' },
+      );
+      runtime.getAddress
+        .mockRejectedValueOnce(new Error('no such container'))
+        .mockResolvedValue({ host: '172.21.0.3', port: 80 });
+
+      await service.onModuleInit();
+      await new Promise((r) => setImmediate(r));
+
+      expect(registry.publish).toHaveBeenCalledTimes(1);
+    });
+
+    it('does nothing when ingress is disabled', async () => {
+      const moduleRef: TestingModule = await Test.createTestingModule({
+        providers: [
+          IngressService,
+          { provide: CONFIG, useValue: buildConfig(false) },
+          { provide: RUNTIME_PROVIDER, useValue: runtime },
+          { provide: IngressRegistry, useValue: registry },
+          { provide: SnapshotRepository, useValue: snapshotRepo },
+          { provide: SandboxRepository, useValue: sandboxRepo },
+        ],
+      }).compile();
+
+      await moduleRef.get(IngressService).onModuleInit();
+
+      expect(sandboxRepo.findPublished).not.toHaveBeenCalled();
+    });
+  });
+
   it('unpublish is a no-op when ingress is disabled', async () => {
     const moduleRef: TestingModule = await Test.createTestingModule({
       providers: [
@@ -256,6 +318,7 @@ describe('IngressService', () => {
         { provide: RUNTIME_PROVIDER, useValue: runtime },
         { provide: IngressRegistry, useValue: registry },
         { provide: SnapshotRepository, useValue: snapshotRepo },
+        { provide: SandboxRepository, useValue: sandboxRepo },
       ],
     }).compile();
     const disabled = moduleRef.get(IngressService);

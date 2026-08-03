@@ -21,6 +21,28 @@ import {
 } from './wakeup-page';
 
 /**
+ * How long to wait to establish a TCP connection to an upstream, as opposed to
+ * waiting for its response. Sandboxes are on the same host, so anything alive
+ * accepts immediately.
+ */
+const CONNECT_TIMEOUT_MS = 2000;
+
+/**
+ * Whether an error means the upstream address answers to nothing — as opposed
+ * to a service that is there but misbehaving, which is the upstream's own
+ * problem and stays a 502.
+ */
+function isUnreachable(err: NodeJS.ErrnoException): boolean {
+  return (
+    err.code === 'ECONNREFUSED' ||
+    err.code === 'EHOSTUNREACH' ||
+    err.code === 'ENETUNREACH' ||
+    err.code === 'ETIMEDOUT' ||
+    err.code === 'EHOSTDOWN'
+  );
+}
+
+/**
  * Embedded HTTP reverse proxy that routes requests to running sandboxes by
  * Host header. Listens on `ingress.proxyPort` (separate from the API server)
  * and only speaks plain HTTP — TLS termination is expected upstream.
@@ -210,6 +232,24 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
       },
     );
 
+    // A separate, much shorter budget for reaching the upstream at all. The
+    // request timeout covers a slow response, which is the upstream's business;
+    // an upstream on the same host either accepts in milliseconds or is not
+    // there. Without this, an address that no longer routes anywhere makes the
+    // visitor wait the full request timeout for a 502.
+    proxyReq.on('socket', (socket) => {
+      if (!socket.connecting) return;
+      const timer = setTimeout(() => {
+        proxyReq.destroy(
+          Object.assign(new Error('upstream connect timeout'), {
+            code: 'ETIMEDOUT',
+          }),
+        );
+      }, CONNECT_TIMEOUT_MS);
+      socket.once('connect', () => clearTimeout(timer));
+      socket.once('close', () => clearTimeout(timer));
+    });
+
     proxyReq.on('timeout', () => {
       proxyReq.destroy(new Error('upstream timeout'));
     });
@@ -217,17 +257,57 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
       this.logger.debug(
         `Upstream error (${upstream.host}:${upstream.port}): ${err.message}`,
       );
-      if (!res.headersSent) {
-        res.statusCode = 502;
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.end('Bad Gateway');
-      } else {
+      if (res.headersSent) {
         res.end();
+        return;
       }
+
+      // The route named an address nothing answers at. Publishing it was a
+      // claim that stopped being true — a sandbox removed behind our back, a
+      // network attachment lost with a restart — and leaving it in place is
+      // worse than having no route at all, because a route suppresses the
+      // wake-up that would replace it. Drop it and treat the address as
+      // dormant, which restores it if a snapshot is behind it.
+      if (isUnreachable(err)) {
+        void this.recoverDeadRoute(req, res, subdomain, upstream.sandboxId);
+        return;
+      }
+
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end('Bad Gateway');
     });
 
     req.on('aborted', () => proxyReq.destroy());
     req.pipe(proxyReq);
+  }
+
+  /**
+   * Forget a route whose upstream cannot be reached, then serve the address as
+   * if nothing had been published — which is now the truth.
+   */
+  private async recoverDeadRoute(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    subdomain: string,
+    sandboxId: string,
+  ): Promise<void> {
+    this.logger.warn(
+      `Dropping route ${subdomain} → sandbox ${sandboxId}: upstream unreachable`,
+    );
+    await this.registry.unpublish(subdomain).catch(() => undefined);
+    try {
+      await this.serveDormant(req, res, subdomain);
+    } catch (err) {
+      this.logger.warn(
+        `Could not serve ${subdomain} after dropping its route: ${(err as Error).message}`,
+      );
+      if (!res.headersSent) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.end('Bad Gateway');
+      }
+    }
   }
 
   /** Whether this request is the waiting page asking whether to reload. */

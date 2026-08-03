@@ -124,6 +124,20 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
   }
 
   /**
+   * Running sandboxes that hold a public subdomain. Used on startup to make
+   * them reachable again: the network attachment that carries traffic to them
+   * belongs to this container and does not survive its restart.
+   */
+  async findPublished(): Promise<SandboxDocument[]> {
+    return this.model
+      .find({
+        status: SandboxStatus.RUNNING,
+        subdomain: { $exists: true, $ne: null },
+      })
+      .exec() as Promise<SandboxDocument[]>;
+  }
+
+  /**
    * Container names of every sandbox that still has a reason to exist in the
    * runtime. Terminal states are excluded on purpose: an expired, stopped or
    * failed sandbox cannot be resumed (there is no start endpoint), so its

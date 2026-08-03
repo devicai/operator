@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { CONFIG } from '../config/config.loader';
 import { IngressConfig, ModuleConfig } from '../config/config.types';
 import {
@@ -6,6 +6,7 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 import { SandboxDocument } from '../schemas/sandbox.schema';
+import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { IngressEntry, IngressRegistry } from './ingress-registry';
 import { subdomainForSnapshot, toDnsLabel } from './subdomain.util';
@@ -25,7 +26,7 @@ export interface PublishResult {
  * which reads the same Redis registry this service writes to.
  */
 @Injectable()
-export class IngressService {
+export class IngressService implements OnModuleInit {
   private readonly logger = new Logger(IngressService.name);
 
   constructor(
@@ -33,7 +34,57 @@ export class IngressService {
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
     private readonly registry: IngressRegistry,
     private readonly snapshotRepo: SnapshotRepository,
+    private readonly sandboxRepo: SandboxRepository,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    if (!this.isEnabled()) return;
+    // Deliberately not awaited: a slow or unreachable runtime must not hold up
+    // the whole application boot, and every sandbox is repaired independently.
+    void this.republishRunningSandboxes();
+  }
+
+  /**
+   * Reattach to sandboxes that were already published before this process
+   * started.
+   *
+   * Reachability lives in the container, not in Redis. Docker puts each sandbox
+   * on its own bridge network and `publish` joins THIS container to it — a
+   * connection that dies with the container. So after any restart or redeploy
+   * the routes in Redis still resolve, but the addresses they name are no
+   * longer routable from here: packets vanish, requests hang until the upstream
+   * timeout, and visitors get a slow 502. Worse, a route that exists blocks the
+   * wake-up from replacing it, so nothing recovers until the sandbox expires.
+   *
+   * Republishing is idempotent and also picks up an address that changed while
+   * we were away.
+   */
+  private async republishRunningSandboxes(): Promise<void> {
+    let sandboxes: SandboxDocument[];
+    try {
+      sandboxes = await this.sandboxRepo.findPublished();
+    } catch (err) {
+      this.logger.warn(
+        `Could not list published sandboxes to reattach: ${(err as Error).message}`,
+      );
+      return;
+    }
+    if (!sandboxes.length) return;
+
+    let repaired = 0;
+    for (const sandbox of sandboxes) {
+      try {
+        if (await this.publish(sandbox)) repaired += 1;
+      } catch (err) {
+        this.logger.warn(
+          `Could not reattach sandbox ${sandbox.sandboxId}: ${(err as Error).message}`,
+        );
+      }
+    }
+    this.logger.log(
+      `Reattached ${repaired}/${sandboxes.length} published sandbox(es) after startup`,
+    );
+  }
 
   /** Whether the ingress feature is enabled in the loaded config. */
   isEnabled(): boolean {
