@@ -176,7 +176,11 @@ export class IngressService implements OnModuleInit {
   ): Promise<void> {
     if (!this.isEnabled()) return;
     const subdomain = sandbox.subdomain ?? toDnsLabel(sandbox.sandboxId);
-    await this.registry.unpublish(subdomain);
+    // Only give up the route if it is still ours. The subdomain belongs to the
+    // snapshot, so a later sandbox restored from it may already have taken the
+    // address over — and this one going away must not take that one down.
+    const removed = await this.registry.unpublish(subdomain, sandbox.sandboxId);
+
     if (this.runtime.detachLocal && sandbox.name) {
       try {
         await this.runtime.detachLocal(sandbox.name);
@@ -186,7 +190,12 @@ export class IngressService implements OnModuleInit {
         );
       }
     }
-    this.logger.log(`Unpublished sandbox ${sandbox.sandboxId} (${subdomain})`);
+
+    this.logger.log(
+      removed
+        ? `Unpublished sandbox ${sandbox.sandboxId} (${subdomain})`
+        : `Sandbox ${sandbox.sandboxId} released: ${subdomain} is served by another sandbox`,
+    );
   }
 
   /**

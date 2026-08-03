@@ -384,6 +384,18 @@ that from stranding a sandbox:
   An upstream that *accepts* the connection and then misbehaves still gets a
   plain 502 — that is the service's problem, not the route's.
 
+**The subdomain belongs to the snapshot**, which means every sandbox restored
+from it contends for one registry key and the last to publish wins. Two rules
+keep that from turning into duplicate sandboxes:
+
+- Releasing a route is a compare-and-delete: a sandbox only gives up the
+  subdomain if the entry still names it. Otherwise an older sandbox expiring
+  would take down the route its younger sibling is serving — and the next visit,
+  finding no route, would restore a third.
+- A wake-up **republishes a running sandbox of that snapshot** if there is one,
+  and only restores when there is not. "No route" is an ambiguous signal: it can
+  mean nothing is running, or that something is running and lost the address.
+
 **A snapshot restores files, not processes**, so nothing listens in a freshly
 restored sandbox unless the snapshot says what to start:
 

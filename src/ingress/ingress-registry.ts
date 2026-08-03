@@ -75,8 +75,28 @@ export class IngressRegistry implements OnModuleDestroy {
     }
   }
 
-  async unpublish(subdomain: string): Promise<void> {
-    await this.redis.del(this.key(subdomain));
+  /**
+   * Remove the route for a subdomain.
+   *
+   * With `ownerSandboxId`, the entry is only removed if it still names that
+   * sandbox. A subdomain belongs to a SNAPSHOT, not to a sandbox, so several
+   * sandboxes restored from one snapshot compete for the same key and the last
+   * to publish wins. An unconditional delete then lets a sandbox that expired
+   * take down the route of whichever one currently holds it — leaving a live
+   * sandbox unreachable and the next visit restoring yet another.
+   *
+   * Returns whether anything was removed.
+   */
+  async unpublish(subdomain: string, ownerSandboxId?: string): Promise<boolean> {
+    const key = this.key(subdomain);
+    if (!ownerSandboxId) {
+      return (await this.redis.del(key)) > 0;
+    }
+
+    const current = await this.lookup(subdomain);
+    if (!current) return false;
+    if (current.sandboxId !== ownerSandboxId) return false;
+    return (await this.redis.del(key)) > 0;
   }
 
   async extendTtl(subdomain: string, ttlSeconds: number): Promise<void> {

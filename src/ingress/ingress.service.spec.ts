@@ -24,8 +24,15 @@ describe('IngressService', () => {
     publish: jest.fn(async (sub, entry) => {
       registryStore.set(sub, entry);
     }),
-    unpublish: jest.fn(async (sub) => {
+    // Mirrors the real compare-and-delete: a subdomain belongs to the snapshot,
+    // so several sandboxes contend for it and only its current holder may
+    // release it.
+    unpublish: jest.fn(async (sub, ownerSandboxId?: string) => {
+      const current = registryStore.get(sub);
+      if (!current) return false;
+      if (ownerSandboxId && current.sandboxId !== ownerSandboxId) return false;
       registryStore.delete(sub);
+      return true;
     }),
     extendTtl: jest.fn(async () => {}),
     lookup: jest.fn(async (sub) => registryStore.get(sub) ?? null),
@@ -307,6 +314,56 @@ describe('IngressService', () => {
       await moduleRef.get(IngressService).onModuleInit();
 
       expect(sandboxRepo.findPublished).not.toHaveBeenCalled();
+    });
+  });
+
+  // A subdomain belongs to the SNAPSHOT, so every sandbox restored from one
+  // contends for the same key and the last to publish wins. Observed on dev:
+  // an older sandbox expired, its unpublish deleted the route its younger
+  // sibling was serving, and the next visit — finding no route — restored a
+  // third sandbox.
+  describe('releasing a shared subdomain', () => {
+    it('does not take down a route another sandbox has taken over', async () => {
+      runtime.getAddress.mockResolvedValue({ host: '172.21.0.2', port: 80 });
+      snapshots.set('snapX', { snapshotId: 'snapX' });
+
+      await service.publish({
+        sandboxId: 'older',
+        name: 'sandbox-older',
+        snapshotId: 'snapX',
+      } as any);
+      await service.publish({
+        sandboxId: 'newer',
+        name: 'sandbox-newer',
+        snapshotId: 'snapX',
+      } as any);
+
+      // The older one expires now, well after handing the address over.
+      await service.unpublish({
+        sandboxId: 'older',
+        subdomain: 'snapx',
+        name: 'sandbox-older',
+      } as any);
+
+      expect(registryStore.get('snapx')?.sandboxId).toBe('newer');
+    });
+
+    it('still releases the route when it is the one serving', async () => {
+      runtime.getAddress.mockResolvedValue({ host: '172.21.0.2', port: 80 });
+      snapshots.set('snapX', { snapshotId: 'snapX' });
+
+      await service.publish({
+        sandboxId: 'only',
+        name: 'sandbox-only',
+        snapshotId: 'snapX',
+      } as any);
+      await service.unpublish({
+        sandboxId: 'only',
+        subdomain: 'snapx',
+        name: 'sandbox-only',
+      } as any);
+
+      expect(registryStore.has('snapx')).toBe(false);
     });
   });
 
