@@ -317,12 +317,22 @@ export interface CommittedImageInfo {
 }
 
 export interface CachedImageInfo {
+  /** Addressable reference: the tag when it has one, the image id otherwise. */
   ref: string;
+  /** The snapshot this image belongs to (the tag IS the snapshotId). */
   tag: string;
   uniqueSizeBytes: number;
   createdAtMs: number;
   /** True when a container still references it, which blocks removal. */
   inUse: boolean;
+  /**
+   * True when a newer commit for the same snapshot took the tag over, leaving
+   * this one untagged. It is a dead previous version — never the image a
+   * restore would resolve — so it is garbage regardless of the cache cap, and
+   * removing it must NOT touch the snapshot's bookkeeping: the tag now points
+   * at a live image.
+   */
+  superseded?: boolean;
 }
 
 export interface ManagedSandboxInfo {

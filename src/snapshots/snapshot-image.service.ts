@@ -250,10 +250,48 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     } finally {
       this.building.delete(snapshotId);
       await this.runtime.remove(helper).catch(() => undefined);
+      // Committing over the tag just orphaned the previous image for this
+      // snapshot. Collect it here, where it is created: a snapshot saved every
+      // few minutes would otherwise pile up a full rootfs per save.
+      await this.pruneSuperseded(snapshotId).catch(() => undefined);
       if (this.maxTotalBytes) {
         await this.enforceCap().catch(() => undefined);
       }
     }
+  }
+
+  /**
+   * Remove images left untagged by a newer commit for the same snapshot.
+   *
+   * These are dead by construction: `refFor` gives every snapshot ONE tag, so
+   * the moment a rebuild commits over it, the previous image can no longer be
+   * resolved by any restore. They are not cache to trade against the cap —
+   * they are garbage, and unlike the cap path this never clears the snapshot's
+   * bookkeeping, because the tag it names now belongs to the live image.
+   *
+   * @param snapshotId when given, only that snapshot's leftovers are swept.
+   */
+  private async pruneSuperseded(snapshotId?: string): Promise<number> {
+    if (!this.runtime.listSnapshotImages || !this.runtime.removeImage) return 0;
+    const images = await this.runtime.listSnapshotImages(this.repository);
+    const stale = images.filter(
+      (i) => i.superseded && !i.inUse && (!snapshotId || i.tag === snapshotId),
+    );
+    let freed = 0;
+    let dropped = 0;
+    for (const img of stale) {
+      if (!(await this.runtime.removeImage(img.ref))) continue;
+      freed += img.uniqueSizeBytes;
+      dropped++;
+    }
+    if (dropped) {
+      this.logger.log(
+        `Dropped ${dropped} superseded snapshot image(s)` +
+          (snapshotId ? ` for ${snapshotId}` : '') +
+          `, freeing ${fmt(freed)}`,
+      );
+    }
+    return freed;
   }
 
   /**
@@ -304,11 +342,17 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     }
 
     try {
+      // Superseded leftovers first: they belong to snapshots that are very
+      // much alive, so the "snapshot is gone" rule below would never reach
+      // them. build() already sweeps them per snapshot; this covers whatever
+      // was orphaned before this sweeper existed, or while it was held.
+      await this.pruneSuperseded().catch(() => undefined);
+
       const images = await this.runtime.listSnapshotImages(this.repository);
       // An image still held by a container cannot be removed anyway, and the
       // holder may be a sandbox that is about to be reclaimed — try again next
       // sweep rather than logging a failure every five minutes.
-      const free = images.filter((i) => !i.inUse);
+      const free = images.filter((i) => !i.inUse && !i.superseded);
       if (!free.length) return;
 
       // The tag IS the snapshotId (see refFor), so one query answers the whole
@@ -357,7 +401,12 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     if (!this.isEnabled() || !cap || !this.runtime.listSnapshotImages) return;
 
     try {
-      const images = await this.runtime.listSnapshotImages(this.repository);
+      // Reclaim the free garbage before evicting anything anyone still uses.
+      await this.pruneSuperseded().catch(() => undefined);
+
+      const images = (
+        await this.runtime.listSnapshotImages(this.repository)
+      ).filter((i) => !i.superseded);
       const total = images.reduce((s, i) => s + i.uniqueSizeBytes, 0);
       if (total <= cap) return;
 

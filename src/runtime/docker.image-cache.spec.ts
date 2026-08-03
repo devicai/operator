@@ -211,6 +211,54 @@ describe('DockerRuntimeProvider — snapshot image cache', () => {
       });
     });
 
+    it('surfaces images a newer commit left untagged, keyed by their label', async () => {
+      // The daemon hides untagged images from a default listing, and they have
+      // no RepoTags to walk — so the previous version of every re-saved
+      // snapshot used to be invisible: never counted, never removed.
+      listImages.mockResolvedValue([
+        { Id: 'sha256:new', Created: 2000, RepoTags: ['devic-snapshot:aaa'] },
+        {
+          Id: 'sha256:old',
+          Created: 1000,
+          RepoTags: [],
+          Labels: { 'devic-sandbox.snapshot': 'aaa' },
+        },
+        {
+          Id: 'sha256:none',
+          Created: 1000,
+          RepoTags: ['<none>:<none>'],
+          Labels: { 'devic-sandbox.snapshot': 'bbb' },
+        },
+      ]);
+      listContainers.mockResolvedValue([]);
+      getImage.mockImplementation(() => ({
+        inspect: jest.fn().mockResolvedValue({ Id: 'x', Size: 100 }),
+      }));
+
+      const provider = await buildProvider();
+      const out = await provider.listSnapshotImages('devic-snapshot');
+
+      expect(listImages).toHaveBeenCalledWith(
+        expect.objectContaining({ all: true }),
+      );
+      const stale = out.filter((i) => i.superseded);
+      expect(stale.map((i) => i.tag).sort()).toEqual(['aaa', 'bbb']);
+      // Untagged images can only be addressed by id.
+      expect(stale.find((i) => i.tag === 'aaa')!.ref).toBe('sha256:old');
+      expect(out.find((i) => i.ref === 'devic-snapshot:aaa')!.superseded).toBe(
+        false,
+      );
+    });
+
+    it('ignores an untagged image that carries no snapshot label', async () => {
+      listImages.mockResolvedValue([
+        { Id: 'sha256:mystery', Created: 1, RepoTags: [], Labels: {} },
+      ]);
+      listContainers.mockResolvedValue([]);
+      const provider = await buildProvider();
+      expect(await provider.listSnapshotImages('devic-snapshot')).toEqual([]);
+    });
+
     it('splits a reference whose registry host carries a port', async () => {
       listImages.mockResolvedValue([
         {

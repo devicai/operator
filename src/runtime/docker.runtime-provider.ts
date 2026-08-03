@@ -662,6 +662,11 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     let images: Docker.ImageInfo[];
     try {
       images = await this.docker.listImages({
+        // `all` is what surfaces the untagged ones. Committing over an existing
+        // tag moves it to the new image and leaves the previous one untagged —
+        // still on disk, still labelled, and invisible to a default listing.
+        // Those are the bulk of what this cache leaks, so they must be listed.
+        all: true,
         filters: JSON.stringify({ label: [`${SNAPSHOT_IMAGE_LABEL}`] }),
       });
     } catch (err) {
@@ -681,7 +686,26 @@ export class DockerRuntimeProvider implements RuntimeProvider {
 
     const out: CachedImageInfo[] = [];
     for (const img of images) {
-      for (const ref of img.RepoTags ?? []) {
+      const tags = (img.RepoTags ?? []).filter((r) => r && r !== '<none>:<none>');
+
+      // No tag left: a newer commit for the same snapshot took it over. The
+      // label still says which snapshot it belonged to, and the id is the only
+      // way left to address it.
+      if (!tags.length) {
+        const snapshotId = img.Labels?.[SNAPSHOT_IMAGE_LABEL];
+        if (!snapshotId) continue;
+        out.push({
+          ref: img.Id,
+          tag: snapshotId,
+          uniqueSizeBytes: await this.uniqueImageSize(img.Id),
+          createdAtMs: img.Created ? img.Created * 1000 : 0,
+          inUse: inUse.has(img.Id),
+          superseded: true,
+        });
+        continue;
+      }
+
+      for (const ref of tags) {
         const { repo, tag } = splitImageRef(ref);
         if (repo !== repository) continue;
         out.push({
@@ -690,6 +714,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
           uniqueSizeBytes: await this.uniqueImageSize(ref),
           createdAtMs: img.Created ? img.Created * 1000 : 0,
           inUse: inUse.has(img.Id),
+          superseded: false,
         });
       }
     }

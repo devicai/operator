@@ -401,4 +401,100 @@ describe('SnapshotImageService', () => {
       await expect(svc.reclaimOrphans()).resolves.toBeUndefined();
     });
   });
+  describe('superseded images', () => {
+    // Committing over `devic-snapshot:<id>` moves the tag and leaves the
+    // previous image untagged: a full rootfs per save, invisible to a listing
+    // that only walks RepoTags. This is what filled the dev host's disk.
+    const superseded = (tag: string, size: number, over: Record<string, any> = {}) => ({
+      ref: `sha256:${tag}-old`,
+      tag,
+      uniqueSizeBytes: size,
+      createdAtMs: 1,
+      inUse: false,
+      superseded: true,
+      ...over,
+    });
+
+    it('drops the previous image right after committing the new one', async () => {
+      const runtime = baseRuntime({
+        listSnapshotImages: jest.fn().mockResolvedValue([
+          superseded('snap1', 4_000_000_000),
+          { ref: 'devic-snapshot:snap1', tag: 'snap1', uniqueSizeBytes: 10, createdAtMs: 2, inUse: false, superseded: false },
+        ]),
+      });
+      const svc = await build(buildConfig({ enabled: true }), runtime, baseRepo());
+      svc.registerTarballApplier(async () => undefined);
+
+      await svc.build(snapshotDoc());
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('sha256:snap1-old');
+      expect(runtime.removeImage).not.toHaveBeenCalledWith('devic-snapshot:snap1');
+    });
+
+    it('never clears the snapshot bookkeeping when reclaiming one', async () => {
+      // The tag the superseded image carries now belongs to a LIVE image;
+      // forgetting it would throw away a perfectly good cache entry.
+      const runtime = baseRuntime({
+        listSnapshotImages: jest
+          .fn()
+          .mockResolvedValue([superseded('snap1', 4_000_000_000)]),
+      });
+      const repo = baseRepo();
+      const svc = await build(buildConfig({ enabled: true, maxTotalBytes: 1 }), runtime, repo);
+
+      await svc.enforceCap();
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('sha256:snap1-old');
+      const cleared = repo.updateById.mock.calls.filter(
+        (c: any[]) => c[1]?.$set?.imageState === 'none',
+      );
+      expect(cleared).toHaveLength(0);
+    });
+
+    it('does not count them against the cap, so live images are not evicted', async () => {
+      const runtime = baseRuntime({
+        listSnapshotImages: jest.fn().mockResolvedValue([
+          superseded('snap1', 900),
+          { ref: 'devic-snapshot:live', tag: 'live', uniqueSizeBytes: 50, createdAtMs: 2, inUse: false, superseded: false },
+        ]),
+      });
+      const svc = await build(buildConfig({ enabled: true, maxTotalBytes: 100 }), runtime, baseRepo());
+
+      await svc.enforceCap();
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('sha256:snap1-old');
+      expect(runtime.removeImage).not.toHaveBeenCalledWith('devic-snapshot:live');
+    });
+
+    it('reclaims leftovers of snapshots that are still alive', async () => {
+      // reclaimOrphans only removes images whose snapshot is gone; a
+      // superseded copy belongs to a snapshot that very much exists.
+      const runtime = baseRuntime({
+        listSnapshotImages: jest
+          .fn()
+          .mockResolvedValue([superseded('snap1', 4_000_000_000)]),
+      });
+      const repo = baseRepo({
+        find: jest.fn().mockResolvedValue({ data: [{ snapshotId: 'snap1' }] }),
+      });
+      const svc = await build(buildConfig({ enabled: true }), runtime, repo);
+
+      await svc.reclaimOrphans();
+
+      expect(runtime.removeImage).toHaveBeenCalledWith('sha256:snap1-old');
+    });
+
+    it('leaves one a container still holds for the next sweep', async () => {
+      const runtime = baseRuntime({
+        listSnapshotImages: jest
+          .fn()
+          .mockResolvedValue([superseded('snap1', 4_000_000_000, { inUse: true })]),
+      });
+      const svc = await build(buildConfig({ enabled: true, maxTotalBytes: 1 }), runtime, baseRepo());
+
+      await svc.enforceCap();
+
+      expect(runtime.removeImage).not.toHaveBeenCalledWith('sha256:snap1-old');
+    });
+  });
 });
