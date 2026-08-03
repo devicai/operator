@@ -2,12 +2,14 @@ import {
   Injectable,
   Inject,
   Logger,
+  Optional,
   forwardRef,
   OnModuleInit,
   OnApplicationShutdown,
 } from '@nestjs/common';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from './sandbox-registry';
+import { IngressService } from '../ingress/ingress.service';
 import { SnapshotsService } from '../snapshots/snapshots.service';
 import { ModuleConfig } from '../config/config.types';
 import { CONFIG } from '../config/config.loader';
@@ -37,6 +39,7 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
     @Inject(forwardRef(() => SnapshotsService))
     private readonly snapshotsService: SnapshotsService,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
+    @Optional() private readonly ingressService?: IngressService,
   ) {}
 
   onModuleInit(): void {
@@ -93,13 +96,31 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
       this.logger.log(`Found ${expired.length} expired sandbox(es)`);
 
       for (const doc of expired) {
+        // Something is already capturing this filesystem (an async stop, a
+        // create). Leave it alone: expiring it here would remove the container
+        // out from under the tar. It reappears next tick, once the flag clears.
+        if (doc.savingSnapshotId) {
+          this.logger.log(
+            `Sandbox ${doc.sandboxId} expired but a snapshot save is in ` +
+              `flight; deferring reap`,
+          );
+          continue;
+        }
+
         const claimed = await this.sandboxRepo.atomicExpire(
           (doc as any)._id.toString(),
         );
         if (!claimed) continue;
 
         if (doc.snapshotId) {
-          await this.snapshotsService.persistToSnapshot(doc);
+          // Expiry saves too: a session that runs out of time keeps whatever
+          // it did, same as one closed on purpose.
+          const outcome = await this.snapshotsService.persistToSnapshot(doc);
+          if (outcome !== 'saved') {
+            this.logger.warn(
+              `Expiry save for ${doc.sandboxId} into ${doc.snapshotId}: ${outcome}`,
+            );
+          }
         }
 
         try {
@@ -121,6 +142,24 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
         }
 
         await this.registry.remove(doc.sandboxId);
+
+        // Drop the public route too. `stop` and `destroy` have always done
+        // this; expiry never did, so the subdomain kept pointing at an address
+        // nobody answers on until the Redis key aged out on its own — up to a
+        // minute of 502s. With auto-restart that gap matters more than it used
+        // to: the proxy can only offer to wake a sandbox when it finds NO
+        // route, so a stale one means the visitor gets a gateway error instead
+        // of the waiting page.
+        if (this.ingressService?.isEnabled()) {
+          await this.ingressService
+            .unpublish(doc)
+            .catch((err) =>
+              this.logger.warn(
+                `Could not unpublish expired sandbox ${doc.sandboxId}: ${(err as Error).message}`,
+              ),
+            );
+        }
+
         this.logger.log(`Sandbox ${doc.sandboxId} expired and removed`);
       }
 

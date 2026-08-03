@@ -1,4 +1,4 @@
-import { Inject, Injectable, Logger } from '@nestjs/common';
+import { Inject, Injectable, Logger, OnModuleInit } from '@nestjs/common';
 import { CONFIG } from '../config/config.loader';
 import { IngressConfig, ModuleConfig } from '../config/config.types';
 import {
@@ -6,7 +6,10 @@ import {
   RuntimeProvider,
 } from '../runtime/runtime-provider.interface';
 import { SandboxDocument } from '../schemas/sandbox.schema';
+import { SandboxRepository } from '../repositories/sandbox.repository';
+import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { IngressEntry, IngressRegistry } from './ingress-registry';
+import { subdomainForSnapshot, toDnsLabel } from './subdomain.util';
 
 export interface PublishResult {
   /** Subdomain assigned to the sandbox (label only, no domain). */
@@ -23,14 +26,65 @@ export interface PublishResult {
  * which reads the same Redis registry this service writes to.
  */
 @Injectable()
-export class IngressService {
+export class IngressService implements OnModuleInit {
   private readonly logger = new Logger(IngressService.name);
 
   constructor(
     @Inject(CONFIG) private readonly config: ModuleConfig,
     @Inject(RUNTIME_PROVIDER) private readonly runtime: RuntimeProvider,
     private readonly registry: IngressRegistry,
+    private readonly snapshotRepo: SnapshotRepository,
+    private readonly sandboxRepo: SandboxRepository,
   ) {}
+
+  async onModuleInit(): Promise<void> {
+    if (!this.isEnabled()) return;
+    // Deliberately not awaited: a slow or unreachable runtime must not hold up
+    // the whole application boot, and every sandbox is repaired independently.
+    void this.republishRunningSandboxes();
+  }
+
+  /**
+   * Reattach to sandboxes that were already published before this process
+   * started.
+   *
+   * Reachability lives in the container, not in Redis. Docker puts each sandbox
+   * on its own bridge network and `publish` joins THIS container to it — a
+   * connection that dies with the container. So after any restart or redeploy
+   * the routes in Redis still resolve, but the addresses they name are no
+   * longer routable from here: packets vanish, requests hang until the upstream
+   * timeout, and visitors get a slow 502. Worse, a route that exists blocks the
+   * wake-up from replacing it, so nothing recovers until the sandbox expires.
+   *
+   * Republishing is idempotent and also picks up an address that changed while
+   * we were away.
+   */
+  private async republishRunningSandboxes(): Promise<void> {
+    let sandboxes: SandboxDocument[];
+    try {
+      sandboxes = await this.sandboxRepo.findPublished();
+    } catch (err) {
+      this.logger.warn(
+        `Could not list published sandboxes to reattach: ${(err as Error).message}`,
+      );
+      return;
+    }
+    if (!sandboxes.length) return;
+
+    let repaired = 0;
+    for (const sandbox of sandboxes) {
+      try {
+        if (await this.publish(sandbox)) repaired += 1;
+      } catch (err) {
+        this.logger.warn(
+          `Could not reattach sandbox ${sandbox.sandboxId}: ${(err as Error).message}`,
+        );
+      }
+    }
+    this.logger.log(
+      `Reattached ${repaired}/${sandboxes.length} published sandbox(es) after startup`,
+    );
+  }
 
   /** Whether the ingress feature is enabled in the loaded config. */
   isEnabled(): boolean {
@@ -97,7 +151,7 @@ export class IngressService {
       return null;
     }
 
-    const subdomain = toDnsLabel(sandbox.sandboxId);
+    const subdomain = await this.resolveSubdomain(sandbox);
     const entry: IngressEntry = {
       sandboxId: sandbox.sandboxId,
       upstreamHost: address.host,
@@ -151,6 +205,64 @@ export class IngressService {
     await this.registry.extendTtl(sandbox.subdomain.toLowerCase(), ttl);
   }
 
+  /**
+   * The public URL a snapshot is served at, or null when ingress is off.
+   *
+   * Callers (Devic, the UI) need this without a sandbox running: the address
+   * belongs to the snapshot, so it is valid — and worth showing — even while
+   * nothing is up. Only this module knows the wildcard domain, so deriving it
+   * here keeps that configuration in one place.
+   */
+  publicUrlForSnapshot(snapshot: {
+    slug?: string | null;
+    snapshotId: string;
+  }): string | null {
+    if (!this.isEnabled()) return null;
+    const cfg = this.requireConfig();
+    return `${cfg.publicScheme}://${subdomainForSnapshot(snapshot)}.${cfg.wildcardDomain}`;
+  }
+
+  /**
+   * The subdomain a sandbox is published under.
+   *
+   * A sandbox restored from a snapshot answers on the SNAPSHOT's subdomain, so
+   * the URL of whatever it serves survives across sessions — `restoreInternal`
+   * mints a new `sandboxId` every time, and publishing by that id would hand
+   * out a different URL on every restore. Anything not born of a snapshot keeps
+   * the historical behaviour of being published under its own id.
+   *
+   * The origin is read from `metadata.restoredFrom`, not from `snapshotId`:
+   * the latter is only set for LINKED restores, and an unlinked sandbox (a
+   * fork, or one revived by visiting its URL) still belongs at the same
+   * address.
+   *
+   * If two sandboxes of the same snapshot are alive at once they both claim
+   * this subdomain and the last to publish wins — the registry entry is a
+   * single key. That is the intended trade-off: the address identifies the
+   * snapshot, not the process serving it.
+   */
+  private async resolveSubdomain(sandbox: SandboxDocument): Promise<string> {
+    const origin =
+      sandbox.snapshotId ?? (sandbox.metadata?.restoredFrom as string | undefined);
+    if (!origin) return toDnsLabel(sandbox.sandboxId);
+
+    try {
+      const snapshot = await this.snapshotRepo.findOne(
+        { snapshotId: origin } as any,
+        {},
+      );
+      if (snapshot) return subdomainForSnapshot(snapshot);
+    } catch (err) {
+      this.logger.warn(
+        `Could not resolve the subdomain of snapshot ${origin}, falling back ` +
+          `to the sandbox id: ${(err as Error).message}`,
+      );
+    }
+    // The snapshot was deleted while this sandbox was running, or the lookup
+    // failed. Publishing under the sandbox id keeps it reachable.
+    return toDnsLabel(sandbox.sandboxId);
+  }
+
   private computeTtlSeconds(
     sandbox: Pick<SandboxDocument, 'expiresAt'>,
     maxTtl: number,
@@ -162,20 +274,3 @@ export class IngressService {
   }
 }
 
-/**
- * Turn a sandboxId into a valid DNS label. nanoid's URL-safe alphabet
- * includes `-` and `_`, but RFC 952/1123 forbid labels that start or end
- * with a hyphen, and most resolvers (libc getaddrinfo, browsers) refuse
- * such hostnames even if the authoritative DNS would return an answer.
- *
- * - Lowercases the id.
- * - Replaces `_` with `-` (underscore is invalid in hostnames at all).
- * - Prefixes `s-` if the result would otherwise start with `-`.
- * - Suffixes `-x` if it would otherwise end with `-`.
- */
-function toDnsLabel(sandboxId: string): string {
-  let label = sandboxId.toLowerCase().replace(/_/g, '-');
-  if (label.startsWith('-')) label = `s${label}`;
-  if (label.endsWith('-')) label = `${label}x`;
-  return label;
-}

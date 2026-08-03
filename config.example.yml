@@ -124,6 +124,29 @@ snapshots:
   defaultScope: full
   compression: auto
   cleanup: conservative
+  # Keep a per-snapshot container image alongside the tarball, so restoring is
+  # just "create a container" instead of replaying the tarball into one.
+  # Measured on a 199.8 MB snapshot: 27.9 s -> ~2 s, and the ~2 s no longer
+  # depends on snapshot size (a 760.9 MB snapshot takes 65 s from its tarball).
+  #
+  # The tarball stays the artifact of record: it is what export/import read,
+  # what backups copy, and what the image is rebuilt from on every capture.
+  # Deleting every image costs speed and nothing else — restores simply fall
+  # back to the tarball, which is the behaviour without this block.
+  imageCache:
+    enabled: false
+    repository: devic-snapshot
+    # An image holds its content UNCOMPRESSED (that is why it starts
+    # instantly), so it costs noticeably more than the tarball it came from:
+    # measured 532 MB of unique layer against a 200 MB tar.gz. Only bytes NOT
+    # shared with the base image are counted here, since the base is paid for
+    # by every sandbox on the host regardless.
+    #
+    # When the total exceeds this, the least recently restored images are
+    # dropped until it fits; images backing a live sandbox are never dropped.
+    # Leave unset and the cache grows until the disk is full.
+    maxTotalBytes: 21474836480  # 20 GiB
+    buildTimeoutMs: 600000
 
 # Size limits (MiB) for multipart uploads. Keep aligned with the reverse
 # proxy's client_max_body_size (see frontend/nginx.conf).
@@ -229,6 +252,29 @@ ingress:
   proxyHost: 0.0.0.0
   defaultUpstreamPort: 80
   upstreamTimeoutMs: 30000
+
+  # A sandbox restored from a snapshot is published under the SNAPSHOT's
+  # subdomain (its `slug`, or a label derived from its id), so the URL of a
+  # service running inside it survives across sessions. Sandboxes with no
+  # snapshot keep being published under their own id.
+  #
+  # With autoRestart on, visiting that URL while nothing is running restores
+  # the snapshot and shows a waiting page until the service answers. Individual
+  # snapshots opt out with their own `autoRestart: false` (PATCH /snapshots/:id).
+  #
+  # Note: this lets an unauthenticated visitor allocate a sandbox. It is bounded
+  # by `resourceLimits` and by the short TTL below, but on a host with guessable
+  # subdomains it is worth knowing about.
+  autoRestart: true
+  # TTL granted to a sandbox nobody explicitly asked for. Shorter than
+  # defaults.defaultTtlSeconds on purpose.
+  autoRestartTtlSeconds: 1800
+  # How long one wake-up holds its claim before another visitor may retry.
+  # Must exceed the slowest restore (a large tarball replay runs to a minute+;
+  # an image-backed restore is a couple of seconds).
+  autoRestartClaimSeconds: 300
+  # How long the waiting page polls before showing an error.
+  autoRestartTimeoutSeconds: 120
 
 mcp:
   enabled: true

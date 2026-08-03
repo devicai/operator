@@ -308,6 +308,7 @@ Live values are exposed via `GET /api/v1/usage` (see [Usage](#usage) below). The
 | GET | `/api/v1/snapshots` | List snapshots (filter by `sandboxId`) |
 | GET | `/api/v1/snapshots/:id` | Get snapshot |
 | POST | `/api/v1/snapshots/:id/restore` | Restore sandbox from snapshot |
+| PATCH | `/api/v1/snapshots/:id` | Set the public subdomain (`slug`), `autoRestart` and `startCommand` |
 | DELETE | `/api/v1/snapshots/:id` | Delete snapshot |
 
 #### Snapshot Restore Modes
@@ -316,6 +317,203 @@ The restore endpoint accepts a `linked` flag:
 
 - **`linked: true`** (default) — Sandbox stays linked to the snapshot. On stop or TTL expiry, changes are automatically persisted back to the snapshot.
 - **`linked: false`** — Fully independent sandbox (fork). The snapshot remains unchanged regardless of what happens in the sandbox.
+
+#### Stable URLs and auto-restart
+
+Restoring mints a new `sandboxId` every time, so publishing a sandbox under its
+own id gives a URL that dies with the session — no good for a service someone
+wants to link to. Instead, **a sandbox restored from a snapshot is published
+under the snapshot's subdomain**:
+
+```
+PATCH /api/v1/snapshots/:id   { "slug": "my-app" }
+    → https://my-app.sandbox.devic.ai
+```
+
+Without a slug the subdomain is derived from the snapshot id, so every snapshot
+has a stable address with nothing to configure. The slug only makes it
+memorable. Sandboxes not born of a snapshot keep being published under their own
+id, exactly as before.
+
+Because the address belongs to the snapshot, it can be served when nothing is
+running: a visit to a dormant URL restores the snapshot and returns a waiting
+page that polls `/__devic/status` and reloads when the service answers. With the
+image cache that takes a couple of seconds.
+
+The restore is **linked**, like any other: what gets served this way is an app
+with users, and an unlinked sandbox would drop everything they wrote when its
+TTL ran out. The snapshot is the thing that persists, so it is written back to
+when the sandbox stops or expires. Note what that means — anyone who can reach
+the public URL can change the snapshot through the app being served. It gets
+`ingress.autoRestartTtlSeconds` rather than the usual default, since nobody
+asked for that sandbox explicitly. Concurrent visits are deduplicated through a
+Redis claim, so one page load starts one restore, not one per asset.
+
+Linked has a consequence worth planning for: when a session expires, the sandbox
+writes itself back, and a full capture of a multi-gigabyte snapshot runs for
+minutes (plus a rebuild of its cached image). A visit arriving in that window
+**waits** for the save rather than failing — the waiting page says what it is
+waiting on and keeps its budget rolling. Restoring with `force` would serve the
+version from before the save and then overwrite it with that older filesystem,
+losing exactly the writes the save exists to keep.
+
+Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
+`ingress.autoRestart: false`.
+
+**Reachability does not live in Redis.** Docker puts each sandbox on its own
+bridge network and `publish` joins *this* container to it — an attachment that
+dies when the container is replaced. After a restart or a redeploy the routes
+still resolve, but the addresses they name are no longer routable from here:
+packets vanish and requests hang until the upstream timeout. Two things keep
+that from stranding a sandbox:
+
+- On startup, every running sandbox holding a subdomain is republished, which
+  reattaches the network and refreshes its address.
+- A route whose upstream cannot be connected to (refused, unreachable, or no
+  answer within `CONNECT_TIMEOUT_MS`) is checked against the sandbox record:
+  - **Sandbox gone or stopped** → the route is dropped and the address served
+    as dormant, so the wake-up can replace it. This matters beyond restarts: a
+    route that exists suppresses the wake-up, so a stale entry would otherwise
+    keep the address dead until the sandbox expired.
+  - **Sandbox running but silent** → the route stands and the visitor gets the
+    waiting page, which reloads the moment anything starts listening. This is
+    the normal state right after a restore, and replacing it would be wrong
+    twice: it abandons a sandbox someone may be working in, and it leaves two
+    linked sandboxes of one snapshot racing to write themselves back into it.
+
+  An upstream that *accepts* the connection and then misbehaves still gets a
+  plain 502 — that is the service's problem, not the route's.
+
+**A snapshot restores files, not processes**, so nothing listens in a freshly
+restored sandbox unless the snapshot says what to start:
+
+```
+PATCH /api/v1/snapshots/:id   { "startCommand": "cd /workspace && npm start" }
+```
+
+It runs after every restore, detached and best-effort — a sandbox whose service
+fails to start is still a working sandbox, and the waiting page reports that
+nothing is listening rather than the restore erroring out. Output goes to
+`/tmp/.devic-start.log` inside the sandbox.
+
+Because it is launched detached, the shell reports success whether or not the
+command goes on to start anything — a broken one is invisible until someone
+visits the URL and gets a 502. So `PATCH` reads the command back and returns
+what it found:
+
+```json
+{ "startCommandWarnings": [ { "code": "PGREP_SELF_MATCH", "message": "…", "fix": "…" } ] }
+```
+
+The command is saved either way; these are advisory. Three checks, each exact
+rather than heuristic:
+
+- **`SYNTAX_ERROR`** — the command is parsed with `sh -n`, the real shell
+  parser, which reads without executing. Unbalanced quotes, an unclosed `if`.
+- **`PGREP_SELF_MATCH`** — `pgrep -f PAT` searches whole command lines,
+  *including the one of the shell evaluating it*, whose command line is the
+  start command itself. The pattern is written right there, so it finds itself,
+  the guard concludes the service is already up, and nothing starts — silently,
+  with an empty log. This is not a matter of writing the pattern better:
+  `"[n]ode app.js"` fails too, because `node app.js` is spelled out later in the
+  same line. A restore always begins from a fresh container, so the guard has
+  nothing to protect against; drop it, or test the port instead.
+- **`PKILL_SELF_MATCH`** — same mechanism, worse outcome: it kills the shell
+  running the command, so nothing after that point runs.
+
+The same check runs at restore time and logs what it finds, tying the problem to
+a specific sandbox.
+
+It deliberately runs **after the filesystem is in place**, not through the
+container entrypoint. A tarball restore creates the container, starts it, and
+only *then* unpacks into it, so anything the snapshot changed about the boot
+path has already been skipped by the time it lands — measured: the same snapshot
+self-started from its image and did not from its tarball. Running it here is the
+only point that behaves identically on both paths.
+
+`initScript` is not this, and the split is by owner:
+
+- **`initScript` belongs to whoever manages the environment** — a developer
+  preparing a sandbox: installing packages, wiring credentials, laying out the
+  workspace. It runs on `create` only (`sandboxes.service.ts:214`).
+- **`startCommand` belongs to whoever consumes the snapshot** — typically the
+  agent working inside it, which is the party that knows how its own service
+  starts. It runs on every restore, including the ones a visitor triggers, where
+  no init script is in play.
+
+They can overlap: a session started through a caller that also runs an init
+script will run both, and if each starts the same server the second one hits
+`Address already in use`. Keep the service start in `startCommand` and leave
+preparation to `initScript`.
+
+#### Snapshot Image Cache
+
+Restoring from a tarball costs time proportional to snapshot size, because the
+archive is pushed into the new container and extracted there — single-threaded
+gzip inside the sandbox's own CPU quota. Measured against a live instance:
+
+| Snapshot | From tarball | From image |
+|---|---|---|
+| 0 MB | 3.0 s | ~2 s |
+| 199.8 MB | 15–28 s | ~2 s |
+| 760.9 MB | 65.1 s | ~2 s |
+
+Enabling `snapshots.imageCache` pre-materializes each snapshot as a container
+image, so a restore is a plain container create and no longer scales with size.
+
+**The tarball remains the artifact of record.** Export, import and backups read
+it, and the image is rebuilt from it after every capture. Deleting every cached
+image costs start time and nothing else — restores fall back to the tarball,
+which is the behaviour with the cache off.
+
+Three properties are worth knowing before enabling it:
+
+- **Disk.** An image stores its content uncompressed (that is why it starts
+  instantly). Only the delta over the base image is charged to the cache, since
+  the base is shared by every sandbox on the host regardless. Set
+  `maxTotalBytes`; the least recently restored images are evicted to stay under
+  it, and an image backing a live sandbox is never evicted. Independently of the
+  cap, every five minutes the module drops images whose snapshot no longer
+  exists — deleting a snapshot cannot always remove its image, because the
+  daemon refuses while any container (even a stopped one) still references it.
+- **Capture cost.** Each capture writes the tarball and then, in the
+  background, rebuilds the image (~23 s for a 200 MB snapshot). Nothing waits
+  on it: the snapshot is `ready` as soon as the tarball is.
+- **Layer depth.** The image is always rebuilt from the ORIGINAL base image, so
+  its depth is pinned at base+1 no matter how many times a linked snapshot is
+  persisted. This is not an optimization but a correctness requirement: under
+  `sysbox-runc` an image of 71 layers fails to start with an opaque OCI error
+  while 70 starts fine (measured; the same images run under `runc`), and the
+  failure surfaces only at the next restore.
+
+A sandbox restored from a cached image records its base image in a container
+label, so its own snapshots stay diffs against that base rather than against
+the snapshot image it happened to boot from.
+
+#### Saving a big snapshot
+
+Capturing a large filesystem takes minutes — longer than most reverse proxies
+will hold a request open. Two options keep that off the request path:
+
+- `POST /api/v1/sandboxes/:id/stop` with `{"async": true}` — the sandbox goes to
+  `stopping`, the response comes back immediately, and the save runs in the
+  background. The container is torn down **after** the capture finishes; killing
+  it mid-capture SIGKILLs the tar and loses the save. Add `{"save": false}` to
+  close a session without keeping its changes.
+- `POST /api/v1/snapshots` with `{"async": true}` — returns the `creating`
+  document; poll `GET /api/v1/snapshots/:id` for the outcome.
+
+While a save runs, the snapshot carries `saveState: "saving"` and its artifact
+on disk is still the **previous** capture (captures write to a temp file and are
+renamed into place, so a reader never sees a half-written tarball). Restoring
+from it in that window is refused with `409 SNAPSHOT_SAVE_IN_PROGRESS` unless the
+caller passes `force: true`, which starts from that last saved version and
+accepts being out of sync with the save in flight. Stopping or destroying a
+sandbox whose filesystem is being captured is refused the same way.
+
+A capture also rebuilds the image cache, if enabled — scheduled only once the
+tarball is renamed into place, so an image never publishes content that is not
+yet the artifact of record.
 
 ### Sandbox Profiles
 
@@ -342,6 +540,20 @@ Tools exposed:
 ### WebSocket Terminal
 
 Connect to `ws://host/ws/terminal` for interactive terminal sessions.
+
+> **This endpoint is not authenticated, and must not be exposed to a network
+> you do not trust.** The gateway registers a raw `ws.on('message')` handler
+> inside `handleConnection`, and Nest applies the global `ApiKeyGuard` to
+> *handlers*, so the guard never runs here: `auth.enabled: true` protects the
+> REST API and leaves this open. Attaching needs only a sandbox id, which is
+> public by construction — it is the label of the sandbox's own ingress
+> hostname — so anyone given a preview URL can open a root shell in it.
+>
+> The bundled frontend therefore serves the UI but refuses `/ws/` (see
+> `frontend/nginx.conf`); it runs commands over the REST API instead. Reach the
+> terminal from a trusted network, against the API port directly. If you put
+> the API port behind a public proxy, terminate it there until the gateway
+> validates a key on connect.
 
 ### Health
 

@@ -163,6 +163,24 @@ class StubResourceUsage {
   async assertDiskAvailable() {}
 }
 
+/**
+ * Image cache turned off, so this suite keeps exercising the tarball restore
+ * path end to end — which stays the fallback on every deployment and must not
+ * be allowed to rot behind the cache.
+ */
+class StubImageService {
+  registerTarballApplier() {}
+  isEnabled() {
+    return false;
+  }
+  async isUsable() {
+    return false;
+  }
+  async markUsed() {}
+  scheduleBuild() {}
+  async discard() {}
+}
+
 async function main(): Promise<void> {
   const provider = new DockerRuntimeProvider(config);
   const snapshotRepo: any = new InMemoryRepo();
@@ -177,7 +195,9 @@ async function main(): Promise<void> {
     config,
     resourceUsage as any,
     provider,
+    new StubImageService() as any,
   );
+  snapshotsService.onModuleInit();
 
   // ===========================================================================
   console.log(`▶ Test 1: create source sandbox A on '${IMAGE}'`);

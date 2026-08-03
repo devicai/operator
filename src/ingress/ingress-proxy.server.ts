@@ -4,13 +4,46 @@ import {
   Logger,
   OnModuleDestroy,
   OnModuleInit,
+  Optional,
 } from '@nestjs/common';
 import * as http from 'http';
 import * as net from 'net';
 import { Duplex } from 'stream';
 import { CONFIG } from '../config/config.loader';
 import { IngressConfig, ModuleConfig } from '../config/config.types';
+import { SandboxRepository } from '../repositories/sandbox.repository';
+import { SandboxStatus } from '../schemas/sandbox.schema';
 import { IngressRegistry } from './ingress-registry';
+import { SandboxWakeupService } from './sandbox-wakeup.service';
+import {
+  STATUS_PATH,
+  disabledPage,
+  errorPage,
+  notFoundPage,
+  waitingPage,
+} from './wakeup-page';
+
+/**
+ * How long to wait to establish a TCP connection to an upstream, as opposed to
+ * waiting for its response. Sandboxes are on the same host, so anything alive
+ * accepts immediately.
+ */
+const CONNECT_TIMEOUT_MS = 2000;
+
+/**
+ * Whether an error means the upstream address answers to nothing — as opposed
+ * to a service that is there but misbehaving, which is the upstream's own
+ * problem and stays a 502.
+ */
+function isUnreachable(err: NodeJS.ErrnoException): boolean {
+  return (
+    err.code === 'ECONNREFUSED' ||
+    err.code === 'EHOSTUNREACH' ||
+    err.code === 'ENETUNREACH' ||
+    err.code === 'ETIMEDOUT' ||
+    err.code === 'EHOSTDOWN'
+  );
+}
 
 /**
  * Embedded HTTP reverse proxy that routes requests to running sandboxes by
@@ -32,6 +65,10 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
   constructor(
     @Inject(CONFIG) private readonly config: ModuleConfig,
     private readonly registry: IngressRegistry,
+    private readonly wakeup: SandboxWakeupService,
+    // Optional so the proxy still runs where no repository is wired; without it
+    // a route is simply trusted, which is the conservative half of the choice.
+    @Optional() private readonly sandboxRepo?: SandboxRepository,
   ) {}
 
   async onModuleInit(): Promise<void> {
@@ -141,13 +178,30 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
     res: http.ServerResponse,
     cfg: ReturnType<IngressProxyServer['resolved']>,
   ): Promise<void> {
-    const upstream = await this.resolveUpstream(req, cfg.wildcardDomain);
-    if (!upstream) {
-      res.statusCode = 404;
-      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-      res.end('Sandbox not found');
+    const subdomain = this.extractSubdomain(req.headers.host, cfg.wildcardDomain);
+    if (!subdomain) {
+      this.sendHtml(req, res, 404, notFoundPage(), 'Sandbox not found');
       return;
     }
+
+    // Reserved path: the waiting page polls it to learn when to reload. Served
+    // before the upstream lookup so it keeps answering while nothing is
+    // running — which is precisely when it is needed.
+    if (this.isStatusRequest(req)) {
+      await this.sendStatus(res, subdomain);
+      return;
+    }
+
+    const entry = await this.registry.lookup(subdomain).catch(() => null);
+    if (!entry) {
+      await this.serveDormant(req, res, subdomain);
+      return;
+    }
+    const upstream = {
+      host: entry.upstreamHost,
+      port: entry.upstreamPort,
+      sandboxId: entry.sandboxId,
+    };
 
     const headers = { ...req.headers };
     delete headers['connection'];
@@ -184,6 +238,24 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
       },
     );
 
+    // A separate, much shorter budget for reaching the upstream at all. The
+    // request timeout covers a slow response, which is the upstream's business;
+    // an upstream on the same host either accepts in milliseconds or is not
+    // there. Without this, an address that no longer routes anywhere makes the
+    // visitor wait the full request timeout for a 502.
+    proxyReq.on('socket', (socket) => {
+      if (!socket.connecting) return;
+      const timer = setTimeout(() => {
+        proxyReq.destroy(
+          Object.assign(new Error('upstream connect timeout'), {
+            code: 'ETIMEDOUT',
+          }),
+        );
+      }, CONNECT_TIMEOUT_MS);
+      socket.once('connect', () => clearTimeout(timer));
+      socket.once('close', () => clearTimeout(timer));
+    });
+
     proxyReq.on('timeout', () => {
       proxyReq.destroy(new Error('upstream timeout'));
     });
@@ -191,17 +263,207 @@ export class IngressProxyServer implements OnModuleInit, OnModuleDestroy {
       this.logger.debug(
         `Upstream error (${upstream.host}:${upstream.port}): ${err.message}`,
       );
-      if (!res.headersSent) {
-        res.statusCode = 502;
-        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
-        res.end('Bad Gateway');
-      } else {
+      if (res.headersSent) {
         res.end();
+        return;
       }
+
+      // Nothing answered at the address. Either the sandbox behind it is gone
+      // — a route that outlived what it pointed at — or it is alive and simply
+      // has no service listening. Only the first is the route's fault.
+      if (isUnreachable(err)) {
+        void this.handleUnreachable(req, res, subdomain, upstream.sandboxId);
+        return;
+      }
+
+      res.statusCode = 502;
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end('Bad Gateway');
     });
 
     req.on('aborted', () => proxyReq.destroy());
     req.pipe(proxyReq);
+  }
+
+  /**
+   * Decide what an unanswered upstream means, and act on it.
+   *
+   * A live sandbox with no service listening is the normal state right after a
+   * restore — a snapshot restores files, not processes — and replacing it would
+   * be the wrong move twice over: it abandons a sandbox someone may be working
+   * in, and it leaves two linked sandboxes of the same snapshot racing to write
+   * themselves back into it. So the route stands, and the visitor gets the
+   * waiting page, which reloads the moment anything starts listening.
+   *
+   * A route pointing at a sandbox that is gone is the opposite: it is a claim
+   * that stopped being true, and worse than no route at all, because a route
+   * suppresses the wake-up that would replace it.
+   */
+  private async handleUnreachable(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    subdomain: string,
+    sandboxId: string,
+  ): Promise<void> {
+    try {
+      if (await this.isSandboxAlive(sandboxId)) {
+        this.logger.debug(
+          `${subdomain} → sandbox ${sandboxId} is running but nothing is listening`,
+        );
+        this.sendHtml(
+          req,
+          res,
+          503,
+          waitingPage({ timeoutSeconds: this.wakeup.timeoutSeconds }),
+          'Sandbox is running but no service is listening',
+        );
+        return;
+      }
+
+      this.logger.warn(
+        `Dropping route ${subdomain} → sandbox ${sandboxId}: upstream unreachable`,
+      );
+      await this.registry.unpublish(subdomain).catch(() => undefined);
+      await this.serveDormant(req, res, subdomain);
+    } catch (err) {
+      this.logger.warn(
+        `Could not serve ${subdomain} after an unreachable upstream: ${(err as Error).message}`,
+      );
+      if (!res.headersSent) {
+        res.statusCode = 502;
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+        res.end('Bad Gateway');
+      }
+    }
+  }
+
+  /**
+   * Whether the sandbox a route names still exists and is running. Without a
+   * repository (the proxy can run standalone) nothing is known, and the safe
+   * answer is yes: keeping a route costs a waiting page, dropping one that was
+   * fine costs a duplicate sandbox.
+   */
+  private async isSandboxAlive(sandboxId: string): Promise<boolean> {
+    if (!this.sandboxRepo) return true;
+    try {
+      const doc = await this.sandboxRepo.findOne({ sandboxId } as any, {});
+      return doc?.status === SandboxStatus.RUNNING;
+    } catch {
+      return true;
+    }
+  }
+
+  /** Whether this request is the waiting page asking whether to reload. */
+  private isStatusRequest(req: http.IncomingMessage): boolean {
+    const path = (req.url ?? '').split('?')[0];
+    return path === STATUS_PATH;
+  }
+
+  private async sendStatus(
+    res: http.ServerResponse,
+    subdomain: string,
+  ): Promise<void> {
+    const status = await this.wakeup
+      .status(subdomain)
+      .catch(() => ({ state: 'starting' as const }));
+    const body = JSON.stringify(status);
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    res.setHeader('Cache-Control', 'no-store');
+    res.end(body);
+  }
+
+  /**
+   * Nothing is routing for this subdomain. Either a snapshot is behind it and
+   * we wake it, or there is genuinely nothing here.
+   */
+  private async serveDormant(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    subdomain: string,
+  ): Promise<void> {
+    const outcome = await this.wakeup.wake(subdomain).catch((err) => {
+      this.logger.warn(
+        `Wake-up failed for ${subdomain}: ${(err as Error).message}`,
+      );
+      return { kind: 'unknown' as const };
+    });
+
+    switch (outcome.kind) {
+      case 'unknown':
+        this.sendHtml(req, res, 404, notFoundPage(), 'Sandbox not found');
+        return;
+
+      case 'disabled':
+        // 503 rather than 404: the sandbox exists and could serve this address,
+        // it is just not allowed to start itself.
+        this.sendHtml(req, res, 503, disabledPage(), 'Sandbox is stopped');
+        return;
+
+      case 'waking':
+      case 'already-waking': {
+        const state = await this.wakeup
+          .status(subdomain)
+          .catch(() => ({ state: 'starting' as const }));
+        if (state.state === 'ready') {
+          // It came up between the lookup and now. Send the visitor round again
+          // rather than making them watch a spinner for a live sandbox.
+          res.statusCode = 307;
+          res.setHeader('Location', req.url ?? '/');
+          res.setHeader('Cache-Control', 'no-store');
+          res.end();
+          return;
+        }
+        if (state.state === 'error') {
+          this.sendHtml(
+            req,
+            res,
+            503,
+            errorPage(state.message ?? ''),
+            `Sandbox failed to start: ${state.message ?? ''}`,
+          );
+          return;
+        }
+        this.sendHtml(
+          req,
+          res,
+          503,
+          waitingPage({ timeoutSeconds: this.wakeup.timeoutSeconds }),
+          'Sandbox is starting',
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * Serve a page to a browser, or a terse equivalent to anything else.
+   *
+   * A page load asks for far more than the document — assets, favicon, XHR — and
+   * answering those with HTML would corrupt them. Only a request that says it
+   * accepts HTML gets the page; everything else gets the status code and a
+   * plain-text line, which is what the old behaviour always was.
+   */
+  private sendHtml(
+    req: http.IncomingMessage,
+    res: http.ServerResponse,
+    statusCode: number,
+    html: string,
+    plain: string,
+  ): void {
+    if (res.headersSent) return;
+    res.statusCode = statusCode;
+    res.setHeader('Cache-Control', 'no-store');
+    if (statusCode === 503) res.setHeader('Retry-After', '5');
+
+    const accept = String(req.headers['accept'] ?? '');
+    if (!accept.includes('text/html')) {
+      res.setHeader('Content-Type', 'text/plain; charset=utf-8');
+      res.end(plain);
+      return;
+    }
+    res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    res.end(html);
   }
 
   private async handleUpgrade(

@@ -182,8 +182,45 @@ export interface SnapshotDto {
   snapshotPath: string;
   sizeBytes: number;
   metadata: Record<string, any>;
+  /**
+   * Subdomain this snapshot is served under. Absent means one derived from the
+   * snapshot id — every snapshot has a stable URL either way.
+   */
+  slug?: string;
+  /** Address the snapshot is served at, derived by the server from its slug. */
+  publicUrl?: string;
+  /** Restore on visit to the public URL. Absent means enabled (opt-out). */
+  autoRestart?: boolean;
+  /**
+   * Command run after every restore to bring the service back up. A snapshot
+   * restores files, not processes, so without it a restored sandbox serves
+   * nothing.
+   */
+  startCommand?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/** How a snapshot is served: its address, whether it wakes, and what it starts. */
+export interface UpdateSnapshotDto {
+  slug?: string | null;
+  autoRestart?: boolean;
+  startCommand?: string | null;
+}
+
+/**
+ * A problem found in a start command by reading it, not by running it. The
+ * command is saved regardless — this is what the caller could not have seen,
+ * since a detached launch reports success either way.
+ */
+export interface StartCommandWarning {
+  code: 'PGREP_SELF_MATCH' | 'PKILL_SELF_MATCH' | 'SYNTAX_ERROR';
+  message: string;
+  fix?: string;
+}
+
+export interface UpdatedSnapshotDto extends SnapshotDto {
+  startCommandWarnings?: StartCommandWarning[];
 }
 
 export interface CreateSnapshotDto {

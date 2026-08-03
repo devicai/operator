@@ -33,7 +33,8 @@ export function useCreateSandbox() {
 export function useStopSandbox() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => sandboxesApi.stop(id).then((res) => res.data),
+    mutationFn: (vars: { id: string; async?: boolean }) =>
+      sandboxesApi.stop(vars.id, { async: vars.async }).then((res) => res.data),
     onSuccess: () => queryClient.invalidateQueries({ queryKey: [SANDBOXES_KEY] }),
   });
 }
