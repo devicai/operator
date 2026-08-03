@@ -349,6 +349,14 @@ the public URL can change the snapshot through the app being served. It gets
 asked for that sandbox explicitly. Concurrent visits are deduplicated through a
 Redis claim, so one page load starts one restore, not one per asset.
 
+Linked has a consequence worth planning for: when a session expires, the sandbox
+writes itself back, and a full capture of a multi-gigabyte snapshot runs for
+minutes (plus a rebuild of its cached image). A visit arriving in that window
+**waits** for the save rather than failing — the waiting page says what it is
+waiting on and keeps its budget rolling. Restoring with `force` would serve the
+version from before the save and then overwrite it with that older filesystem,
+losing exactly the writes the save exists to keep.
+
 Turn it off per snapshot with `{"autoRestart": false}`, or entirely with
 `ingress.autoRestart: false`.
 
