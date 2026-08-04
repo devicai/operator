@@ -17,6 +17,12 @@ export interface SandboxDto {
   expiresAt: string;
   autoExtend?: boolean;
   snapshotId?: string;
+  /**
+   * Snapshot this sandbox's filesystem is being captured into, right now.
+   * Written by the server for the duration of the save, so a page opened
+   * mid-capture sees it — it is not something the client starts or tracks.
+   */
+  savingSnapshotId?: string;
   commandCount: number;
   recentCommands: string[];
   bindingId?: string;

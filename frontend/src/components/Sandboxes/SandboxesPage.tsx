@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Button,
   Empty,
@@ -25,6 +25,7 @@ import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/use
 import { useSnapshots } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
+import SandboxSaveStatus from './SandboxSaveStatus';
 import CreateSandboxModal from './CreateSandboxModal';
 import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
@@ -107,6 +108,13 @@ const SandboxesPage: React.FC = () => {
   });
   const { data: snapshotsPage } = useSnapshots();
   const { data: usage, isLoading: usageLoading } = useUsage();
+  // The save state lives on the snapshot; the workflow that produces it lives
+  // on the sandbox. Indexing here lets each row show its own without a request
+  // per sandbox.
+  const snapshotsById = useMemo(
+    () => new Map((snapshotsPage?.data ?? []).map((s) => [s.snapshotId, s])),
+    [snapshotsPage],
+  );
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
 
@@ -373,6 +381,14 @@ const SandboxesPage: React.FC = () => {
       key: 'commands',
       width: 90,
       align: 'center',
+    },
+    {
+      title: 'Save',
+      key: 'save',
+      width: 190,
+      render: (_: any, row) => (
+        <SandboxSaveStatus sandbox={row} snapshots={snapshotsById} />
+      ),
     },
     {
       title: '',

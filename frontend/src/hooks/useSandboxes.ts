@@ -15,7 +15,16 @@ export function useSandboxes(params?: {
   return useQuery({
     queryKey: [SANDBOXES_KEY, params],
     queryFn: () => sandboxesApi.getAll(params).then((res) => res.data),
-    refetchInterval: 10_000,
+    // Faster while a capture is running, so the save indicator on a row keeps
+    // up with the stages instead of jumping from "stopping" to gone. The
+    // signal is the server's own `savingSnapshotId`, not anything the client
+    // set — a page opened mid-save starts polling at the fast rate too.
+    refetchInterval: (query) => {
+      const rows = (query.state.data as any)?.data as
+        | Array<{ savingSnapshotId?: string }>
+        | undefined;
+      return rows?.some((s) => s.savingSnapshotId) ? 2_000 : 10_000;
+    },
     // Paging without this flickers back to the empty state on every page
     // change; keeping the previous page rendered makes it feel instant.
     placeholderData: (prev) => prev,
