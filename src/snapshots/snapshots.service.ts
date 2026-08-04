@@ -1425,10 +1425,22 @@ export class SnapshotsService implements OnModuleInit {
       // image and the version it describes land in a single update.
       const nextVersion = (snapshotDoc.persistVersion ?? 0) + 1;
 
+      // First commit-based save of a snapshot that predates the field: the
+      // tarball sitting on disk holds the version we are about to leave behind,
+      // so record that rather than let it stay unset. Without this the lag is
+      // unknowable from the document alone, and the reader has to keep guessing
+      // forever.
+      const backfillTarballVersion =
+        snapshotDoc.tarballVersion === undefined ||
+        snapshotDoc.tarballVersion === null
+          ? { tarballVersion: snapshotDoc.persistVersion ?? 0 }
+          : {};
+
       const persisted = await this.snapshotRepo.updateById(
         docId,
         {
           $set: {
+            ...backfillTarballVersion,
             persistVersion: nextVersion,
             imageState: 'ready',
             imageRef: info.ref,

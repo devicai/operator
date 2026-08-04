@@ -88,7 +88,15 @@ const SaveStatus: React.FC<{ snapshot: SnapshotDto }> = ({ snapshot }) => {
   const stage = snapshot.saveStage;
   const elapsed = useElapsed(stage ? snapshot.saveStageSince : undefined);
 
-  const lag = (snapshot.persistVersion ?? 0) - (snapshot.tarballVersion ?? 0);
+  // Absent `tarballVersion` is NOT version zero. Snapshots saved before
+  // commit-based saves existed have the field unset and a tarball that is
+  // current by construction — the only path back then wrote it. Treating
+  // absent as 0 invented a lag equal to the whole version count and put an
+  // orange warning on snapshots with nothing wrong with them.
+  const lag =
+    snapshot.tarballVersion === undefined || snapshot.tarballVersion === null
+      ? 0
+      : (snapshot.persistVersion ?? 0) - snapshot.tarballVersion;
   const lastError = snapshot.metadata?.lastSaveError as string | undefined;
 
   if (stage) {

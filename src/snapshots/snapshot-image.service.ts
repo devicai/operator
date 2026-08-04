@@ -142,9 +142,25 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     return layers > 0 && layers >= RUNTIME_LAYER_CEILING - LAYER_SAFETY_MARGIN;
   }
 
-  /** Whether this snapshot's tarball is behind the image, and by how much. */
+  /**
+   * How many versions the tarball is behind the image.
+   *
+   * An ABSENT `tarballVersion` means zero lag, not version zero. Every snapshot
+   * saved before commit-based saves existed has the field unset, and its
+   * tarball is current by construction: the only path that ran back then wrote
+   * the tarball itself. Reading absent as 0 turned `persistVersion` into a lag
+   * out of thin air — a snapshot last saved days ago, whose tarball is exactly
+   * right, was reported as two versions behind.
+   *
+   * Once a commit-based save touches such a snapshot it backfills the field
+   * (see persistByCommit), so this default stops applying the moment it could
+   * ever be wrong.
+   */
   tarballLag(snapshot: SnapshotDocument): number {
-    return (snapshot.persistVersion ?? 0) - (snapshot.tarballVersion ?? 0);
+    if (snapshot.tarballVersion === undefined || snapshot.tarballVersion === null) {
+      return 0;
+    }
+    return (snapshot.persistVersion ?? 0) - snapshot.tarballVersion;
   }
 
   private needsConsolidation(snapshot: SnapshotDocument): boolean {

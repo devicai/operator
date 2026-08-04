@@ -124,6 +124,34 @@ describe('persistByCommit', () => {
     expect(setOf(updates, 'persistVersion').tarballVersion).toBeUndefined();
   });
 
+  // A snapshot last saved before this feature existed has no `tarballVersion`,
+  // and its tarball is current: the only path that ran then wrote it. Leaving
+  // the field unset made every later reader compute a lag equal to the whole
+  // version count — a real snapshot on dev, correct and days old, was flagged
+  // "tarball -2" in orange.
+  it('backfills tarballVersion on the first commit save of an old snapshot', async () => {
+    const { run, updates } = makeService({
+      snapshot: { persistVersion: 2, tarballVersion: undefined },
+    });
+
+    await run();
+
+    const published = setOf(updates, 'persistVersion');
+    // The tarball on disk holds version 2 — the one being left behind.
+    expect(published.tarballVersion).toBe(2);
+    expect(published.persistVersion).toBe(3);
+  });
+
+  it('leaves an existing tarballVersion untouched', async () => {
+    const { run, updates } = makeService({
+      snapshot: { persistVersion: 9, tarballVersion: 7 },
+    });
+
+    await run();
+
+    expect(setOf(updates, 'persistVersion').tarballVersion).toBeUndefined();
+  });
+
   it('asks for the background pass that refreshes the tarball', async () => {
     const { run, imageService } = makeService();
     await run();
