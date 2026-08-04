@@ -31,6 +31,7 @@ import { IngressService } from '../ingress/ingress.service';
 import { SandboxWakeupService } from '../ingress/sandbox-wakeup.service';
 import {
   SnapshotDocument,
+  SnapshotSaveStage,
   SnapshotSaveState,
   SnapshotStatus,
 } from '../schemas/snapshot.schema';
@@ -53,16 +54,56 @@ import {
 } from '../runtime/runtime-provider.interface';
 import {
   buildExcludeMatcher,
+  cleanupPrefixes,
   partitionChanges,
   isSafeDeletePath,
   sh,
 } from './snapshot-fs.util';
 import { SnapshotImageService } from './snapshot-image.service';
+import { execFile } from 'child_process';
+import { promisify } from 'util';
+
+const execFileAsync = promisify(execFile);
+
+/**
+ * Whether the `zstd` binary is on PATH. Probed once: it either ships with the
+ * image or it does not, and the answer decides between a multi-core compressor
+ * and Node's single-threaded one on every capture.
+ */
+let zstdCliAvailable: boolean | null = null;
+async function hasZstdCli(): Promise<boolean> {
+  if (zstdCliAvailable !== null) return zstdCliAvailable;
+  try {
+    await execFileAsync('zstd', ['--version'], { maxBuffer: 64 * 1024 });
+    zstdCliAvailable = true;
+  } catch {
+    zstdCliAvailable = false;
+  }
+  return zstdCliAvailable;
+}
 
 const SNAPSHOTS_DIR = join(homedir(), '.devic-sandbox', 'snapshots');
 
-/** zstd compression level for full-snapshot artifacts (disk-priority). */
-const ZSTD_LEVEL = 19;
+/**
+ * zstd level for full-snapshot artifacts.
+ *
+ * Was 19, which is a bad trade at any speed. Measured over a 762 MB tar with
+ * `-T0` on ten cores:
+ *
+ *     -3    0.90 s   244 MB
+ *     -9    1.47 s   214 MB      <- here
+ *     -19  25.71 s   184 MB
+ *     gzip -9        262 MB
+ *
+ * Level 19 costs 28x the time of level 3 to save a further 25%, and level 9
+ * gets within 16% of it for a seventeenth of the work. Even at 9 this beats the
+ * gzip default on both axes at once — smaller AND faster — which is the whole
+ * reason to prefer zstd here.
+ *
+ * The number matters more than it used to: with `-T0` unavailable the fallback
+ * below runs single-threaded, where 19 would take minutes.
+ */
+const ZSTD_LEVEL = 9;
 /** gzip level used when zstd is unavailable. */
 const GZIP_LEVEL = 9;
 /**
@@ -86,6 +127,18 @@ type Codec = 'zstd' | 'gzip';
  * this instead of relying on an exception.
  */
 export type SnapshotSaveOutcome = 'saved' | 'skipped' | 'conflict' | 'failed';
+
+export interface PersistOptions {
+  /**
+   * The sandbox is being torn down and will not be used again.
+   *
+   * Two things hang off this. Regenerable caches are deleted before the layer
+   * is sealed, which is free when the container is dying and destructive when
+   * it is not; and the commit is allowed to freeze the container, which costs
+   * nothing here and would stall a sandbox still serving requests.
+   */
+  terminal?: boolean;
+}
 
 @Injectable()
 export class SnapshotsService implements OnModuleInit {
@@ -165,6 +218,13 @@ export class SnapshotsService implements OnModuleInit {
       this.applyTarballTo(containerName, snapshot),
     );
 
+    // The other direction, for the same reason: after a commit-based save the
+    // tarball is behind, and rebuilding it means capturing from a container of
+    // the image — which is this service's capture routine, not the cache's.
+    this.imageService.registerTarballRefresher((snapshot) =>
+      this.refreshTarballFromImage(snapshot),
+    );
+
     // Same reason the image cache gets its applier injected rather than
     // importing this service: the ingress already sits below us (we publish
     // through it), so it cannot depend on us without closing a cycle.
@@ -183,7 +243,12 @@ export class SnapshotsService implements OnModuleInit {
         { saveState: SnapshotSaveState.SAVING } as any,
         {
           $set: { saveState: SnapshotSaveState.IDLE },
-          $unset: { savingSince: '', savingSandboxId: '' },
+          $unset: {
+            savingSince: '',
+            savingSandboxId: '',
+            saveStage: '',
+            saveStageSince: '',
+          },
         },
       );
       const orphanedCreates = await this.snapshotRepo.updateMany(
@@ -1057,7 +1122,9 @@ export class SnapshotsService implements OnModuleInit {
   async persistToSnapshot(
     sandboxDoc: SandboxDocument,
     targetSnapshotId?: string,
+    options: PersistOptions = {},
   ): Promise<SnapshotSaveOutcome> {
+    const startedAt = Date.now();
     // Callers may name the snapshot instead of relying on the link the sandbox
     // was restored with — the only way to save a sandbox restored unlinked.
     const snapshotId = targetSnapshotId ?? sandboxDoc.snapshotId;
@@ -1093,6 +1160,8 @@ export class SnapshotsService implements OnModuleInit {
           saveState: SnapshotSaveState.SAVING,
           savingSince: new Date(),
           savingSandboxId: sandboxDoc.sandboxId,
+          saveStage: SnapshotSaveStage.CLAIMING,
+          saveStageSince: new Date(),
         },
       },
       {},
@@ -1143,9 +1212,25 @@ export class SnapshotsService implements OnModuleInit {
       }
       const sandbox = await handle.connect();
 
+      // Seal the writable layer instead of walking, tarring and replaying it.
+      // Returns null when it declines or fails, and the tarball path below runs
+      // exactly as it always has — the artifact of record is never at risk.
+      const committed = await this.persistByCommit(
+        snapshotDoc,
+        sandboxDoc,
+        sandbox,
+        containerName,
+        persistScope,
+        startedAt,
+        options,
+      );
+      if (committed) return committed;
+
       if (targetPath !== snapshotDoc.snapshotPath && !existsSync(SNAPSHOTS_DIR)) {
         mkdirSync(SNAPSHOTS_DIR, { recursive: true });
       }
+
+      await this.setSaveStage(snapshotDoc, SnapshotSaveStage.CAPTURING);
 
       let deletes: string[] = [];
       let captureMeta: Record<string, any> = {};
@@ -1198,6 +1283,10 @@ export class SnapshotsService implements OnModuleInit {
             // A previous failure is history now.
             'metadata.lastSaveError': null,
             'metadata.lastSaveErrorAt': null,
+            lastSaveMethod: 'tarball',
+            lastSaveDurationMs: Date.now() - startedAt,
+            // This path IS the tarball, so it is current by construction.
+            tarballVersion: (snapshotDoc.persistVersion ?? 0) + 1,
             ...(persistScope === 'full'
               ? {
                   'metadata.deletes': this.capDeletes(deletes),
@@ -1251,6 +1340,269 @@ export class SnapshotsService implements OnModuleInit {
     }
   }
 
+  /**
+   * Save by sealing the sandbox's writable layer as the snapshot's image.
+   *
+   * Returns the outcome when it took the save, or `null` to decline — in which
+   * case the caller runs the tarball path unchanged. Declining is not failure:
+   * it is how a workdir snapshot, a runtime without commits, or a layer stack
+   * that has run out of headroom keeps working exactly as before.
+   *
+   * Why this is the fast path: the runtime already holds the delta as the
+   * container's writable layer. The tarball path re-derives it by walking the
+   * filesystem, tarring it, compressing it, copying it out, and then replaying
+   * it into a fresh container to rebuild the image — measured ~115 s against
+   * 14.9 s for a 1.2 GB delta, of which 83.8 s was gzip alone.
+   *
+   * It also removes the window this design has always had. The tarball path
+   * bumps `persistVersion` when the artifact lands and rebuilds the image
+   * afterwards, so for ~30 s the image is stale, `isUsable()` says no, and
+   * every restore falls back to replaying a tarball. Here the commit IS the new
+   * version: one write, no window.
+   */
+  private async persistByCommit(
+    snapshotDoc: SnapshotDocument,
+    sandboxDoc: SandboxDocument,
+    sandbox: RuntimeSandbox,
+    containerName: string,
+    persistScope: SnapshotScope,
+    startedAt: number,
+    options: PersistOptions,
+  ): Promise<SnapshotSaveOutcome | null> {
+    if (persistScope !== 'full') return null;
+
+    const docId = (snapshotDoc as any)._id.toString();
+
+    // Everything below is inside the net, guards included: this method promises
+    // that declining costs nothing, and a guard that threw would instead take
+    // down a save the tarball path was perfectly able to complete.
+    try {
+      if (!this.imageService.canCommitLive()) return null;
+
+      // Committing on top of an image that is already deep would produce one
+      // the runtime refuses to start. Hand this save to the tarball path and
+      // let the consolidation pass give the headroom back.
+      if (this.imageService.isOutOfLayerHeadroom(snapshotDoc)) {
+        this.logger.log(
+          `Snapshot ${snapshotDoc.snapshotId} has ${snapshotDoc.imageLayers} layers; ` +
+            'saving via the tarball and scheduling a consolidation',
+        );
+        this.imageService.scheduleConsolidation(snapshotDoc);
+        return null;
+      }
+
+      // Only for a sandbox that is being torn down: the caches are
+      // regenerable, but deleting them under a session that is still running
+      // is not this code's call to make.
+      if (options.terminal) {
+        await this.setSaveStage(snapshotDoc, SnapshotSaveStage.CLEANING);
+        await this.dropRegenerableCaches(sandbox, snapshotDoc.snapshotId);
+      }
+
+      await this.setSaveStage(snapshotDoc, SnapshotSaveStage.COMMITTING);
+      const ref = this.imageService.refFor(snapshotDoc.snapshotId);
+      const info = await this.runtime.commitImage!(containerName, ref, {
+        labels: { 'devic-sandbox.snapshot': snapshotDoc.snapshotId },
+        // The freeze lasts the whole commit. Free for a container about to be
+        // destroyed; not something to inflict on one still serving requests.
+        pause: options.terminal === true,
+      });
+
+      // The claim makes this the only writer, so the next version can be
+      // computed and written rather than incremented — which is what lets the
+      // image and the version it describes land in a single update.
+      const nextVersion = (snapshotDoc.persistVersion ?? 0) + 1;
+
+      const persisted = await this.snapshotRepo.updateById(
+        docId,
+        {
+          $set: {
+            persistVersion: nextVersion,
+            imageState: 'ready',
+            imageRef: info.ref,
+            imageSourceVersion: nextVersion,
+            imageBuiltAt: new Date(),
+            imageSizeBytes: info.uniqueSizeBytes,
+            imageLayers: info.layers,
+            imageGeneration: (snapshotDoc.imageGeneration ?? 0) + 1,
+            lastSaveMethod: 'commit',
+            lastSaveDurationMs: Date.now() - startedAt,
+            'metadata.lastPersistedFrom': sandboxDoc.sandboxId,
+            'metadata.lastPersistedAt': new Date().toISOString(),
+            'metadata.currentCwd': sandboxDoc.currentCwd,
+            'metadata.lastSaveError': null,
+            'metadata.lastSaveErrorAt': null,
+          },
+        },
+        {},
+      );
+
+      this.logger.log(
+        `Snapshot ${snapshotDoc.snapshotId} committed from sandbox ` +
+          `${sandboxDoc.sandboxId} (${info.layers} layers, ` +
+          `${(info.uniqueSizeBytes / 1048576).toFixed(1)} MB unique, ` +
+          `${Date.now() - startedAt} ms)`,
+      );
+
+      // The tarball is now behind. It stays the artifact of record — export,
+      // backups and migration all read it — so the background pass refreshes
+      // it, and until it does `tarballVersion` says how far behind it is.
+      if (persisted) this.imageService.scheduleConsolidation(persisted);
+      return 'saved';
+    } catch (err) {
+      // The tarball on disk is untouched and still restorable, so the honest
+      // move is to fall through to the path that produces it rather than fail
+      // the save over an optimisation.
+      this.logger.warn(
+        `Commit-based save of snapshot ${snapshotDoc.snapshotId} failed, ` +
+          `falling back to the tarball: ${(err as Error).message}`,
+      );
+      return null;
+    }
+  }
+
+  /**
+   * Delete the caches a full snapshot excludes, before the layer is sealed.
+   *
+   * The tarball path filters these out of its file list; a commit has no list,
+   * so they have to leave the container. Never throws: an image carrying a
+   * package cache is worse than it needs to be, not broken.
+   */
+  private async dropRegenerableCaches(
+    sandbox: RuntimeSandbox,
+    snapshotId: string,
+  ): Promise<void> {
+    const prefixes = cleanupPrefixes({
+      cleanup: this.config.snapshots?.cleanup ?? 'conservative',
+      extra: this.config.snapshots?.excludePaths,
+    });
+    if (!prefixes.length) return;
+    try {
+      const res = await sandbox.exec(
+        `rm -rf ${prefixes.map((p) => sh(p)).join(' ')} 2>/dev/null; exit 0`,
+      );
+      if (res.code !== 0) {
+        this.logger.debug(
+          `Cache cleanup for ${snapshotId} exited ${res.code}: ${res.stderr}`,
+        );
+      }
+    } catch (err) {
+      this.logger.debug(
+        `Cache cleanup for ${snapshotId} failed: ${(err as Error).message}`,
+      );
+    }
+  }
+
+  /**
+   * Rebuild a snapshot's tarball from its image, so the portable artifact
+   * catches up with what a commit-based save published.
+   *
+   * The tarball is not an optimisation: `downloadAsZip`, backups and moving a
+   * snapshot between hosts all read it, and it is the copy that survives the
+   * daemon losing its images. A commit-based save leaves it behind by one
+   * version, and this is what closes that gap.
+   *
+   * Runs against a throwaway container of the image rather than the original
+   * sandbox, which by now is usually gone — and would be the wrong source
+   * anyway, since the image is what the version describes.
+   */
+  private async refreshTarballFromImage(
+    snapshot: SnapshotDocument,
+  ): Promise<SnapshotDocument | null> {
+    const version = snapshot.persistVersion ?? 0;
+    const imageRef = snapshot.imageRef;
+    if (!imageRef) return null;
+
+    const helper = `snaptar-${nanoid(10)}`;
+    const codec: Codec = (snapshot.compression as Codec) ?? 'gzip';
+    const targetPath = this.resolveSnapshotPath(snapshot.snapshotPath);
+    const tmpPath = this.tempCapturePath(targetPath, helper);
+
+    await this.setSaveStage(snapshot, SnapshotSaveStage.TARBALL);
+
+    try {
+      await this.runtime.create({
+        name: helper,
+        image: imageRef,
+        workdir: snapshot.workdir,
+        cpus: snapshot.cpus,
+        memoryMib: snapshot.memoryMib,
+        env: snapshot.envVars ?? {},
+        // It exists only to be read from.
+        networkPolicy: 'deny-all',
+        // Diffs must come out relative to the ORIGINAL base, not to the image
+        // this container was created from — otherwise the tarball would hold
+        // only what changed since the last consolidation and replaying it onto
+        // the base would silently drop everything before that.
+        baselineImage: snapshot.image,
+      });
+
+      const handle = await this.runtime.get(helper);
+      if (!handle) throw new Error(`helper ${helper} is not reachable`);
+      const sandbox = await handle.connect();
+
+      const result = await this.captureFullToHost(
+        sandbox,
+        snapshot.workdir,
+        helper,
+        codec,
+        tmpPath,
+      );
+      const sizeBytes = this.commitCapture(tmpPath, targetPath);
+
+      // Written under the version that was current when the capture STARTED: a
+      // save landing meanwhile makes this tarball describe the older content,
+      // and claiming otherwise would hide a real lag.
+      const updated = await this.snapshotRepo.updateById(
+        (snapshot as any)._id.toString(),
+        {
+          $set: {
+            sizeBytes,
+            tarballVersion: version,
+            'metadata.deletes': this.capDeletes(result.deletes),
+            'metadata.fullCapture': result.stats,
+          },
+        },
+        {},
+      );
+
+      this.logger.log(
+        `Snapshot ${snapshot.snapshotId} tarball refreshed from its image at ` +
+          `version ${version} (${(sizeBytes / 1048576).toFixed(1)} MB)`,
+      );
+      return updated;
+    } catch (err) {
+      this.logger.warn(
+        `Tarball refresh for ${snapshot.snapshotId} failed: ${(err as Error).message}`,
+      );
+      return null;
+    } finally {
+      this.discardCapture(tmpPath);
+      await this.runtime.remove(helper).catch(() => undefined);
+      await this.snapshotRepo
+        .updateById(
+          (snapshot as any)._id.toString(),
+          { $unset: { saveStage: '', saveStageSince: '' } },
+          {},
+        )
+        .catch(() => undefined);
+    }
+  }
+
+  /** Record where the running save is. Never throws — it is display state. */
+  private async setSaveStage(
+    snapshotDoc: SnapshotDocument,
+    stage: SnapshotSaveStage,
+  ): Promise<void> {
+    await this.snapshotRepo
+      .updateById(
+        (snapshotDoc as any)._id.toString(),
+        { $set: { saveStage: stage, saveStageSince: new Date() } },
+        {},
+      )
+      .catch(() => undefined);
+  }
+
   /** Flag the sandbox as being captured, so stop/destroy refuse to kill it. */
   private async markSandboxSaving(
     sandboxDoc: SandboxDocument,
@@ -1288,7 +1640,12 @@ export class SnapshotsService implements OnModuleInit {
         (snapshotDoc as any)._id.toString(),
         {
           $set: { saveState: SnapshotSaveState.IDLE },
-          $unset: { savingSince: '', savingSandboxId: '' },
+          $unset: {
+            savingSince: '',
+            savingSandboxId: '',
+            saveStage: '',
+            saveStageSince: '',
+          },
         },
         {},
       );
@@ -1687,6 +2044,18 @@ export class SnapshotsService implements OnModuleInit {
     destPath: string,
     codec: Codec,
   ): Promise<void> {
+    // Node's zstd is single-threaded. The CLI with -T0 uses every core, and on
+    // a 1.13 GB tar that was 6.7 s against ~12 s — and 16 s all-in against the
+    // 83.8 s the inline gzip takes for the same content, at a BETTER ratio
+    // (373 MB vs 398 MB). Worth shelling out for; falls back when absent.
+    if (codec === 'zstd' && (await hasZstdCli())) {
+      await execFileAsync(
+        'zstd',
+        ['-q', '-f', `-${ZSTD_LEVEL}`, '-T0', srcTar, '-o', destPath],
+        { maxBuffer: 1024 * 1024 },
+      );
+      return;
+    }
     const transform =
       codec === 'zstd'
         ? (zlib as any).createZstdCompress({

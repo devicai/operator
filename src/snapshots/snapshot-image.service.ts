@@ -26,6 +26,27 @@ export type ApplyTarball = (
 ) => Promise<void>;
 
 /**
+ * Rebuild the snapshot's tarball from its current image. Registered by
+ * SnapshotsService, which owns the capture machinery.
+ *
+ * Resolves to the refreshed document, or null when it could not be produced.
+ */
+export type RefreshTarball = (
+  snapshot: SnapshotDocument,
+) => Promise<SnapshotDocument | null>;
+
+const DEFAULT_CONSOLIDATE_AT_LAYERS = 40;
+const DEFAULT_CONSOLIDATE_AT_TARBALL_LAG = 5;
+/**
+ * Layer count at which an image stops being startable. Measured under
+ * sysbox-runc; `docker.runtime-provider` refuses to publish at or above it.
+ * Kept in step with MAX_IMAGE_LAYERS there.
+ */
+const RUNTIME_LAYER_CEILING = 70;
+/** Headroom kept below the ceiling so a save always has somewhere to go. */
+const LAYER_SAFETY_MARGIN = 5;
+
+/**
  * Keeps a per-snapshot container image alongside each snapshot's tarball, so a
  * restore is "create a container" rather than "create a container and replay a
  * tarball into it" — measured ~2s flat against 15-65s scaling with size.
@@ -62,6 +83,12 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
    */
   private applyTarball: ApplyTarball | null = null;
 
+  /** Rebuilds a snapshot's tarball from its image. Injected for the same reason. */
+  private refreshTarball: RefreshTarball | null = null;
+
+  /** snapshotIds with a consolidation running, so two never overlap. */
+  private readonly consolidating = new Set<string>();
+
   constructor(
     private readonly snapshotRepo: SnapshotRepository,
     @Inject(CONFIG) private readonly config: ModuleConfig,
@@ -70,6 +97,123 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
 
   registerTarballApplier(fn: ApplyTarball): void {
     this.applyTarball = fn;
+  }
+
+  registerTarballRefresher(fn: RefreshTarball): void {
+    this.refreshTarball = fn;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Commit-based saves and consolidation
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Whether a save may seal the sandbox's writable layer instead of walking it.
+   * Needs the cache on, the opt-in set, and a runtime that can commit.
+   */
+  canCommitLive(): boolean {
+    return (
+      this.isEnabled() &&
+      this.config.snapshots?.imageCache?.commitLive === true &&
+      !!this.runtime.commitImage
+    );
+  }
+
+  private get consolidateAtLayers(): number {
+    const v = this.config.snapshots?.imageCache?.consolidateAtLayers;
+    return v && v > 0 ? v : DEFAULT_CONSOLIDATE_AT_LAYERS;
+  }
+
+  private get consolidateAtTarballLag(): number {
+    const v = this.config.snapshots?.imageCache?.consolidateAtTarballLag;
+    return v && v > 0 ? v : DEFAULT_CONSOLIDATE_AT_TARBALL_LAG;
+  }
+
+  /**
+   * True when another commit would risk producing an image the runtime cannot
+   * start. The caller saves via the tarball instead and asks for consolidation.
+   *
+   * Layers stack once per SESSION, not per save — a second save inside one
+   * session replaces the top layer rather than adding to it — so this is
+   * reached slowly, if ever.
+   */
+  isOutOfLayerHeadroom(snapshot: SnapshotDocument): boolean {
+    const layers = snapshot.imageLayers ?? 0;
+    return layers > 0 && layers >= RUNTIME_LAYER_CEILING - LAYER_SAFETY_MARGIN;
+  }
+
+  /** Whether this snapshot's tarball is behind the image, and by how much. */
+  tarballLag(snapshot: SnapshotDocument): number {
+    return (snapshot.persistVersion ?? 0) - (snapshot.tarballVersion ?? 0);
+  }
+
+  private needsConsolidation(snapshot: SnapshotDocument): boolean {
+    return (
+      (snapshot.imageLayers ?? 0) >= this.consolidateAtLayers ||
+      this.isOutOfLayerHeadroom(snapshot)
+    );
+  }
+
+  /**
+   * Background work owed after a commit-based save: refresh the tarball, and
+   * flatten back to base+1 once the stack has grown enough.
+   *
+   * Fire-and-forget by design. The caller has already been told the save
+   * succeeded, and it did — the image holds the content. What is outstanding is
+   * durability (the tarball is what survives the daemon, backups and migration)
+   * and layer headroom, and neither is worth making a stop wait for.
+   */
+  scheduleConsolidation(snapshot: SnapshotDocument): void {
+    if (!this.isEnabled()) return;
+    void this.consolidate(snapshot).catch((err) => {
+      this.logger.warn(
+        `Consolidation for snapshot ${snapshot.snapshotId} failed: ${(err as Error).message}`,
+      );
+    });
+  }
+
+  async consolidate(snapshot: SnapshotDocument): Promise<void> {
+    const snapshotId = snapshot.snapshotId;
+    if (this.consolidating.has(snapshotId)) {
+      this.logger.debug(`Consolidation for ${snapshotId} already in flight`);
+      return;
+    }
+    this.consolidating.add(snapshotId);
+
+    try {
+      let current = snapshot;
+
+      const lag = this.tarballLag(current);
+      if (lag > 0 && this.refreshTarball) {
+        if (lag >= this.consolidateAtTarballLag) {
+          this.logger.warn(
+            `Snapshot ${snapshotId} tarball is ${lag} versions behind; the ` +
+              'image has been the only fresh copy for that long',
+          );
+        }
+        const refreshed = await this.refreshTarball(current);
+        if (!refreshed) {
+          this.logger.warn(
+            `Could not refresh the tarball of ${snapshotId}; it stays ${lag} ` +
+              'version(s) behind and the image remains the only fresh copy',
+          );
+          return;
+        }
+        current = refreshed;
+      }
+
+      // Only now, with a tarball that matches the image, is flattening safe:
+      // the rebuild replays that tarball onto the original base.
+      if (this.needsConsolidation(current)) {
+        this.logger.log(
+          `Consolidating snapshot ${snapshotId}: ${current.imageLayers} layers ` +
+            `after ${current.imageGeneration ?? 0} generation(s)`,
+        );
+        await this.build(current, { keepUsable: true });
+      }
+    } finally {
+      this.consolidating.delete(snapshotId);
+    }
   }
 
   onModuleInit(): void {
@@ -174,7 +318,10 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     });
   }
 
-  async build(snapshot: SnapshotDocument): Promise<void> {
+  async build(
+    snapshot: SnapshotDocument,
+    opts: { keepUsable?: boolean } = {},
+  ): Promise<void> {
     if (!this.isEnabled()) return;
     if (!this.applyTarball) {
       this.logger.warn('No tarball applier registered; skipping image build');
@@ -194,7 +341,10 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     const helper = `snapimg-${nanoid(10)}`;
     const docId = (snapshot as any)._id.toString();
 
-    await this.setState(docId, 'building');
+    // A consolidation replaces a working image with an equivalent one that is
+    // merely shallower, so announcing 'building' would send every restore down
+    // the tarball path for no reason. The tag flips atomically at the commit.
+    if (!opts.keepUsable) await this.setState(docId, 'building');
 
     const started = Date.now();
     try {
@@ -214,13 +364,19 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
           `Discarding image for ${snapshotId}: built from version ` +
             `${builtVersion}, snapshot is now at ${currentVersion}`,
         );
-        await this.runtime.removeImage?.(ref).catch(() => undefined);
-        await this.setState(docId, 'none');
+        // `ref` is the live tag. When a commit-based save published it for the
+        // newer version, dropping it here would delete the only fresh copy —
+        // so only the pre-commit flow, where the tag still points at content
+        // nobody wants, may clear it.
+        if (!opts.keepUsable) {
+          await this.runtime.removeImage?.(ref).catch(() => undefined);
+          await this.setState(docId, 'none');
+        }
         return;
       }
 
       const info = await this.runtime.commitImage!(helper, ref, {
-        'devic-sandbox.snapshot': snapshotId,
+        labels: { 'devic-sandbox.snapshot': snapshotId },
       });
 
       await this.snapshotRepo.updateById(
@@ -232,6 +388,10 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
             imageSourceVersion: builtVersion,
             imageBuiltAt: new Date(),
             imageSizeBytes: info.uniqueSizeBytes,
+            // Built from the base image plus the tarball, so the stack is back
+            // to base+1 and the generation count starts over.
+            imageLayers: info.layers,
+            imageGeneration: 0,
           },
         },
         {},

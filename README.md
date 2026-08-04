@@ -527,6 +527,57 @@ A capture also rebuilds the image cache, if enabled — scheduled only once the
 tarball is renamed into place, so an image never publishes content that is not
 yet the artifact of record.
 
+#### Commit-based saves
+
+`snapshots.imageCache.commitLive` changes what a save *is*. Instead of walking
+the filesystem, tarring it, compressing it, copying it out and replaying it into
+a fresh container to rebuild the image, the save seals the sandbox's writable
+layer — which the runtime already holds — as the snapshot's image.
+
+Measured on a 1.2 GB delta: **~115 s against 14.9 s**. Of the old 115 s, 83.8 s
+was gzip and 29.5 s was rebuilding the image from the tarball just written; the
+diff that decides *what changed* was never more than two seconds of it.
+
+It also removes a window this design always had. The tarball path bumps
+`persistVersion` when the artifact lands and rebuilds the image afterwards, so
+for ~30 s `imageSourceVersion` trails, `isUsable()` says no, and every restore
+falls back to replaying a tarball. A commit publishes the image and the version
+it describes in one write.
+
+Three things to know:
+
+- **Layers stack once per session, not per save.** A second save inside one
+  session replaces the top layer rather than adding to it. From a `node:24` base
+  (8 layers) against the runtime's 70-layer ceiling that is ~61 sessions of
+  headroom, and `consolidateAtLayers` rebuilds base+1 long before it matters.
+  Consolidation rebuilds from the **original base image**, not with
+  `docker export | docker import`: that flattens to one layer but shares nothing
+  with the base, costing a full copy of it per snapshot.
+- **The tarball stays the artifact of record** — export, backups and moving a
+  snapshot between hosts all read it — but it is refreshed in the background,
+  off the save path. Until it catches up, `tarballVersion` is behind
+  `persistVersion` and that gap is the window in which the freshest copy exists
+  only as a container image. `consolidateAtTarballLag` bounds it, and the UI
+  shows it.
+- **Nothing here can lose a save.** A workdir snapshot, a runtime that cannot
+  commit, a layer stack out of headroom, or an outright failure all fall back to
+  the tarball path unchanged.
+
+On a terminal save (stop, TTL expiry) the regenerable caches are deleted before
+the layer is sealed — the tarball path filters them out of its file list and a
+commit has no list to filter — and the container is allowed to freeze for the
+commit, which under `docker commit` lasts essentially its whole duration
+(measured 5.011 s of a 5.043 s commit). A save that leaves the session running
+skips both.
+
+Under `sysbox-runc` this rests on a property worth stating plainly, because
+`docker diff` disagrees with it: a commit takes the **whole** writable layer.
+Verified on the production host with ten markers written across `/usr`, `/etc`,
+`/var`, `/root`, `/opt` and the workdir — `docker diff` reported three, the
+writable layer held all ten, and the committed image restored all ten. The
+sysbox mount points (`/var/lib/docker`, `/var/lib/containerd`, …) stay out of
+the commit, so nested-runtime state is never dragged in.
+
 ### Sandbox Profiles
 
 | Method | Endpoint | Description |

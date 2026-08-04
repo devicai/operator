@@ -112,7 +112,14 @@ runtime:
 #   defaultScope: 'full' captures the whole filesystem diff (installed packages,
 #                 /etc configs, /usr/local binaries); 'workdir' captures only the
 #                 workdir. Overridable per-request.
-#   compression:  'auto' (gzip) | 'zstd' (smaller, host-side) | 'gzip'.
+#   compression:  'auto' (gzip) | 'zstd' (smaller AND faster) | 'gzip'.
+#
+#                 zstd wins on both axes at once, so 'auto' meaning gzip is
+#                 history rather than a judgement. Measured over a 762 MB tar
+#                 with the `zstd` binary and -T0: 1.5 s for 214 MB, against
+#                 ~60 s for gzip -9's 262 MB. Without the binary on PATH the
+#                 module falls back to Node's zstd, which is single-threaded
+#                 but still ahead of gzip.
 #   cleanup:      'conservative' (default) | 'none' | 'aggressive'.
 #
 # Full snapshots work under BOTH runc and sysbox-runc. Under sysbox the change
@@ -147,6 +154,31 @@ snapshots:
     # Leave unset and the cache grows until the disk is full.
     maxTotalBytes: 21474836480  # 20 GiB
     buildTimeoutMs: 600000
+    # Save by sealing the sandbox's writable layer instead of walking the
+    # filesystem, compressing a tarball and replaying it into a fresh container.
+    #
+    # Measured on a 1.2 GB delta: ~115 s the old way against 14.9 s, and a
+    # 50 MB delta commits in 0.3 s. Of the old 115 s, 83.8 s was gzip alone and
+    # 29.5 s was rebuilding the image from the tarball just written.
+    #
+    # It also closes the window where `persistVersion` has advanced but the
+    # image has not — the one every restore falls back to the tarball for —
+    # because the commit and the version bump become a single write.
+    #
+    # Needs `enabled`. Applies to full-scope snapshots only. If a commit fails
+    # for any reason the save falls back to the tarball path, so the artifact of
+    # record is never at risk.
+    commitLive: false
+    # Layers stack once per SESSION (repeated saves within one session replace
+    # the top layer rather than adding to it). A node:24 base is 8 layers and
+    # the runtime stops starting images at 70, so this leaves room on both
+    # sides. Consolidation rebuilds base+1 from the original base image —
+    # deliberately not `docker export | import`, which flattens to one layer but
+    # shares nothing with the base and so costs a full copy of it per snapshot.
+    consolidateAtLayers: 40
+    # Also consolidate once the tarball is this many versions behind, which
+    # bounds how long the freshest copy of a snapshot lives only as an image.
+    consolidateAtTarballLag: 5
 
 # Size limits (MiB) for multipart uploads. Keep aligned with the reverse
 # proxy's client_max_body_size (see frontend/nginx.conf).

@@ -199,7 +199,45 @@ export interface SnapshotDto {
   startCommand?: string;
   createdAt: string;
   updatedAt: string;
+
+  // --- Saving ---------------------------------------------------------------
+  /** 'saving' while a capture is writing this snapshot; 'idle' otherwise. */
+  saveState?: 'idle' | 'saving';
+  /** Where the running save is. Absent when none is running. */
+  saveStage?: SaveStage;
+  /** When the current stage began, for the elapsed-time readout. */
+  saveStageSince?: string;
+  /** End-to-end duration of the last completed save. */
+  lastSaveDurationMs?: number;
+  /** How the last save was produced. */
+  lastSaveMethod?: 'commit' | 'tarball';
+  /** Captures so far. The tarball is current when it equals `tarballVersion`. */
+  persistVersion?: number;
+  /**
+   * Version the on-disk tarball holds. Behind `persistVersion` between a
+   * commit-based save and the background pass that refreshes it — that gap is
+   * the window in which the image is the only fresh copy.
+   */
+  tarballVersion?: number;
+  /** Layers in the derived image. Consolidation brings this back to base+1. */
+  imageLayers?: number;
+  /** Commits stacked since the last consolidation. */
+  imageGeneration?: number;
+  imageState?: 'none' | 'building' | 'ready' | 'failed';
 }
+
+/**
+ * Stages a save goes through. `committing` and `capturing` are alternatives —
+ * one per strategy — and the last two belong to the background pass that runs
+ * after a commit-based save, long after the caller was told it finished.
+ */
+export type SaveStage =
+  | 'claiming'
+  | 'cleaning'
+  | 'committing'
+  | 'capturing'
+  | 'consolidating'
+  | 'tarball';
 
 /** How a snapshot is served: its address, whether it wakes, and what it starts. */
 export interface UpdateSnapshotDto {

@@ -292,11 +292,19 @@ export interface RuntimeProvider {
    * takes the whole writable layer, including the internally-mounted /usr,
    * /etc and /var that `docker diff` cannot see. Callers must therefore commit
    * only containers whose content they fully intend to publish.
+   *
+   * Measured on the production host (sysbox-runc, Docker 27.5.1, overlay2) with
+   * ten markers written across /usr, /etc, /var, /root, /opt and the workdir:
+   * `docker diff` reported three of them, the writable layer held all ten, and
+   * the committed image restored all ten. The blindness is in the reporting,
+   * not in the storage. The sysbox mount points (/var/lib/docker,
+   * /var/lib/containerd, …) stay out of the commit, so nested-runtime state is
+   * never dragged along.
    */
   commitImage?(
     containerName: string,
     ref: string,
-    labels?: Record<string, string>,
+    options?: CommitImageOptions,
   ): Promise<CommittedImageInfo>;
 
   imageExists?(ref: string): Promise<boolean>;
@@ -306,6 +314,23 @@ export interface RuntimeProvider {
 
   /** Every cached snapshot image, for accounting and eviction. */
   listSnapshotImages?(repository: string): Promise<CachedImageInfo[]>;
+}
+
+export interface CommitImageOptions {
+  /** Written onto the image so eviction can enumerate without the database. */
+  labels?: Record<string, string>;
+  /**
+   * Freeze the container while its layer is archived. Defaults to true, which
+   * is also the runtime's own default.
+   *
+   * The freeze lasts essentially the whole commit — measured 5.011 s of a
+   * 5.043 s commit — so it is free for a container that is about to be torn
+   * down and very much not free for one serving traffic. Pass false there: the
+   * resulting layer is read while it is being written, which is no weaker than
+   * the tarball path, whose `tar` has never paused anything either (hence its
+   * tolerance for tar's "file changed as we read it").
+   */
+  pause?: boolean;
 }
 
 export interface CommittedImageInfo {

@@ -14,7 +14,16 @@ export function useSnapshots(params?: { sandboxId?: string }) {
   return useQuery({
     queryKey: [SNAPSHOTS_KEY, params],
     queryFn: () => snapshotsApi.getAll(params).then((res) => res.data),
-    refetchInterval: 15_000,
+    // Poll hard only while something is actually moving. A save advances
+    // through several stages, the fastest of which is under a second, so at
+    // the idle cadence the whole thing would come and go between two refetches
+    // and the stage display would never show anything.
+    refetchInterval: (query) => {
+      const rows = (query.state.data as any)?.data as
+        | Array<{ saveStage?: string }>
+        | undefined;
+      return rows?.some((s) => s.saveStage) ? 2_000 : 15_000;
+    },
   });
 }
 

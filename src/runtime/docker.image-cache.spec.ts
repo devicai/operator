@@ -91,7 +91,7 @@ describe('DockerRuntimeProvider — snapshot image cache', () => {
 
       const provider = await buildProvider();
       const out = await provider.commitImage('helper-1', 'devic-snapshot:abc', {
-        'devic-sandbox.snapshot': 'abc',
+        labels: { 'devic-sandbox.snapshot': 'abc' },
       });
 
       expect(commit).toHaveBeenCalledWith(

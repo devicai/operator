@@ -115,7 +115,13 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
         if (doc.snapshotId) {
           // Expiry saves too: a session that runs out of time keeps whatever
           // it did, same as one closed on purpose.
-          const outcome = await this.snapshotsService.persistToSnapshot(doc);
+          // The container is removed a few lines down, so the commit may freeze
+          // it and the regenerable caches may go.
+          const outcome = await this.snapshotsService.persistToSnapshot(
+            doc,
+            undefined,
+            { terminal: true },
+          );
           if (outcome !== 'saved') {
             this.logger.warn(
               `Expiry save for ${doc.sandboxId} into ${doc.snapshotId}: ${outcome}`,

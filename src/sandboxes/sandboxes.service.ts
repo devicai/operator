@@ -662,6 +662,7 @@ export class SandboxesService {
       const outcome = await this.snapshotsService.persistToSnapshot(
         doc,
         saveTarget,
+        { terminal: true },
       );
       if (outcome === 'conflict') {
         throw new ConflictException({
@@ -689,7 +690,9 @@ export class SandboxesService {
     targetSnapshotId?: string,
   ): Promise<void> {
     try {
-      await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId);
+      await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId, {
+        terminal: true,
+      });
     } catch (err) {
       this.logger.error(
         `Background save for ${doc.sandboxId} failed: ${(err as Error).message}`,

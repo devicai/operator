@@ -27,6 +27,7 @@ import {
 import type { ColumnsType } from 'antd/es/table';
 import { useSnapshots, useRestoreSnapshot, useDeleteSnapshot } from '../../hooks/useSnapshots';
 import ServingSettingsModal from './ServingSettingsModal';
+import SaveStatus from './SaveStatus';
 import { useUsage } from '../../hooks/useUsage';
 import { snapshotsApi } from '../../api/client';
 import type { SnapshotDto } from '../../api/types';
@@ -263,6 +264,12 @@ const SnapshotsPage: React.FC = () => {
           </Tooltip>
         );
       },
+    },
+    {
+      title: 'Save',
+      key: 'save',
+      width: 200,
+      render: (_: any, row) => <SaveStatus snapshot={row} />,
     },
     {
       title: '',

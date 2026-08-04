@@ -279,6 +279,35 @@ export interface SnapshotImageCacheConfig {
    * unbounded one would pin a throwaway container forever. Default: 600000.
    */
   buildTimeoutMs?: number;
+  /**
+   * Save by sealing the sandbox's writable layer (`docker commit`) instead of
+   * walking the filesystem, compressing a tarball and replaying it into a fresh
+   * container. Default: false.
+   *
+   * Measured on the dev host with a 1.2 GB delta: ~115 s the old way (83.8 s of
+   * which is gzip alone, plus 29.5 s rebuilding the image) against 14.9 s for
+   * the commit. It also collapses the window in which `persistVersion` has
+   * advanced but the image has not — the one restores fall back to the tarball
+   * for — because the commit and the version bump become one event.
+   *
+   * Requires `enabled`. Applies to `full`-scope snapshots only: a workdir
+   * snapshot is a small tar of one directory and has nothing to gain.
+   */
+  commitLive?: boolean;
+  /**
+   * Rebuild base+1 once an image reaches this many layers. Default: 40.
+   *
+   * Layers stack one per SESSION, not per save: repeated saves within a session
+   * replace the top layer. A `node:24` base is 8 layers and the runtime stops
+   * starting images at 70, so 40 leaves generous headroom on both sides.
+   */
+  consolidateAtLayers?: number;
+  /**
+   * Also consolidate once the tarball is this many versions behind the image.
+   * Default: 5. Bounds the window in which the freshest copy of a snapshot
+   * exists only as a container image.
+   */
+  consolidateAtTarballLag?: number;
 }
 
 export interface ResourceLimitsConfig {

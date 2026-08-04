@@ -22,6 +22,7 @@ import {
 } from './sysbox-diff.util';
 import {
   CachedImageInfo,
+  CommitImageOptions,
   CommittedImageInfo,
   ExecResult,
   ExecStream,
@@ -591,7 +592,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
   async commitImage(
     containerName: string,
     ref: string,
-    labels?: Record<string, string>,
+    options?: CommitImageOptions,
   ): Promise<CommittedImageInfo> {
     const { repo, tag } = splitImageRef(ref);
     const container = this.docker.getContainer(containerName);
@@ -599,9 +600,13 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     await container.commit({
       repo,
       tag,
+      // Only sent when the caller opts out: the daemon pauses by default, and
+      // spelling that out would flip older daemons that read `pause` as a
+      // string rather than leave their default alone.
+      ...(options?.pause === false ? { pause: false } : {}),
       // Carry the label set through to the image so eviction can enumerate
       // snapshot images without consulting the database.
-      changes: Object.entries(labels ?? {})
+      changes: Object.entries(options?.labels ?? {})
         .map(([k, v]) => `LABEL ${k}=${v}`)
         .join('\n') || undefined,
     } as any);

@@ -19,6 +19,30 @@ export enum SnapshotSaveState {
   SAVING = 'saving',
 }
 
+/**
+ * Where a save currently is. Written as it advances so the UI can show progress
+ * instead of an opaque "saving" that used to sit there for ~two minutes.
+ *
+ * These are the stages a save actually goes through, not a generic progress
+ * bar: `commit` and `capture` are alternatives (one per save strategy), and
+ * `consolidate`/`tarball` belong to the background pass that runs after a
+ * commit-based save, long after the caller was told the save finished.
+ */
+export enum SnapshotSaveStage {
+  /** Claiming the snapshot, before anything is read from the sandbox. */
+  CLAIMING = 'claiming',
+  /** Deleting regenerable caches before sealing (terminal saves only). */
+  CLEANING = 'cleaning',
+  /** Sealing the sandbox's writable layer as an image. */
+  COMMITTING = 'committing',
+  /** Walking the filesystem and writing the tarball (the pre-commit path). */
+  CAPTURING = 'capturing',
+  /** Background: rebuilding base+1 to give back layer headroom. */
+  CONSOLIDATING = 'consolidating',
+  /** Background: refreshing the portable tarball from the image. */
+  TARBALL = 'tarball',
+}
+
 @Schema({ timestamps: true, collection: 'snapshots' })
 export class Snapshot {
   @ApiProperty()
@@ -254,6 +278,72 @@ export class Snapshot {
   })
   @Prop()
   savingSandboxId?: string;
+
+  // ---------------------------------------------------------------------------
+  // Generations. A commit-based save seals the sandbox's writable layer instead
+  // of replaying a tarball into a fresh container, which is ~7x faster but
+  // stacks one layer per SESSION (repeated saves within one session replace the
+  // top layer rather than adding to it). These fields let the consolidation
+  // pass know when to rebuild base+1, and let the UI show where a save is.
+  // ---------------------------------------------------------------------------
+
+  @ApiProperty({
+    enum: SnapshotSaveStage,
+    required: false,
+    description:
+      'Stage the running save is in. Absent when no save is running. Advances ' +
+      'as the save progresses so the UI can show more than "saving".',
+  })
+  @Prop({ enum: SnapshotSaveStage })
+  saveStage?: SnapshotSaveStage;
+
+  @ApiProperty({
+    required: false,
+    description: 'When the current stage began, for elapsed-time display.',
+  })
+  @Prop()
+  saveStageSince?: Date;
+
+  @ApiProperty({
+    required: false,
+    description: 'How long the last completed save took, end to end, in ms.',
+  })
+  @Prop()
+  lastSaveDurationMs?: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      "How the last save was produced: 'commit' (sealed the live layer) or " +
+      "'tarball' (walked the filesystem). Absent before the first save.",
+  })
+  @Prop()
+  lastSaveMethod?: string;
+
+  @ApiProperty({
+    required: false,
+    description: 'Layers in the current image. Consolidation targets base+1.',
+  })
+  @Prop()
+  imageLayers?: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Commits stacked since the last consolidation. Zero right after one.',
+  })
+  @Prop({ default: 0 })
+  imageGeneration?: number;
+
+  @ApiProperty({
+    required: false,
+    description:
+      '`persistVersion` the on-disk tarball holds. Lags behind `persistVersion` ' +
+      'between a commit-based save and the background pass that refreshes it; ' +
+      'the gap is the window in which the image is the only fresh copy.',
+  })
+  @Prop()
+  tarballVersion?: number;
 }
 
 export type SnapshotDocument = Snapshot & Document;

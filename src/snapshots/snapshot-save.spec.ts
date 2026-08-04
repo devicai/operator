@@ -44,7 +44,16 @@ function makeService(overrides: { snapshot?: any; claim?: any } = {}) {
   // The image cache is rebuilt from the tarball after every capture. It must
   // never be handed a snapshot before the rename commits, or the image would
   // publish the previous contents under the new persistVersion.
-  const imageService = { scheduleBuild: jest.fn(), isUsable: jest.fn() };
+  // `canCommitLive: false` keeps these cases on the tarball path, which is what
+  // they are about. The commit path has its own spec.
+  const imageService = {
+    scheduleBuild: jest.fn(),
+    isUsable: jest.fn(),
+    canCommitLive: jest.fn().mockReturnValue(false),
+    isOutOfLayerHeadroom: jest.fn().mockReturnValue(false),
+    scheduleConsolidation: jest.fn(),
+    refFor: jest.fn((id: string) => `devic-snapshot:${id}`),
+  };
 
   const service = Object.create(SnapshotsService.prototype) as SnapshotsService;
   Object.assign(service as any, {
