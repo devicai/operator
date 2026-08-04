@@ -128,6 +128,18 @@ type Codec = 'zstd' | 'gzip';
  */
 export type SnapshotSaveOutcome = 'saved' | 'skipped' | 'conflict' | 'failed';
 
+/**
+ * Stages that belong to the save the caller is waiting on, as opposed to the
+ * background pass it schedules on its way out. Only these may be cleared when
+ * the save releases its claim.
+ */
+const FOREGROUND_SAVE_STAGES = [
+  SnapshotSaveStage.CLAIMING,
+  SnapshotSaveStage.CLEANING,
+  SnapshotSaveStage.COMMITTING,
+  SnapshotSaveStage.CAPTURING,
+];
+
 export interface PersistOptions {
   /**
    * The sandbox is being torn down and will not be used again.
@@ -1630,23 +1642,32 @@ export class SnapshotsService implements OnModuleInit {
     } catch {}
   }
 
-  /** Release the save claim on both documents. Never throws. */
+  /**
+   * Release the save claim on both documents. Never throws.
+   *
+   * The stage is cleared with a FILTER, not unconditionally. A commit-based
+   * save schedules the background pass before returning, so by the time this
+   * runs the snapshot may already be reporting `consolidating` or `tarball` —
+   * work that outlives the save by minutes. Wiping it here left the field empty
+   * for the whole refresh, which is precisely the long stage worth showing.
+   */
   private async releaseSnapshotSave(
     snapshotDoc: SnapshotDocument,
     sandboxDoc: SandboxDocument,
   ): Promise<void> {
     try {
+      const id = (snapshotDoc as any)._id.toString();
       await this.snapshotRepo.updateById(
-        (snapshotDoc as any)._id.toString(),
+        id,
         {
           $set: { saveState: SnapshotSaveState.IDLE },
-          $unset: {
-            savingSince: '',
-            savingSandboxId: '',
-            saveStage: '',
-            saveStageSince: '',
-          },
+          $unset: { savingSince: '', savingSandboxId: '' },
         },
+        {},
+      );
+      await this.snapshotRepo.updateOne(
+        { _id: id, saveStage: { $in: FOREGROUND_SAVE_STAGES } } as any,
+        { $unset: { saveStage: '', saveStageSince: '' } },
         {},
       );
     } catch (err) {

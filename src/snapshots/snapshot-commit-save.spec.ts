@@ -208,6 +208,44 @@ describe('persistByCommit', () => {
     expect(await run()).toBeNull();
   });
 
+  // Releasing the claim used to `$unset` the stage unconditionally. A
+  // commit-based save schedules the background pass BEFORE it returns, so by
+  // the time the release ran the snapshot was already reporting `tarball` —
+  // and that wipe left the field empty for the whole refresh, which on a 1 GB
+  // snapshot is two and a half minutes of the UI showing nothing while the
+  // durable copy is visibly behind.
+  it('does not clear a background stage when the save releases its claim', async () => {
+    const filtered: any[] = [];
+    const service = Object.create(SnapshotsService.prototype) as SnapshotsService;
+    Object.assign(service as any, {
+      snapshotRepo: {
+        updateById: jest.fn().mockResolvedValue({}),
+        updateOne: jest.fn(async (filter: any) => {
+          filtered.push(filter);
+          return {};
+        }),
+      },
+      sandboxRepo: { updateById: jest.fn().mockResolvedValue(undefined) },
+      logger: { warn: jest.fn() },
+    });
+
+    await (service as any).releaseSnapshotSave(
+      { _id: { toString: () => 'oid' }, snapshotId: 'snap1' },
+      { _id: { toString: () => 'sbx' } },
+    );
+
+    expect(filtered).toHaveLength(1);
+    const stages = filtered[0].saveStage.$in;
+    expect(stages).toEqual(
+      expect.arrayContaining([
+        SnapshotSaveStage.COMMITTING,
+        SnapshotSaveStage.CAPTURING,
+      ]),
+    );
+    expect(stages).not.toContain(SnapshotSaveStage.TARBALL);
+    expect(stages).not.toContain(SnapshotSaveStage.CONSOLIDATING);
+  });
+
   it('reports the stages it goes through', async () => {
     const { run, updates } = makeService();
 
