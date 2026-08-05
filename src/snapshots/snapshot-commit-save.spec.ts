@@ -61,9 +61,14 @@ function makeService(over: {
 
   const sandbox = { exec: jest.fn().mockResolvedValue({ code: 0, stderr: '' }) };
 
+  // A successful save moves the sandbox's base to the version it just wrote,
+  // or its own next save would conflict with itself.
+  const sandboxRepo = { updateById: jest.fn().mockResolvedValue(undefined) };
+
   const service = Object.create(SnapshotsService.prototype) as SnapshotsService;
   Object.assign(service as any, {
     snapshotRepo,
+    sandboxRepo,
     imageService,
     runtime: { commitImage: commit },
     config: { snapshots: { cleanup: over.cleanupPreset ?? 'conservative' } },
@@ -81,7 +86,7 @@ function makeService(over: {
       opts,
     );
 
-  return { run, updates, commit, imageService, sandbox, snapshotRepo };
+  return { run, updates, commit, imageService, sandbox, snapshotRepo, sandboxRepo };
 }
 
 const setOf = (updates: any[], key: string) =>

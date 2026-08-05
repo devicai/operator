@@ -527,6 +527,37 @@ A capture also rebuilds the image cache, if enabled — scheduled only once the
 tarball is renamed into place, so an image never publishes content that is not
 yet the artifact of record.
 
+#### One writer per snapshot
+
+A **linked** restore (the default) takes ownership of the snapshot: the sandbox
+writes its whole filesystem back on stop or expiry. Two of those on one snapshot
+is a lost update by construction — neither save merges with the other, so the
+later one erases whatever the earlier wrote, and nothing says so.
+
+It is easy to end up with two without meaning to, because there are two
+independent creators that cannot see each other: a visit to the public URL wakes
+the snapshot from inside the ingress, while a caller starting a session restores
+through the API. Observed on dev: two sandboxes of one snapshot forty-eight
+seconds apart, both committing "15 layers" nine minutes apart, the second
+discarding twenty minutes of the first's work.
+
+So `POST /snapshots/:id/restore` with `linked` (the default) returns the sandbox
+that already owns the snapshot rather than starting a second one, and sets
+**`attachedToExisting: true`** in the response. The TTL you asked for is applied
+to it if it is longer than what was left; it is never shortened, because the
+other holder is still using it. Anything that cannot be changed on a running
+container (cpus, memory) is logged as ignored rather than quietly dropped.
+
+Restore with **`linked: false`** to fork instead. A fork never writes back, so
+any number can run at once — that is the mode for "give me a scratch copy of
+this".
+
+Behind the rule, every linked sandbox records the `persistVersion` it descends
+from. A save whose base the snapshot has since moved past is refused and written
+to `metadata.lastSaveError` instead of overwriting the versions in between. That
+should be unreachable now; it exists because the failure it guards against is
+silent, and silent data loss is worth two defences.
+
 #### Commit-based saves
 
 `snapshots.imageCache.commitLive` changes what a save *is*. Instead of walking

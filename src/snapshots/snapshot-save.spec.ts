@@ -31,7 +31,12 @@ function makeService(overrides: { snapshot?: any; claim?: any } = {}) {
     updateById: jest.fn().mockResolvedValue(snapshotDoc),
     updateMany: jest.fn().mockResolvedValue(0),
   };
-  const sandboxRepo = { updateById: jest.fn().mockResolvedValue(undefined) };
+  const sandboxRepo = {
+    updateById: jest.fn().mockResolvedValue(undefined),
+    // A linked restore first checks whether the snapshot is already running as
+    // something; these cases have nothing running.
+    findOwningSandbox: jest.fn().mockResolvedValue(null),
+  };
   const registry = { get: jest.fn().mockResolvedValue(null) };
   const sandbox = { exec: jest.fn(), copyToHost: jest.fn(), diff: jest.fn() };
   const runtime = {

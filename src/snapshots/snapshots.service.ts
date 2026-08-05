@@ -140,6 +140,17 @@ const FOREGROUND_SAVE_STAGES = [
   SnapshotSaveStage.CAPTURING,
 ];
 
+/**
+ * What a restore produced. `attached` says the caller was handed the sandbox
+ * that already owns this snapshot rather than a new one — the snapshot was
+ * already running, and a second linked sandbox would have meant one of the two
+ * silently overwriting the other's work on the way out.
+ */
+export interface RestoreResult {
+  sandbox: SandboxDocument;
+  attached: boolean;
+}
+
 export interface PersistOptions {
   /**
    * The sandbox is being torn down and will not be used again.
@@ -573,11 +584,62 @@ export class SnapshotsService implements OnModuleInit {
     snapshotId: string,
     dto: RestoreSnapshotDto,
     scope: ExtensionScope,
-  ): Promise<SandboxDocument> {
+  ): Promise<RestoreResult> {
     return this.restoreInternal(snapshotId, dto, scope, {
       skipMemoryCheck: false,
       hotReserved: false,
     });
+  }
+
+  /**
+   * Hand back the sandbox that already owns this snapshot, instead of minting a
+   * second writer for it.
+   *
+   * The TTL is pushed out to whatever the new caller asked for when that is
+   * longer than what is left — an assistant starting a session on an instance
+   * with four minutes to live should not inherit those four minutes. It is
+   * never shortened: the other holder is still using it.
+   *
+   * The rest of the request (cpus, memory, ports) cannot be honoured on a
+   * container that is already running, so a mismatch is logged rather than
+   * quietly pretended away.
+   */
+  private async attachToOwner(
+    owner: SandboxDocument,
+    dto: RestoreSnapshotDto,
+  ): Promise<SandboxDocument> {
+    const requested = dto.ttlSeconds ?? this.config.defaults.defaultTtlSeconds;
+    const wantedExpiry = new Date(Date.now() + requested * 1000);
+    const currentExpiry = owner.expiresAt ? new Date(owner.expiresAt) : null;
+
+    let doc = owner;
+    if (!currentExpiry || wantedExpiry > currentExpiry) {
+      doc =
+        (await this.sandboxRepo
+          .updateById(
+            (owner as any)._id.toString(),
+            { $set: { expiresAt: wantedExpiry, ttlSeconds: requested } },
+            {},
+          )
+          .catch(() => null)) ?? owner;
+    }
+
+    const mismatched: string[] = [];
+    if (dto.cpus !== undefined && dto.cpus !== owner.cpus) {
+      mismatched.push(`cpus ${dto.cpus} != ${owner.cpus}`);
+    }
+    if (dto.memoryMib !== undefined && dto.memoryMib !== owner.memoryMib) {
+      mismatched.push(`memoryMib ${dto.memoryMib} != ${owner.memoryMib}`);
+    }
+
+    this.logger.log(
+      `Snapshot ${owner.snapshotId} is already running as sandbox ` +
+        `${owner.sandboxId}; attaching instead of starting a second one` +
+        (mismatched.length
+          ? ` (requested ${mismatched.join(', ')} ignored — it is already up)`
+          : ''),
+    );
+    return doc;
   }
 
   /**
@@ -592,7 +654,7 @@ export class SnapshotsService implements OnModuleInit {
     snapshotId: string,
     overrides: { cpus?: number; memoryMib?: number },
   ): Promise<SandboxDocument> {
-    return this.restoreInternal(
+    const { sandbox } = await this.restoreInternal(
       snapshotId,
       {
         cpus: overrides.cpus,
@@ -606,6 +668,7 @@ export class SnapshotsService implements OnModuleInit {
         hotReserved: true,
       },
     );
+    return sandbox;
   }
 
   private async restoreInternal(
@@ -613,7 +676,7 @@ export class SnapshotsService implements OnModuleInit {
     dto: RestoreSnapshotDto,
     scope: ExtensionScope,
     options: { skipMemoryCheck: boolean; hotReserved: boolean },
-  ): Promise<SandboxDocument> {
+  ): Promise<RestoreResult> {
     const snapshot = await this.findById(snapshotId, scope);
 
     // Its very first capture is still running: same situation as a re-save,
@@ -652,6 +715,32 @@ export class SnapshotsService implements OnModuleInit {
         savingSince: snapshot.savingSince,
         savingSandboxId: snapshot.savingSandboxId,
       });
+    }
+
+    // A linked restore takes ownership of the snapshot: it writes its entire
+    // filesystem back on stop or expiry. A second owner is a lost update by
+    // construction — each saves its complete view, so the later one discards
+    // whatever the earlier wrote, and nobody is told. The two creators do not
+    // even know about each other: a visit waking the public URL restores inside
+    // this service, while an assistant starting a session restores through the
+    // API.
+    //
+    // So the second caller is handed the sandbox that already exists rather
+    // than a second one. That is what the wake-up path has always done; doing
+    // it here makes both paths agree, and it is what the caller wanted anyway —
+    // to work on the instance this snapshot is currently running as.
+    //
+    // Forks are untouched: `linked: false` never writes back, so any number of
+    // them can coexist.
+    const wantsLink = dto.linked !== false && !options.hotReserved;
+    if (wantsLink) {
+      const owner = await this.sandboxRepo
+        .findOwningSandbox(snapshot.snapshotId)
+        .catch(() => null);
+      if (owner) {
+        const attached = await this.attachToOwner(owner, dto);
+        return { sandbox: attached, attached: true };
+      }
     }
 
     const onDiskPath = this.resolveSnapshotPath(snapshot.snapshotPath);
@@ -725,6 +814,12 @@ export class SnapshotsService implements OnModuleInit {
           restoredFrom: snapshot.snapshotId,
           restoredAt: new Date().toISOString(),
           linked: isLinked,
+          // The version this sandbox's filesystem descends from. A save writes
+          // the WHOLE filesystem back, so one made from a base the snapshot has
+          // since moved past would erase everything written in between. Single
+          // ownership should make that unreachable; this is what catches the
+          // paths nobody thought of.
+          baseVersion: snapshot.persistVersion ?? 0,
           ...(options.hotReserved
             ? { hotPool: true, hotPoolSnapshotId: snapshot.snapshotId }
             : {}),
@@ -813,8 +908,11 @@ export class SnapshotsService implements OnModuleInit {
       // Hot-reserve sandboxes stay unpublished until they are claimed — the
       // claim path publishes them, and idle pool entries must not hold
       // public subdomains.
-      if (options.hotReserved) return updated!;
-      return await this.publishIfEnabled(updated!, scope);
+      if (options.hotReserved) return { sandbox: updated!, attached: false };
+      return {
+        sandbox: await this.publishIfEnabled(updated!, scope),
+        attached: false,
+      };
     } catch (err) {
       await this.sandboxRepo.updateById(
         (sandboxDoc as any)._id.toString(),
@@ -1159,6 +1257,43 @@ export class SnapshotsService implements OnModuleInit {
       return 'skipped';
     }
 
+    // A save writes the sandbox's WHOLE filesystem back, so one made from a
+    // base the snapshot has since moved past does not merge with what came
+    // after — it erases it. Refusing costs this session's work; proceeding
+    // costs somebody else's, already saved, with nobody told either way.
+    //
+    // `baseVersion` is only compared when the sandbox has one: a sandbox that
+    // predates the field, or one saving into a snapshot it was not restored
+    // from (`targetSnapshotId`), has nothing meaningful to compare.
+    const baseVersion = (sandboxDoc.metadata as any)?.baseVersion;
+    const currentVersion = snapshotDoc.persistVersion ?? 0;
+    if (
+      typeof baseVersion === 'number' &&
+      !targetSnapshotId &&
+      currentVersion > baseVersion
+    ) {
+      const message =
+        `Refusing to save sandbox ${sandboxDoc.sandboxId} into snapshot ` +
+        `${snapshotId}: it started from version ${baseVersion} and the snapshot ` +
+        `is now at ${currentVersion}. Saving would overwrite the ` +
+        `${currentVersion - baseVersion} version(s) written since.`;
+      this.logger.error(message);
+      await this.snapshotRepo
+        .updateById(
+          (snapshotDoc as any)._id.toString(),
+          {
+            $set: {
+              'metadata.lastSaveError': message,
+              'metadata.lastSaveErrorAt': new Date().toISOString(),
+              'metadata.lastSaveErrorFrom': sandboxDoc.sandboxId,
+            },
+          },
+          {},
+        )
+        .catch(() => undefined);
+      return 'conflict';
+    }
+
     // Claim the snapshot before touching anything. Two sessions saving into the
     // same snapshot would interleave their tars over one file; the loser is
     // told so rather than silently corrupting the winner's artifact.
@@ -1319,6 +1454,11 @@ export class SnapshotsService implements OnModuleInit {
         `Snapshot ${snapshotDoc.snapshotId} updated from sandbox ${sandboxDoc.sandboxId} (${(sizeBytes / 1024).toFixed(1)} KB)`,
       );
 
+      await this.advanceBaseVersion(
+        sandboxDoc,
+        (snapshotDoc.persistVersion ?? 0) + 1,
+      );
+
       // Only now, with the tarball renamed into place, can a rebuild publish an
       // image: it replays the artifact of record, so scheduling it any earlier
       // would bake the PREVIOUS capture under the new persistVersion.
@@ -1467,6 +1607,8 @@ export class SnapshotsService implements OnModuleInit {
           `${(info.uniqueSizeBytes / 1048576).toFixed(1)} MB unique, ` +
           `${Date.now() - startedAt} ms)`,
       );
+
+      await this.advanceBaseVersion(sandboxDoc, nextVersion);
 
       // The tarball is now behind. It stays the artifact of record — export,
       // backups and migration all read it — so the background pass refreshes
@@ -1625,6 +1767,29 @@ export class SnapshotsService implements OnModuleInit {
         {},
       )
       .catch(() => undefined);
+  }
+
+  /**
+   * Move the sandbox's base forward to the version it just wrote.
+   *
+   * Without this every save after the first would conflict with itself: the
+   * sandbox's base would still name the version it was restored from while the
+   * snapshot sits at the one this very sandbox just published.
+   */
+  private async advanceBaseVersion(
+    sandboxDoc: SandboxDocument,
+    version: number,
+  ): Promise<void> {
+    await this.sandboxRepo
+      .updateById(
+        (sandboxDoc as any)._id.toString(),
+        { $set: { 'metadata.baseVersion': version } },
+        {},
+      )
+      .catch(() => undefined);
+    if (sandboxDoc.metadata) {
+      (sandboxDoc.metadata as any).baseVersion = version;
+    }
   }
 
   /** Flag the sandbox as being captured, so stop/destroy refuse to kill it. */
@@ -1921,7 +2086,10 @@ export class SnapshotsService implements OnModuleInit {
       return { sandboxId: existing.sandboxId };
     }
 
-    const sandbox = await this.restore(snapshotId, { ttlSeconds }, {});
+    // `restore` now enforces single ownership itself, so this is belt and
+    // braces: if something came up between the lookup above and here, it hands
+    // back that one rather than adding a second writer.
+    const { sandbox } = await this.restore(snapshotId, { ttlSeconds }, {});
     return { sandboxId: sandbox.sandboxId };
   }
 

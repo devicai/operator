@@ -17,7 +17,12 @@ function makeService(runningSandbox: any = null) {
     findRunningFromSnapshot: jest.fn(async () => runningSandbox),
   };
   const publishIfEnabled = jest.fn(async (s: any) => s);
-  const restore = jest.fn(async () => ({ sandboxId: 'freshBox' }));
+  // `restore` now reports whether it created a sandbox or handed back the one
+  // that already owns the snapshot, so it returns the pair rather than the doc.
+  const restore = jest.fn(async () => ({
+    sandbox: { sandboxId: 'freshBox' },
+    attached: false,
+  }));
 
   const service = Object.create(SnapshotsService.prototype) as SnapshotsService;
   Object.assign(service as any, {

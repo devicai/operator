@@ -108,13 +108,30 @@ export class SnapshotsController {
   }
 
   @Post(':id/restore')
-  @ApiOperation({ summary: 'Restore sandbox from snapshot' })
-  restore(
+  @ApiOperation({
+    summary: 'Restore sandbox from snapshot',
+    description:
+      'A linked restore (the default) takes ownership of the snapshot: the ' +
+      'sandbox writes its whole filesystem back on stop or expiry. Only one ' +
+      'sandbox may own a snapshot at a time, because a second would overwrite ' +
+      "the first's work on the way out rather than merge with it. When the " +
+      'snapshot is already running, the live sandbox is returned instead of a ' +
+      'second one and `attachedToExisting` is true — check it before assuming ' +
+      'a fresh filesystem, and note the TTL you asked for was applied to it. ' +
+      'Restore with `linked: false` to fork instead: forks never write back, ' +
+      'so any number can run at once.',
+  })
+  async restore(
     @Param('id') id: string,
     @Body() dto: RestoreSnapshotDto,
     @Req() req: any,
   ) {
-    return this.service.restore(id, dto, req.extensionScope ?? {});
+    const { sandbox, attached } = await this.service.restore(
+      id,
+      dto,
+      req.extensionScope ?? {},
+    );
+    return { ...(sandbox as any).toJSON(), attachedToExisting: attached };
   }
 
   @Patch(':id')

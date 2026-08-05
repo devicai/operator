@@ -132,6 +132,37 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
    * already up. Two sandboxes of one snapshot would compete for the address and,
    * when linked, race to write themselves back into it.
    */
+  /**
+   * The sandbox that currently OWNS a snapshot, if any.
+   *
+   * Ownership means linked: it writes its whole filesystem back on stop or
+   * expiry. Two of those on one snapshot is a lost update waiting to happen —
+   * each saves its complete view, so the later one silently discards whatever
+   * the earlier wrote, and neither ever learns. Observed on dev: two sandboxes
+   * of one snapshot 48 seconds apart, one from a visit waking the URL and one
+   * from an assistant starting a session, both committing "15 layers" nine
+   * minutes apart.
+   *
+   * Deliberately narrower than `findRunningFromSnapshot`, which also matches
+   * `metadata.restoredFrom` and so includes forks. A fork never writes back,
+   * so any number of them can coexist.
+   *
+   * CREATING counts: the document exists before the container does, and two
+   * restores racing must not both get past this.
+   */
+  async findOwningSandbox(
+    snapshotId: string,
+  ): Promise<SandboxDocument | null> {
+    return this.model
+      .findOne({
+        snapshotId,
+        status: { $in: [SandboxStatus.RUNNING, SandboxStatus.CREATING] },
+        hotReserved: { $ne: true },
+      })
+      .sort({ createdAt: -1 })
+      .exec() as Promise<SandboxDocument | null>;
+  }
+
   async findRunningFromSnapshot(
     snapshotId: string,
   ): Promise<SandboxDocument | null> {
