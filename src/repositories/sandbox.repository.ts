@@ -124,6 +124,72 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
   }
 
   /**
+   * The most recent running sandbox restored from a snapshot, whether it is
+   * linked to it or was forked from it.
+   *
+   * A snapshot's public URL is answered by whichever sandbox is serving it, so
+   * before restoring another one there has to be a way to ask whether one is
+   * already up. Two sandboxes of one snapshot would compete for the address and,
+   * when linked, race to write themselves back into it.
+   */
+  /**
+   * The sandbox that currently OWNS a snapshot, if any.
+   *
+   * Ownership means linked: it writes its whole filesystem back on stop or
+   * expiry. Two of those on one snapshot is a lost update waiting to happen —
+   * each saves its complete view, so the later one silently discards whatever
+   * the earlier wrote, and neither ever learns. Observed on dev: two sandboxes
+   * of one snapshot 48 seconds apart, one from a visit waking the URL and one
+   * from an assistant starting a session, both committing "15 layers" nine
+   * minutes apart.
+   *
+   * Deliberately narrower than `findRunningFromSnapshot`, which also matches
+   * `metadata.restoredFrom` and so includes forks. A fork never writes back,
+   * so any number of them can coexist.
+   *
+   * CREATING counts: the document exists before the container does, and two
+   * restores racing must not both get past this.
+   */
+  async findOwningSandbox(
+    snapshotId: string,
+  ): Promise<SandboxDocument | null> {
+    return this.model
+      .findOne({
+        snapshotId,
+        status: { $in: [SandboxStatus.RUNNING, SandboxStatus.CREATING] },
+        hotReserved: { $ne: true },
+      })
+      .sort({ createdAt: -1 })
+      .exec() as Promise<SandboxDocument | null>;
+  }
+
+  async findRunningFromSnapshot(
+    snapshotId: string,
+  ): Promise<SandboxDocument | null> {
+    return this.model
+      .findOne({
+        status: SandboxStatus.RUNNING,
+        $or: [{ snapshotId }, { 'metadata.restoredFrom': snapshotId }],
+      })
+      .sort({ createdAt: -1 })
+      .exec() as Promise<SandboxDocument | null>;
+  }
+
+  /**
+   * Running sandboxes that hold a public subdomain. Used on startup to make
+   * them reachable again: the network attachment that carries traffic to them
+   * belongs to this container and does not survive its restart.
+   */
+  async findPublished(): Promise<SandboxDocument[]> {
+    return this.model
+      .find({
+        status: SandboxStatus.RUNNING,
+        subdomain: { $exists: true, $ne: null },
+      })
+      .exec() as Promise<SandboxDocument[]>;
+  }
+
+  /**
    * Container names of every sandbox that still has a reason to exist in the
    * runtime. Terminal states are excluded on purpose: an expired, stopped or
    * failed sandbox cannot be resumed (there is no start endpoint), so its
@@ -133,14 +199,22 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
     const rows = await this.model
       .find(
         {
-          status: {
-            $in: [
-              SandboxStatus.PENDING,
-              SandboxStatus.CREATING,
-              SandboxStatus.RUNNING,
-              SandboxStatus.STOPPING,
-            ],
-          },
+          $or: [
+            {
+              status: {
+                $in: [
+                  SandboxStatus.PENDING,
+                  SandboxStatus.CREATING,
+                  SandboxStatus.RUNNING,
+                  SandboxStatus.STOPPING,
+                ],
+              },
+            },
+            // A sandbox being captured must survive the sweep whatever its
+            // status says: the TTL reaper marks it `expired` BEFORE persisting,
+            // and removing the container mid-tar kills the save.
+            { savingSnapshotId: { $exists: true, $ne: null } },
+          ],
         },
         { name: 1 },
       )

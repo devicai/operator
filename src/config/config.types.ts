@@ -241,6 +241,73 @@ export interface SnapshotsConfig {
    * to exclude from full snapshots, merged on top of the `cleanup` preset.
    */
   excludePaths?: string[];
+  /** Derived per-snapshot images that make restores O(1) instead of O(size). */
+  imageCache?: SnapshotImageCacheConfig;
+}
+
+/**
+ * Pre-materializes each snapshot as a container image so restoring is just
+ * "create a container" — measured ~2s flat, against 15-65s for replaying the
+ * tarball, which scales with snapshot size.
+ *
+ * The image is strictly a cache. The tarball remains the artifact of record:
+ * it is what export/import read, what backups copy, and what the image is
+ * rebuilt from. Losing every image costs speed and nothing else.
+ *
+ * Disabled by default — it trades disk for start time, and that is the
+ * operator's call. An image holds its content UNCOMPRESSED (that is why it
+ * starts instantly), so it occupies noticeably more than the tarball it came
+ * from: measured 532 MB against a 200 MB tar.gz.
+ */
+export interface SnapshotImageCacheConfig {
+  /** Master switch. Default: false. */
+  enabled?: boolean;
+  /**
+   * Repository name for derived images; the snapshot id becomes the tag.
+   * Default: 'devic-snapshot'.
+   */
+  repository?: string;
+  /**
+   * Cap on the total unique bytes held by cached images. When exceeded, the
+   * least recently restored images are dropped until it fits. 0/undefined
+   * means no cap — which on a shared host means the cache grows until the
+   * disk is full, so set it.
+   */
+  maxTotalBytes?: number;
+  /**
+   * Give up on a build that exceeds this. A build is background work, but an
+   * unbounded one would pin a throwaway container forever. Default: 600000.
+   */
+  buildTimeoutMs?: number;
+  /**
+   * Save by sealing the sandbox's writable layer (`docker commit`) instead of
+   * walking the filesystem, compressing a tarball and replaying it into a fresh
+   * container. Default: false.
+   *
+   * Measured on the dev host with a 1.2 GB delta: ~115 s the old way (83.8 s of
+   * which is gzip alone, plus 29.5 s rebuilding the image) against 14.9 s for
+   * the commit. It also collapses the window in which `persistVersion` has
+   * advanced but the image has not — the one restores fall back to the tarball
+   * for — because the commit and the version bump become one event.
+   *
+   * Requires `enabled`. Applies to `full`-scope snapshots only: a workdir
+   * snapshot is a small tar of one directory and has nothing to gain.
+   */
+  commitLive?: boolean;
+  /**
+   * Rebuild base+1 once an image reaches this many layers. Default: 40.
+   *
+   * Layers stack one per SESSION, not per save: repeated saves within a session
+   * replace the top layer. A `node:24` base is 8 layers and the runtime stops
+   * starting images at 70, so 40 leaves generous headroom on both sides.
+   */
+  consolidateAtLayers?: number;
+  /**
+   * Also consolidate once the tarball is this many versions behind the image.
+   * Default: 5. Bounds the window in which the freshest copy of a snapshot
+   * exists only as a container image.
+   */
+  consolidateAtTarballLag?: number;
 }
 
 export interface ResourceLimitsConfig {
@@ -380,4 +447,38 @@ export interface IngressConfig {
    * `expiresAt`, capped at 24h.
    */
   registryMaxTtlSeconds?: number;
+
+  /**
+   * Restore a snapshot automatically when its public URL is visited and no
+   * sandbox is serving it, showing a waiting page until the service answers.
+   *
+   * Master switch for the behaviour; individual snapshots opt out with their
+   * own `autoRestart: false`. Default true — a URL that silently 404s once the
+   * sandbox stops is the behaviour this replaces.
+   *
+   * Note this makes an unauthenticated request able to allocate a sandbox
+   * (memory, disk, a container). It is bounded by `resourceLimits` like any
+   * other restore, and by `autoRestartTtlSeconds` below, but on a host whose
+   * subdomains are guessable it is a lever worth knowing about.
+   */
+  autoRestart?: boolean;
+  /**
+   * TTL (s) granted to a sandbox restored by a visit. Deliberately shorter than
+   * `defaults.defaultTtlSeconds`: nobody asked for this sandbox explicitly, so
+   * it should not outlive the interest that woke it. Default 1800.
+   */
+  autoRestartTtlSeconds?: number;
+  /**
+   * How long (s) a wake-up may hold its claim before another visitor may retry.
+   * Must exceed the slowest restore — a tarball replay of a large snapshot runs
+   * to a minute or more, while an image-backed one is a couple of seconds.
+   * Default 300.
+   */
+  autoRestartClaimSeconds?: number;
+  /**
+   * How long (s) the waiting page keeps polling before it gives up and shows an
+   * error. A restore that finishes later still works; this only bounds the wait
+   * the visitor is asked to sit through. Default 120.
+   */
+  autoRestartTimeoutSeconds?: number;
 }

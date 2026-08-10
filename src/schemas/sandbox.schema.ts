@@ -129,6 +129,17 @@ export class Sandbox {
 
   @ApiProperty({
     description:
+      'Snapshot this sandbox is currently being captured into. Set for the ' +
+      'whole duration of a save so nothing tears the container down mid-tar: ' +
+      'stopping or removing a sandbox with a capture in flight kills the tar ' +
+      'with SIGKILL and loses the save.',
+    required: false,
+  })
+  @Prop()
+  savingSnapshotId?: string;
+
+  @ApiProperty({
+    description:
       'True once this sandbox has been handed out from the hot pool. Unlike ' +
       '`hotReserved` (which is cleared on claim) this flag is permanent, so a ' +
       'sandbox serving a session can always be told apart from a cold-started ' +

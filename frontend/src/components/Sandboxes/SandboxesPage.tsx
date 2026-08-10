@@ -1,4 +1,4 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import {
   Button,
   Empty,
@@ -25,6 +25,7 @@ import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/use
 import { useSnapshots } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
+import SandboxSaveStatus from './SandboxSaveStatus';
 import CreateSandboxModal from './CreateSandboxModal';
 import CreateSnapshotModal from './CreateSnapshotModal';
 import TerminalDrawer from './TerminalDrawer';
@@ -107,14 +108,27 @@ const SandboxesPage: React.FC = () => {
   });
   const { data: snapshotsPage } = useSnapshots();
   const { data: usage, isLoading: usageLoading } = useUsage();
+  // The save state lives on the snapshot; the workflow that produces it lives
+  // on the sandbox. Indexing here lets each row show its own without a request
+  // per sandbox.
+  const snapshotsById = useMemo(
+    () => new Map((snapshotsPage?.data ?? []).map((s) => [s.snapshotId, s])),
+    [snapshotsPage],
+  );
   const stopSandbox = useStopSandbox();
   const destroySandbox = useDestroySandbox();
 
-  const handleStop = async (id: string) => {
+  const handleStop = async (id: string, snapshotId?: string) => {
     setStoppingIds((prev) => new Set(prev).add(id));
     try {
-      await stopSandbox.mutateAsync(id);
-      message.success('Sandbox stopped');
+      // Linked: the save is a full capture, so let it run off-request and say
+      // so, rather than holding the browser open for minutes.
+      await stopSandbox.mutateAsync({ id, async: Boolean(snapshotId) });
+      message.success(
+        snapshotId
+          ? `Saving to snapshot ${snapshotId} in the background. The sandbox stops once the capture finishes.`
+          : 'Sandbox stopped',
+      );
     } catch (e: any) {
       message.error(e?.message ?? 'Stop failed');
     } finally {
@@ -369,6 +383,14 @@ const SandboxesPage: React.FC = () => {
       align: 'center',
     },
     {
+      title: 'Save',
+      key: 'save',
+      width: 190,
+      render: (_: any, row) => (
+        <SandboxSaveStatus sandbox={row} snapshots={snapshotsById} />
+      ),
+    },
+    {
       title: '',
       key: 'actions',
       width: 120,
@@ -391,19 +413,41 @@ const SandboxesPage: React.FC = () => {
                   onClick={() => setSnapshotSandbox(row)}
                 />
               </Tooltip>
-              <Tooltip title={stoppingIds.has(row.sandboxId) ? 'Stopping…' : 'Stop'}>
+              <Tooltip
+                title={
+                  stoppingIds.has(row.sandboxId)
+                    ? 'Stopping…'
+                    : row.snapshotId
+                      ? `Stop and save: the filesystem is written back to snapshot ${row.snapshotId}`
+                      : // A forked sandbox does come from a snapshot, it just
+                        // does not write back to it. Saying "not linked to a
+                        // snapshot" reads as "unrelated to any snapshot",
+                        // which the snapshot's own URL on this same row
+                        // contradicts.
+                        row.metadata?.restoredFrom
+                        ? `Stop. This sandbox was forked from snapshot ${row.metadata.restoredFrom} and is not linked to it, so its changes are discarded`
+                        : 'Stop. This sandbox does not come from a snapshot, so its changes are discarded'
+                }
+              >
                 <Button
                   size="small"
                   icon={<FontAwesomeIcon icon={faStop} />}
                   loading={stoppingIds.has(row.sandboxId)}
                   disabled={stoppingIds.has(row.sandboxId)}
-                  onClick={() => handleStop(row.sandboxId)}
+                  onClick={() => handleStop(row.sandboxId, row.snapshotId)}
                 />
               </Tooltip>
             </>
           )}
           <Popconfirm
             title="Destroy this sandbox?"
+            description={
+              row.snapshotId
+                ? `Nothing is saved. Snapshot ${row.snapshotId} keeps its last saved version, and everything done in this sandbox since it started is lost. Use Stop to keep it.`
+                : 'The sandbox and its filesystem are removed.'
+            }
+            okText={row.snapshotId ? 'Destroy, losing the changes' : 'Destroy'}
+            okButtonProps={{ danger: true }}
             onConfirm={() => handleDestroy(row.sandboxId)}
             disabled={destroyingIds.has(row.sandboxId)}
           >

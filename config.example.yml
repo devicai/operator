@@ -112,7 +112,14 @@ runtime:
 #   defaultScope: 'full' captures the whole filesystem diff (installed packages,
 #                 /etc configs, /usr/local binaries); 'workdir' captures only the
 #                 workdir. Overridable per-request.
-#   compression:  'auto' (gzip) | 'zstd' (smaller, host-side) | 'gzip'.
+#   compression:  'auto' (gzip) | 'zstd' (smaller AND faster) | 'gzip'.
+#
+#                 zstd wins on both axes at once, so 'auto' meaning gzip is
+#                 history rather than a judgement. Measured over a 762 MB tar
+#                 with the `zstd` binary and -T0: 1.5 s for 214 MB, against
+#                 ~60 s for gzip -9's 262 MB. Without the binary on PATH the
+#                 module falls back to Node's zstd, which is single-threaded
+#                 but still ahead of gzip.
 #   cleanup:      'conservative' (default) | 'none' | 'aggressive'.
 #
 # Full snapshots work under BOTH runc and sysbox-runc. Under sysbox the change
@@ -124,6 +131,54 @@ snapshots:
   defaultScope: full
   compression: auto
   cleanup: conservative
+  # Keep a per-snapshot container image alongside the tarball, so restoring is
+  # just "create a container" instead of replaying the tarball into one.
+  # Measured on a 199.8 MB snapshot: 27.9 s -> ~2 s, and the ~2 s no longer
+  # depends on snapshot size (a 760.9 MB snapshot takes 65 s from its tarball).
+  #
+  # The tarball stays the artifact of record: it is what export/import read,
+  # what backups copy, and what the image is rebuilt from on every capture.
+  # Deleting every image costs speed and nothing else — restores simply fall
+  # back to the tarball, which is the behaviour without this block.
+  imageCache:
+    enabled: false
+    repository: devic-snapshot
+    # An image holds its content UNCOMPRESSED (that is why it starts
+    # instantly), so it costs noticeably more than the tarball it came from:
+    # measured 532 MB of unique layer against a 200 MB tar.gz. Only bytes NOT
+    # shared with the base image are counted here, since the base is paid for
+    # by every sandbox on the host regardless.
+    #
+    # When the total exceeds this, the least recently restored images are
+    # dropped until it fits; images backing a live sandbox are never dropped.
+    # Leave unset and the cache grows until the disk is full.
+    maxTotalBytes: 21474836480  # 20 GiB
+    buildTimeoutMs: 600000
+    # Save by sealing the sandbox's writable layer instead of walking the
+    # filesystem, compressing a tarball and replaying it into a fresh container.
+    #
+    # Measured on a 1.2 GB delta: ~115 s the old way against 14.9 s, and a
+    # 50 MB delta commits in 0.3 s. Of the old 115 s, 83.8 s was gzip alone and
+    # 29.5 s was rebuilding the image from the tarball just written.
+    #
+    # It also closes the window where `persistVersion` has advanced but the
+    # image has not — the one every restore falls back to the tarball for —
+    # because the commit and the version bump become a single write.
+    #
+    # Needs `enabled`. Applies to full-scope snapshots only. If a commit fails
+    # for any reason the save falls back to the tarball path, so the artifact of
+    # record is never at risk.
+    commitLive: false
+    # Layers stack once per SESSION (repeated saves within one session replace
+    # the top layer rather than adding to it). A node:24 base is 8 layers and
+    # the runtime stops starting images at 70, so this leaves room on both
+    # sides. Consolidation rebuilds base+1 from the original base image —
+    # deliberately not `docker export | import`, which flattens to one layer but
+    # shares nothing with the base and so costs a full copy of it per snapshot.
+    consolidateAtLayers: 40
+    # Also consolidate once the tarball is this many versions behind, which
+    # bounds how long the freshest copy of a snapshot lives only as an image.
+    consolidateAtTarballLag: 5
 
 # Size limits (MiB) for multipart uploads. Keep aligned with the reverse
 # proxy's client_max_body_size (see frontend/nginx.conf).
@@ -229,6 +284,29 @@ ingress:
   proxyHost: 0.0.0.0
   defaultUpstreamPort: 80
   upstreamTimeoutMs: 30000
+
+  # A sandbox restored from a snapshot is published under the SNAPSHOT's
+  # subdomain (its `slug`, or a label derived from its id), so the URL of a
+  # service running inside it survives across sessions. Sandboxes with no
+  # snapshot keep being published under their own id.
+  #
+  # With autoRestart on, visiting that URL while nothing is running restores
+  # the snapshot and shows a waiting page until the service answers. Individual
+  # snapshots opt out with their own `autoRestart: false` (PATCH /snapshots/:id).
+  #
+  # Note: this lets an unauthenticated visitor allocate a sandbox. It is bounded
+  # by `resourceLimits` and by the short TTL below, but on a host with guessable
+  # subdomains it is worth knowing about.
+  autoRestart: true
+  # TTL granted to a sandbox nobody explicitly asked for. Shorter than
+  # defaults.defaultTtlSeconds on purpose.
+  autoRestartTtlSeconds: 1800
+  # How long one wake-up holds its claim before another visitor may retry.
+  # Must exceed the slowest restore (a large tarball replay runs to a minute+;
+  # an image-backed restore is a couple of seconds).
+  autoRestartClaimSeconds: 300
+  # How long the waiting page polls before showing an error.
+  autoRestartTimeoutSeconds: 120
 
 mcp:
   enabled: true

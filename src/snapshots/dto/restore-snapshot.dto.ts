@@ -60,4 +60,17 @@ export class RestoreSnapshotDto {
   @Min(1)
   @Max(65535)
   exposedHttpPort?: number;
+
+  @ApiPropertyOptional({
+    default: false,
+    description:
+      'Restore even while a save into this snapshot is still running. Without ' +
+      'it such a restore is refused with 409 SNAPSHOT_SAVE_IN_PROGRESS, because ' +
+      'the caller would silently get the PREVIOUS contents. With it the restore ' +
+      'proceeds from that previous (complete) artifact and the caller accepts ' +
+      'that the sandbox may be out of sync with the save in flight.',
+  })
+  @IsOptional()
+  @IsBoolean()
+  force?: boolean;
 }

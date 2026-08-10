@@ -18,6 +18,21 @@ export interface RuntimeSandboxConfig {
   /** hostPort -> guestPort */
   ports?: Record<string, number>;
   networkPolicy?: 'allow-all' | 'deny-all';
+  /**
+   * Image that `diff()` must treat as the starting point, when that is NOT the
+   * image the container was created from.
+   *
+   * Only set when restoring from a snapshot's derived image. There, `image` is
+   * `devic-snapshot:<id>` (base + snapshot content) while the snapshot's
+   * tarball is, and must stay, a diff against the ORIGINAL base image. Without
+   * this the next capture would diff against the snapshot image, produce a
+   * tarball holding only what changed since, and restoring that tarball onto
+   * the base image would silently drop everything the snapshot already had.
+   *
+   * Persisted as a container label so it survives a process restart — the
+   * capture that needs it may happen days after the create that set it.
+   */
+  baselineImage?: string;
 }
 
 export interface ExecResult {
@@ -264,6 +279,85 @@ export interface RuntimeProvider {
      */
     withSize?: boolean;
   }): Promise<ManagedSandboxInfo[]>;
+
+  // ---------------------------------------------------------------------------
+  // Snapshot image cache (all optional — a runtime without them simply has no
+  // image cache and every restore replays the tarball, as it always did).
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Seal a container's current filesystem as an image tagged `ref`.
+   *
+   * Note this captures MORE than `diff()` reports: under sysbox-runc a commit
+   * takes the whole writable layer, including the internally-mounted /usr,
+   * /etc and /var that `docker diff` cannot see. Callers must therefore commit
+   * only containers whose content they fully intend to publish.
+   *
+   * Measured on the production host (sysbox-runc, Docker 27.5.1, overlay2) with
+   * ten markers written across /usr, /etc, /var, /root, /opt and the workdir:
+   * `docker diff` reported three of them, the writable layer held all ten, and
+   * the committed image restored all ten. The blindness is in the reporting,
+   * not in the storage. The sysbox mount points (/var/lib/docker,
+   * /var/lib/containerd, …) stay out of the commit, so nested-runtime state is
+   * never dragged along.
+   */
+  commitImage?(
+    containerName: string,
+    ref: string,
+    options?: CommitImageOptions,
+  ): Promise<CommittedImageInfo>;
+
+  imageExists?(ref: string): Promise<boolean>;
+
+  /** Remove an image. Idempotent; resolves false when it was in use. */
+  removeImage?(ref: string): Promise<boolean>;
+
+  /** Every cached snapshot image, for accounting and eviction. */
+  listSnapshotImages?(repository: string): Promise<CachedImageInfo[]>;
+}
+
+export interface CommitImageOptions {
+  /** Written onto the image so eviction can enumerate without the database. */
+  labels?: Record<string, string>;
+  /**
+   * Freeze the container while its layer is archived. Defaults to true, which
+   * is also the runtime's own default.
+   *
+   * The freeze lasts essentially the whole commit — measured 5.011 s of a
+   * 5.043 s commit — so it is free for a container that is about to be torn
+   * down and very much not free for one serving traffic. Pass false there: the
+   * resulting layer is read while it is being written, which is no weaker than
+   * the tarball path, whose `tar` has never paused anything either (hence its
+   * tolerance for tar's "file changed as we read it").
+   */
+  pause?: boolean;
+}
+
+export interface CommittedImageInfo {
+  ref: string;
+  /** Bytes not shared with any other image, i.e. what this image really costs. */
+  uniqueSizeBytes: number;
+  /** Total layers. Bounded by the runtime — see DockerRuntimeProvider.MAX_LAYERS. */
+  layers: number;
+}
+
+export interface CachedImageInfo {
+  /** Addressable reference: the tag when it has one, the image id otherwise. */
+  ref: string;
+  /** The snapshot this image belongs to (the tag IS the snapshotId). */
+  tag: string;
+  uniqueSizeBytes: number;
+  createdAtMs: number;
+  /** True when a container still references it, which blocks removal. */
+  inUse: boolean;
+  /**
+   * True when a newer commit for the same snapshot took the tag over, leaving
+   * this one untagged. It is a dead previous version — never the image a
+   * restore would resolve — so it is garbage regardless of the cache cap, and
+   * removing it must NOT touch the snapshot's bookkeeping: the tag now points
+   * at a live image.
+   */
+  superseded?: boolean;
 }
 
 export interface ManagedSandboxInfo {

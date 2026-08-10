@@ -92,6 +92,40 @@ export function buildExcludeMatcher(cfg: ExcludeConfig): (path: string) => boole
   };
 }
 
+/**
+ * Concrete directories a commit-based save deletes before sealing the layer.
+ *
+ * The tarball path filters these out while building its file list; a commit has
+ * no list to filter, so the only way to keep them out of the image is to remove
+ * them from the container first. Measured: a file created and deleted within
+ * the same session leaves a 16.4 kB layer, i.e. the delete genuinely reclaims
+ * the bytes rather than stacking a marker on top of them.
+ *
+ * Deliberately narrower than `buildExcludeMatcher`:
+ *
+ * - The pseudo-filesystems (/proc, /sys, /dev, /run) are excluded from archives
+ *   but must never be deleted from a live container. They are absent here.
+ * - /tmp is left alone too: it is excluded from snapshots, but a running
+ *   process may well be using it, and this runs while the sandbox is still up.
+ * - The segment and sub-path patterns (`__pycache__`, `node_modules/.cache`)
+ *   would need a full filesystem walk to resolve, which is the cost this whole
+ *   path exists to avoid. They stay in the image until consolidation, which
+ *   rebuilds through the matcher, sweeps them out.
+ *
+ * Only ever called for a sandbox that is about to be torn down.
+ */
+export function cleanupPrefixes(cfg: ExcludeConfig): string[] {
+  if (cfg.cleanup === 'none') return [];
+  const prefixes = [...CONSERVATIVE_EXCLUDE_PREFIXES];
+  if (cfg.cleanup === 'aggressive') prefixes.push(...AGGRESSIVE_EXTRA_PREFIXES);
+  for (const e of cfg.extra ?? []) {
+    if (e.startsWith('/')) prefixes.push(e.replace(/\/+$/, ''));
+  }
+  // A path that is not a concrete child of root would widen the rm below into
+  // something nobody asked for.
+  return prefixes.filter((p) => /^\/[^/]/.test(p) && !p.split('/').includes('..'));
+}
+
 export interface FullCapturePartition {
   /** Changed/added paths to archive, made relative to `/` (no leading slash). */
   present: string[];

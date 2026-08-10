@@ -17,6 +17,12 @@ export interface SandboxDto {
   expiresAt: string;
   autoExtend?: boolean;
   snapshotId?: string;
+  /**
+   * Snapshot this sandbox's filesystem is being captured into, right now.
+   * Written by the server for the duration of the save, so a page opened
+   * mid-capture sees it — it is not something the client starts or tracks.
+   */
+  savingSnapshotId?: string;
   commandCount: number;
   recentCommands: string[];
   bindingId?: string;
@@ -182,8 +188,83 @@ export interface SnapshotDto {
   snapshotPath: string;
   sizeBytes: number;
   metadata: Record<string, any>;
+  /**
+   * Subdomain this snapshot is served under. Absent means one derived from the
+   * snapshot id — every snapshot has a stable URL either way.
+   */
+  slug?: string;
+  /** Address the snapshot is served at, derived by the server from its slug. */
+  publicUrl?: string;
+  /** Restore on visit to the public URL. Absent means enabled (opt-out). */
+  autoRestart?: boolean;
+  /**
+   * Command run after every restore to bring the service back up. A snapshot
+   * restores files, not processes, so without it a restored sandbox serves
+   * nothing.
+   */
+  startCommand?: string;
   createdAt: string;
   updatedAt: string;
+
+  // --- Saving ---------------------------------------------------------------
+  /** 'saving' while a capture is writing this snapshot; 'idle' otherwise. */
+  saveState?: 'idle' | 'saving';
+  /** Where the running save is. Absent when none is running. */
+  saveStage?: SaveStage;
+  /** When the current stage began, for the elapsed-time readout. */
+  saveStageSince?: string;
+  /** End-to-end duration of the last completed save. */
+  lastSaveDurationMs?: number;
+  /** How the last save was produced. */
+  lastSaveMethod?: 'commit' | 'tarball';
+  /** Captures so far. The tarball is current when it equals `tarballVersion`. */
+  persistVersion?: number;
+  /**
+   * Version the on-disk tarball holds. Behind `persistVersion` between a
+   * commit-based save and the background pass that refreshes it — that gap is
+   * the window in which the image is the only fresh copy.
+   */
+  tarballVersion?: number;
+  /** Layers in the derived image. Consolidation brings this back to base+1. */
+  imageLayers?: number;
+  /** Commits stacked since the last consolidation. */
+  imageGeneration?: number;
+  imageState?: 'none' | 'building' | 'ready' | 'failed';
+}
+
+/**
+ * Stages a save goes through. `committing` and `capturing` are alternatives —
+ * one per strategy — and the last two belong to the background pass that runs
+ * after a commit-based save, long after the caller was told it finished.
+ */
+export type SaveStage =
+  | 'claiming'
+  | 'cleaning'
+  | 'committing'
+  | 'capturing'
+  | 'consolidating'
+  | 'tarball';
+
+/** How a snapshot is served: its address, whether it wakes, and what it starts. */
+export interface UpdateSnapshotDto {
+  slug?: string | null;
+  autoRestart?: boolean;
+  startCommand?: string | null;
+}
+
+/**
+ * A problem found in a start command by reading it, not by running it. The
+ * command is saved regardless — this is what the caller could not have seen,
+ * since a detached launch reports success either way.
+ */
+export interface StartCommandWarning {
+  code: 'PGREP_SELF_MATCH' | 'PKILL_SELF_MATCH' | 'SYNTAX_ERROR';
+  message: string;
+  fix?: string;
+}
+
+export interface UpdatedSnapshotDto extends SnapshotDto {
+  startCommandWarnings?: StartCommandWarning[];
 }
 
 export interface CreateSnapshotDto {
