@@ -10,6 +10,7 @@ import {
   mkdirSync,
   readFileSync,
   statSync,
+  unlinkSync,
 } from 'fs';
 import { basename, dirname, isAbsolute, resolve } from 'path';
 import { CONFIG } from '../config/config.loader';
@@ -1291,10 +1292,98 @@ class DockerSandbox implements RuntimeSandbox {
   }
 
   async copyToHost(guestPath: string, hostPath: string): Promise<void> {
-    const stream = await this.container.getArchive({ path: guestPath });
+    // Read from INSIDE the container (exec + `cat`) rather than getArchive, for
+    // the same reason readFile/writeFile do — but this path failed in a louder
+    // way, so it is worth spelling out.
+    //
+    // getArchive serves the file from the host's own overlay mount of the
+    // container rootfs. Under sysbox-runc the container has its OWN overlay
+    // mount over the same upperdir (userns + id-shifted), and the two views
+    // diverge: whatever the container writes lands in the upperdir with a
+    // shifted uid, while the host's mount keeps serving the lower layer and
+    // never looks at the upper for that directory's children.
+    //
+    // It bites exactly one case, and bites it every time: a sandbox restored
+    // from a snapshot's cached image, whose workdir comes from a layer created
+    // by `docker commit`. There, `docker exec ls /workspace` lists the file the
+    // capture just wrote while `docker cp <c>:/workspace` returns an EMPTY
+    // directory — so every save of an image-restored snapshot died with
+    // `404 ... Could not find the file /workspace/.devic-runtime-snapshot-*`
+    // even though the tarball was sitting right there, intact.
+    //
+    // `cat` runs in the container's mount namespace, so it sees the same
+    // filesystem the shell does, under every runtime. Streamed to disk rather
+    // than buffered: these are snapshot tarballs, hundreds of MB.
     const dir = dirname(hostPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-    await extractFirstFileToDisk(stream as any as NodeJS.ReadableStream, hostPath);
+    await this.execToFile(`cat -- ${shellEscape(guestPath)}`, hostPath, {
+      label: `copyToHost ${guestPath}`,
+    });
+  }
+
+  /**
+   * Run a command in the container and stream its stdout straight into
+   * `hostPath`. Companion to execRaw for payloads too big to hold in memory:
+   * stderr is still buffered (it is small and only used for the error message),
+   * but stdout never materializes as a Buffer.
+   *
+   * On a non-zero exit the partial file is removed, so a failure can never be
+   * mistaken for a short-but-valid artifact by the caller.
+   */
+  private async execToFile(
+    command: string,
+    hostPath: string,
+    opts: { label: string },
+  ): Promise<void> {
+    const exec = await this.container.exec({
+      Cmd: ['/bin/sh', '-c', command],
+      AttachStdout: true,
+      AttachStderr: true,
+      Tty: false,
+    });
+    const stream = await exec.start({ hijack: true, stdin: false });
+
+    const stdoutStream = new PassThrough();
+    const stderrStream = new PassThrough();
+    const stderrChunks: Buffer[] = [];
+    stderrStream.on('data', (c: Buffer) => stderrChunks.push(c));
+
+    this.container.modem.demuxStream(stream, stdoutStream, stderrStream);
+
+    const out = createWriteStream(hostPath);
+    const written = new Promise<void>((res, rej) => {
+      out.on('finish', () => res());
+      out.on('error', rej);
+    });
+    stdoutStream.on('error', (err) => out.destroy(err as Error));
+    stdoutStream.pipe(out);
+
+    await new Promise<void>((resolve, reject) => {
+      const done = () => resolve();
+      stream.once('end', done);
+      stream.once('close', done);
+      stream.once('error', reject);
+    });
+
+    // demuxStream writes into the sinks but never ends them, so close our side
+    // now that the source is drained — otherwise `out` never emits 'finish'.
+    // By the time the source emits 'end' every chunk has already been written
+    // through synchronously, so nothing is lost here.
+    stdoutStream.end();
+    stderrStream.end();
+    await written;
+
+    const inspect = await exec.inspect();
+    const code = inspect.ExitCode ?? 0;
+    if (code !== 0) {
+      try {
+        unlinkSync(hostPath);
+      } catch {}
+      throw new Error(
+        `${opts.label} failed (exit ${code}): ` +
+          Buffer.concat(stderrChunks).toString('utf-8').trim(),
+      );
+    }
   }
 
   async copyFromHost(hostPath: string, guestPath: string): Promise<void> {
@@ -1338,37 +1427,6 @@ class DockerSandbox implements RuntimeSandbox {
       throw err;
     }
   }
-}
-
-async function extractFirstFileToDisk(
-  stream: NodeJS.ReadableStream,
-  destPath: string,
-): Promise<void> {
-  const extract = tar.extract();
-  let writeFinished: Promise<void> | null = null;
-
-  return new Promise<void>((resolve, reject) => {
-    extract.on('entry', (header, fileStream, next) => {
-      if (header.type !== 'file') {
-        fileStream.resume();
-        fileStream.on('end', next);
-        return;
-      }
-      const out = createWriteStream(destPath);
-      writeFinished = new Promise((res, rej) => {
-        out.on('finish', () => res());
-        out.on('error', rej);
-      });
-      fileStream.pipe(out);
-      fileStream.on('end', next);
-    });
-    extract.on('finish', async () => {
-      if (writeFinished) await writeFinished;
-      resolve();
-    });
-    extract.on('error', reject);
-    (stream as Readable).pipe(extract);
-  });
 }
 
 /**
