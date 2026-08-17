@@ -1,5 +1,11 @@
 import { PassThrough } from 'stream';
-import { mkdtempSync, writeFileSync } from 'fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { Test, TestingModule } from '@nestjs/testing';
@@ -864,6 +870,60 @@ describe('DockerRuntimeProvider', () => {
       await expect(h.sandbox.readFile('/nope')).rejects.toThrow(
         /readFile \/nope failed \(exit 1\): cat: \/nope: No such file or directory/,
       );
+    });
+
+    /**
+     * copyToHost must go through the container too. getArchive serves the
+     * file from the HOST's overlay mount, which under sysbox-runc does not
+     * see what the container wrote into a workdir inherited from a committed
+     * layer — every save of an image-restored snapshot 404'd on a tarball that
+     * was sitting in the container, intact. These lock the exec path in.
+     */
+    it('copyToHost streams the file out via `cat --`, not getArchive', async () => {
+      const bytes = Buffer.from([0x1f, 0x8b, 0x00, 0xff, 0x42]);
+      const h = await buildFsSandbox((cmd) =>
+        cmd.startsWith('cat -- ') ? { code: 0, stdout: bytes } : { code: 0 },
+      );
+      const dest = join(tmpdir(), `copytohost-${Date.now()}.bin`);
+
+      try {
+        await h.sandbox.copyToHost('/workspace/snap.tar.gz', dest);
+
+        expect(readFileSync(dest)).toEqual(bytes);
+        const call = h.execCalls.find((c) =>
+          c.opts.Cmd[2].startsWith('cat -- '),
+        );
+        expect(call!.opts.Cmd[2]).toBe("cat -- '/workspace/snap.tar.gz'");
+        expect(h.getArchive).not.toHaveBeenCalled();
+      } finally {
+        rmSync(dest, { force: true });
+      }
+    });
+
+    it('copyToHost throws and leaves no partial file when the read fails', async () => {
+      const h = await buildFsSandbox((cmd) =>
+        cmd.startsWith('cat -- ')
+          ? {
+              code: 1,
+              stdout: Buffer.from('partial'),
+              stderr: Buffer.from('cat: /workspace/gone: No such file\n'),
+            }
+          : { code: 0 },
+      );
+      const dest = join(tmpdir(), `copytohost-fail-${Date.now()}.bin`);
+
+      try {
+        await expect(
+          h.sandbox.copyToHost('/workspace/gone', dest),
+        ).rejects.toThrow(
+          /copyToHost \/workspace\/gone failed \(exit 1\): cat: \/workspace\/gone: No such file/,
+        );
+        // A truncated artifact must never survive a failed capture: the caller
+        // would happily register it as the snapshot.
+        expect(existsSync(dest)).toBe(false);
+      } finally {
+        rmSync(dest, { force: true });
+      }
     });
   });
 
