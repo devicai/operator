@@ -25,6 +25,12 @@ export interface HotPoolMetrics {
   totalClaims: number;
   /** ISO timestamp of the most recent successful claim, or null. */
   lastClaimedAt: string | null;
+  /**
+   * Pods thrown away since boot because they failed a health probe. A number
+   * that climbs is the pool absorbing a broken container runtime; a number
+   * that climbs FAST means every new pod is born broken — look at the host.
+   */
+  unhealthyEvictions: number;
 }
 
 export interface HotPoolSandboxView {

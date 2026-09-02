@@ -406,6 +406,34 @@ export interface HotPoolConfig {
   targetSize?: number;
   /** Reconcile cadence in milliseconds. */
   reconcileIntervalMs?: number;
+  /** Liveness checking of pooled sandboxes. See {@link HotPoolHealthProbeConfig}. */
+  healthProbe?: HotPoolHealthProbeConfig;
+}
+
+/**
+ * A pod can sit in the pool for weeks, and "the container is up" says nothing
+ * about whether it can still run a process: restarting the OCI runtime under a
+ * live container (a sysbox upgrade, an unattended-upgrades service restart)
+ * leaves it running but unable to accept any new `exec` — and Docker keeps
+ * reporting it as healthy. Since the pool hands out the OLDEST pod first, those
+ * are exactly the ones a user gets. So the pool asks each pod to actually run
+ * something: before handing it over, and periodically while it waits.
+ */
+export interface HotPoolHealthProbeConfig {
+  /** Master switch. Default true. */
+  enabled?: boolean;
+  /** Budget for a single probe. Default 10000. */
+  timeoutMs?: number;
+  /**
+   * How stale a pod's last successful probe may be before the reconcile loop
+   * re-checks it. Default 300000 (5 min).
+   */
+  intervalMs?: number;
+  /**
+   * How many pods a single claim may discard before giving up and letting the
+   * caller fall back to a fresh create. Default 3.
+   */
+  maxClaimAttempts?: number;
 }
 
 /**

@@ -6,6 +6,7 @@ import {
   OnApplicationShutdown,
 } from '@nestjs/common';
 import { nanoid } from 'nanoid';
+import { withTimeout } from '../common/with-timeout.util';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SnapshotDocument } from '../schemas/snapshot.schema';
 import { ModuleConfig } from '../config/config.types';
@@ -661,25 +662,6 @@ export class SnapshotImageService implements OnModuleInit, OnApplicationShutdown
     await this.snapshotRepo
       .updateById(docId, { $set: { imageState: state } }, {})
       .catch(() => undefined);
-  }
-}
-
-async function withTimeout<T>(
-  p: Promise<T>,
-  ms: number,
-  label: string,
-): Promise<T> {
-  let timer: NodeJS.Timeout;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(
-      () => reject(new Error(`${label} timed out after ${ms}ms`)),
-      ms,
-    );
-  });
-  try {
-    return await Promise.race([p, timeout]);
-  } finally {
-    clearTimeout(timer!);
   }
 }
 

@@ -41,6 +41,7 @@ import {
   ShellRunResult,
   ShellRunStream,
   ShellSession,
+  ShellUnavailableError,
 } from './runtime-provider.interface';
 import {
   buildWrappedCommand,
@@ -85,6 +86,22 @@ const SNAPSHOT_IMAGE_LABEL = 'devic-sandbox.snapshot';
  * anyone should reach.
  */
 const MAX_IMAGE_LAYERS = 70;
+
+/**
+ * Cheap no-op used to prove a freshly-opened shell can actually run something.
+ * `:` is a POSIX builtin: no fork, no PATH lookup, no output.
+ */
+const SHELL_PROBE_COMMAND = ':';
+
+/**
+ * Budget for that proof. Opening a shell is a local round-trip through the
+ * Docker socket; a container that needs longer than this to echo back a
+ * builtin is not one we should hand to a caller.
+ */
+const SHELL_OPEN_PROBE_TIMEOUT_MS = 15000;
+
+/** Cap on the diagnostics buffer of unexplained stream bytes. */
+const DIAGNOSTIC_OUTPUT_LIMIT = 2048;
 
 /**
  * Split `repo:tag` without tripping over a registry host that carries a port
@@ -1090,10 +1107,26 @@ class DockerSandbox implements RuntimeSandbox {
     });
 
     const inspect = await exec.inspect();
+    const stdout = Buffer.concat(stdoutChunks);
+    const stderr = Buffer.concat(stderrChunks);
+
+    // A process the runtime refused to start finishes with no exit code at
+    // all: Docker still answers 200, writes the reason into the stream and
+    // leaves `ExitCode` null. Reading that as 0 would be worse than a crash —
+    // readFile() would hand back the runtime's error text AS THE FILE, and a
+    // snapshot would happily store it. Fail loudly instead.
+    if (!inspect.Running && inspect.ExitCode === null) {
+      const reason =
+        [stderr.toString('utf-8'), stdout.toString('utf-8')]
+          .map((s) => s.trim())
+          .find(Boolean) ?? 'the runtime did not report an exit code';
+      throw new ShellUnavailableError(reason.slice(0, DIAGNOSTIC_OUTPUT_LIMIT));
+    }
+
     return {
       code: inspect.ExitCode ?? 0,
-      stdout: Buffer.concat(stdoutChunks),
-      stderr: Buffer.concat(stderrChunks),
+      stdout,
+      stderr,
     };
   }
 
@@ -1452,6 +1485,20 @@ class DockerShellSession implements ShellSession {
   /** Currently-active per-command processors (null when idle between calls). */
   private currentStdout: MarkerProcessor | null = null;
   private currentStderr: MarkerProcessor | null = null;
+  /**
+   * What the stream said before the session was declared usable, plus anything
+   * that arrives later while no command owns the processors. Normally empty:
+   * the shell only speaks when spoken to. It is NOT empty when the runtime
+   * refuses the exec — Docker answers 200 and writes the failure into the
+   * hijacked stream itself — so this is the only place that text exists, and
+   * it can arrive before or after we write the probe. Kept small; it is
+   * diagnostics, not output.
+   */
+  private diagnosticOutput = '';
+  /** Set once the session has proved it can run a command. */
+  private opened = false;
+  /** Why the session ended, when we know. Feeds ShellUnavailableError. */
+  private closeReason: string | null = null;
 
   private constructor(
     private readonly exec: Docker.Exec,
@@ -1462,8 +1509,14 @@ class DockerShellSession implements ShellSession {
   ) {
     container.modem.demuxStream(stream, this.stdoutSink, this.stderrSink);
 
-    this.stdoutSink.on('data', (c: Buffer) => this.currentStdout?.feed(c));
-    this.stderrSink.on('data', (c: Buffer) => this.currentStderr?.feed(c));
+    this.stdoutSink.on('data', (c: Buffer) => {
+      this.recordDiagnostic(c, this.currentStdout !== null);
+      this.currentStdout?.feed(c);
+    });
+    this.stderrSink.on('data', (c: Buffer) => {
+      this.recordDiagnostic(c, this.currentStderr !== null);
+      this.currentStderr?.feed(c);
+    });
 
     const onEnd = (err?: Error) => this.markClosed(err);
     stream.once('end', () => onEnd());
@@ -1497,11 +1550,31 @@ class DockerShellSession implements ShellSession {
       container,
       defaultTimeoutMs,
     );
-    if (initialCwd && initialCwd.trim()) {
-      // Best-effort: position the shell at the requested cwd before any
-      // caller-issued command. Failures here surface on the first run().
-      await session.run(`cd ${shellEscape(initialCwd)}`).catch(() => undefined);
+
+    // Probe the session before handing it out. Docker's exec API answers 200
+    // even when the OCI runtime refuses to start the process — the failure
+    // arrives as bytes on the hijacked stream, which then closes. Without this
+    // round-trip the caller gets a session that is already dead and reads as
+    // "the shell was reset mid-command", hiding the real cause (and inviting a
+    // retry loop against a container that will never run anything again).
+    //
+    // `cd` doubles as the probe when a cwd was requested: a missing directory
+    // is a non-zero exit, not a failure to open, and stays as best-effort.
+    const probe = initialCwd?.trim()
+      ? `cd ${shellEscape(initialCwd)}`
+      : SHELL_PROBE_COMMAND;
+    try {
+      await session.run(probe, { timeoutMs: SHELL_OPEN_PROBE_TIMEOUT_MS });
+    } catch (err) {
+      if (session.closed) {
+        throw new ShellUnavailableError(
+          session.failureReason ?? (err as Error).message,
+        );
+      }
+      // Session is alive; the probe itself failed (e.g. `cd` into a path the
+      // caller made up). Same best-effort semantics as before.
     }
+    session.markOpened();
     return session;
   }
 
@@ -1517,9 +1590,43 @@ class DockerShellSession implements ShellSession {
     this.closeListeners.push(listener);
   }
 
+  /**
+   * Keep at most `DIAGNOSTIC_OUTPUT_LIMIT` chars of what the stream says while
+   * the session is still unproven, and of any off-command chatter afterwards.
+   */
+  private recordDiagnostic(chunk: Buffer, claimedByCommand: boolean): void {
+    // Once the session is proven, a running command's own output is output,
+    // not diagnostics.
+    if (this.opened && claimedByCommand) return;
+    if (this.diagnosticOutput.length >= DIAGNOSTIC_OUTPUT_LIMIT) return;
+    this.diagnosticOutput = (
+      this.diagnosticOutput + chunk.toString('utf-8')
+    ).slice(0, DIAGNOSTIC_OUTPUT_LIMIT);
+  }
+
+  /**
+   * Declare the session usable and forget the probe's own traffic, so a later
+   * failure is not explained with a stale end-of-command marker.
+   */
+  private markOpened(): void {
+    this.opened = true;
+    this.diagnosticOutput = '';
+  }
+
+  /**
+   * Best explanation available for why this session is unusable: what the
+   * runtime wrote into the stream, or the stream's own error.
+   */
+  get failureReason(): string | null {
+    const noise = this.diagnosticOutput.trim();
+    if (noise) return noise;
+    return this.closeReason;
+  }
+
   private markClosed(err?: Error): void {
     if (this._closed) return;
     this._closed = true;
+    if (err && !this.closeReason) this.closeReason = err.message;
     // Abort any in-flight processors.
     this.currentStdout?.abort(err);
     this.currentStderr?.abort(err);
