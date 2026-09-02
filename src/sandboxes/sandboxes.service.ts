@@ -1,6 +1,8 @@
 import { Injectable, Inject, Logger, NotFoundException, BadRequestException, ConflictException, forwardRef, Optional } from '@nestjs/common';
 import * as net from 'net';
+import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
+import { withTimeout } from '../common/with-timeout.util';
 import { SandboxRegistry } from './sandbox-registry';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxProfileRepository } from '../repositories/sandbox-profile.repository';
@@ -20,6 +22,7 @@ import {
   RuntimeProvider,
   RuntimeSandbox,
   ShellCommandTimeoutError,
+  ShellUnavailableError,
 } from '../runtime/runtime-provider.interface';
 import { isImageAllowed, sanitizeHostPorts } from '../runtime/admission.util';
 import {
@@ -47,6 +50,16 @@ const CAPTURE_POLL_MS = 2_000;
  * clearing its flag cannot strand a container.
  */
 const CAPTURE_WAIT_TIMEOUT_MS = 20 * 60_000;
+
+/**
+ * Exit code reported when the container refuses to start a shell at all.
+ * 126 is the POSIX convention for "found, but could not be executed" and is
+ * deliberately NOT 124 (timeout): a timeout invites a retry, this does not.
+ */
+const SHELL_UNAVAILABLE_EXIT_CODE = 126;
+
+/** Budget for {@link SandboxesService.probeHealth}. */
+const HEALTH_PROBE_TIMEOUT_MS = 10_000;
 
 @Injectable()
 export class SandboxesService {
@@ -372,6 +385,44 @@ export class SandboxesService {
     }
   }
 
+  /**
+   * Ask a sandbox to prove it can still run a process, in one round-trip.
+   *
+   * "Container is up" is not the same as "container works": a container whose
+   * OCI runtime was restarted underneath it keeps running its own processes
+   * but rejects every new `exec`, and Docker reports it as perfectly healthy.
+   * The only reliable test is to actually run something, so this echoes a
+   * token and checks it comes back.
+   *
+   * Never throws — an unreachable sandbox is simply not healthy. The timeout
+   * matters: the probe backs a maintenance loop that must not hang on a wedged
+   * container.
+   */
+  async probeHealth(
+    doc: SandboxDocument,
+    timeoutMs = HEALTH_PROBE_TIMEOUT_MS,
+  ): Promise<{ healthy: boolean; reason?: string }> {
+    const token = `devic-probe-${randomUUID().slice(0, 8)}`;
+    try {
+      const sandbox = await this.getSandboxInstance(doc);
+      const result = await withTimeout(
+        sandbox.exec(`echo ${token}`),
+        timeoutMs,
+        `health probe exceeded ${timeoutMs}ms`,
+      );
+      if (result.stdout.includes(token)) return { healthy: true };
+      return {
+        healthy: false,
+        reason:
+          [result.stderr, result.stdout]
+            .map((s) => s.trim())
+            .find(Boolean) ?? `probe exited ${result.code} with no output`,
+      };
+    } catch (err) {
+      return { healthy: false, reason: (err as Error).message };
+    }
+  }
+
   async runCommand(
     id: string,
     dto: RunCommandDto,
@@ -394,7 +445,31 @@ export class SandboxesService {
     // visible. `cd` is also real and persists, but we still pin the starting
     // cwd to whatever the caller asked for (or what we last recorded) so the
     // shell's own drift doesn't surprise the agent.
-    const shell = await sandbox.openShell(cwd);
+    let shell;
+    try {
+      shell = await sandbox.openShell(cwd);
+    } catch (err) {
+      if (err instanceof ShellUnavailableError) {
+        // The container is up but cannot spawn processes any more — the
+        // classic cause is the OCI runtime being restarted underneath a
+        // running container (a sysbox upgrade, an unattended-upgrades
+        // service restart), which leaves every later `exec` rejected.
+        // Nothing about this is retryable, and saying otherwise sends the
+        // caller into a loop, so name the real cause and say it is terminal.
+        this.logger.error(
+          `Sandbox ${doc.sandboxId} (${doc.name}) cannot open a shell: ${err.reason}`,
+        );
+        return {
+          code: SHELL_UNAVAILABLE_EXIT_CODE,
+          stdout: '',
+          stderr:
+            'this sandbox can no longer run commands and will not recover; ' +
+            `start a new sandbox session. Runtime said: ${err.reason}`,
+          cwd,
+        };
+      }
+      throw err;
+    }
     // This REST endpoint is synchronous and sits behind a gateway that cuts the
     // origin request at ~60s. Default the per-command budget BELOW that (and
     // bound the queue wait, see DockerShellSession.runStream) so a stuck command

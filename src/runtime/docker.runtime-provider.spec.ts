@@ -504,7 +504,10 @@ describe('DockerRuntimeProvider', () => {
      * mkdir performed during `create`) gets a fast-completing one-shot; the
      * second one (the persistent shell) wires up to the harness streams.
      */
-    async function buildShellHarness() {
+    async function buildShellHarness(
+      opts: { answerProbes?: boolean } = {},
+    ) {
+      const answerProbes = opts.answerProbes ?? true;
       getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
 
       // First exec: workdir mkdir. Completes instantly.
@@ -524,18 +527,53 @@ describe('DockerRuntimeProvider', () => {
       // writes from the harness's POV, and the demuxStream mock wires our
       // sinks to it so the test can synthesize stdout/stderr.
       const shellStdin: Buffer[] = [];
+      let stdoutSink: PassThrough | undefined;
+      let stderrSink: PassThrough | undefined;
+
+      /**
+       * openShell() proves the session is alive before returning it, by
+       * running a probe (`:`, or the initial `cd`) and waiting for its end
+       * marker. A real shell answers; this harness must too, or every session
+       * would open "dead" and the tests below would never get a shell.
+       *
+       * The probe's traffic is then wiped from `shellStdin` so each test still
+       * sees only the command it issued itself.
+       */
+      const answerProbe = (chunk: Buffer): boolean => {
+        const text = chunk.toString('utf-8');
+        const payload = text.match(/printf '%s' '([A-Za-z0-9+/=]+)'/);
+        const marker = text.match(/__DEVIC_END_[0-9a-f]+__/);
+        if (!payload || !marker) return false;
+        const command = Buffer.from(payload[1], 'base64').toString('utf-8');
+        if (!answerProbes) return false;
+        if (command !== ':' && !command.startsWith('cd ')) return false;
+        setImmediate(() => {
+          stdoutSink?.write(Buffer.from(`${marker[0]}:0:/workspace\n`));
+          stderrSink?.write(Buffer.from(`${marker[0]}\n`));
+          shellStdin.length = 0;
+        });
+        return true;
+      };
+
+      // Listeners the session registers on the exec stream, so a test can
+      // play the daemon and end (or fault) the stream under it.
+      const streamListeners = new Map<string, Array<(arg?: any) => void>>();
       const shellStream: any = {
         write: jest.fn((chunk: any) => {
-          shellStdin.push(Buffer.from(chunk));
+          const buf = Buffer.from(chunk);
+          shellStdin.push(buf);
+          answerProbe(buf);
           return true;
         }),
         end: jest.fn(),
         destroy: jest.fn(),
-        once: jest.fn(),
+        once: jest.fn((event: string, cb: (arg?: any) => void) => {
+          const list = streamListeners.get(event) ?? [];
+          list.push(cb);
+          streamListeners.set(event, list);
+        }),
         on: jest.fn(),
       };
-      let stdoutSink: PassThrough | undefined;
-      let stderrSink: PassThrough | undefined;
       const modem = {
         demuxStream: jest.fn((_s: any, out: PassThrough, err: PassThrough) => {
           stdoutSink = out;
@@ -579,6 +617,9 @@ describe('DockerRuntimeProvider', () => {
           return { stdoutSink, stderrSink };
         },
         shellStdin,
+        emitStream: (event: string, arg?: any) => {
+          for (const cb of streamListeners.get(event) ?? []) cb(arg);
+        },
       };
     }
 
@@ -714,6 +755,46 @@ describe('DockerRuntimeProvider', () => {
       expect(shell.closed).toBe(true);
     });
 
+    it('rejects with the runtime error when the exec never starts', async () => {
+      // Docker answers 200 and reports the OCI failure INSIDE the hijacked
+      // stream, which then closes. Reproduced verbatim from a container whose
+      // sysbox runtime was restarted underneath it.
+      const runtimeError =
+        'OCI runtime exec failed: exec failed: container_linux.go:439: ' +
+        'starting container process caused: get handle to ' +
+        '/proc/thread-self/fd: unsafe procfs detected: operation not permitted';
+      const h = await buildShellHarness({ answerProbes: false });
+
+      const opening = h.sandbox.openShell();
+      await new Promise((r) => setImmediate(r));
+      h.getSinks().stdoutSink.write(Buffer.from(runtimeError));
+      await new Promise((r) => setImmediate(r));
+      h.emitStream('end');
+
+      await expect(opening).rejects.toMatchObject({
+        name: 'ShellUnavailableError',
+        reason: expect.stringContaining('unsafe procfs detected'),
+      });
+    });
+
+    it('does not hand out a session that died while opening', async () => {
+      const h = await buildShellHarness({ answerProbes: false });
+      const opening = h.sandbox.openShell();
+      await new Promise((r) => setImmediate(r));
+      h.emitStream('end');
+      await expect(opening).rejects.toMatchObject({
+        name: 'ShellUnavailableError',
+      });
+
+      // The failed session must not be cached: the next call opens a new one.
+      const retry = h.sandbox.openShell();
+      await new Promise((r) => setImmediate(r));
+      h.emitStream('end');
+      await expect(retry).rejects.toBeDefined();
+      // Two shells attempted → two execs beyond the create-time mkdir.
+      expect(h.shellStdin.length).toBeGreaterThan(0);
+    });
+
     it('does not arm a timeout when the per-call budget is 0', async () => {
       const h = await buildShellHarness();
       const shell = await h.sandbox.openShell();
@@ -744,7 +825,8 @@ describe('DockerRuntimeProvider', () => {
      */
     async function buildFsSandbox(
       handler: (cmd: string) => {
-        code: number;
+        /** `null` models a process the runtime refused to start. */
+        code: number | null;
         stdout?: Buffer;
         stderr?: Buffer;
       },
@@ -760,7 +842,7 @@ describe('DockerRuntimeProvider', () => {
         const stdin: Buffer[] = [];
         execCalls.push({ opts, stdin });
         let result = { code: 0 } as {
-          code: number;
+          code: number | null;
           stdout?: Buffer;
           stderr?: Buffer;
         };
@@ -782,7 +864,10 @@ describe('DockerRuntimeProvider', () => {
             (stream as any).__result = result;
             return stream;
           }),
-          inspect: jest.fn(async () => ({ ExitCode: result.code })),
+          inspect: jest.fn(async () => ({
+            Running: false,
+            ExitCode: result.code,
+          })),
         };
       });
 
@@ -858,6 +943,25 @@ describe('DockerRuntimeProvider', () => {
       const call = h.execCalls.find((c) => c.opts.Cmd[2].startsWith('cat -- '));
       expect(call!.opts.Cmd[2]).toBe("cat -- '/workspace/blob.bin'");
       expect(h.getArchive).not.toHaveBeenCalled();
+    });
+
+    it('readFile refuses to return the runtime error as file content', async () => {
+      // The OCI runtime rejecting the exec leaves ExitCode null and writes the
+      // reason into the stream. Read as exit 0, that text would BE the file —
+      // and a snapshot would then store it.
+      const runtimeError = Buffer.from(
+        'OCI runtime exec failed: unsafe procfs detected\n',
+      );
+      const h = await buildFsSandbox((cmd) =>
+        cmd.startsWith('cat -- ')
+          ? { code: null, stderr: runtimeError }
+          : { code: 0 },
+      );
+
+      await expect(h.sandbox.readFile('/workspace/blob.bin')).rejects.toMatchObject({
+        name: 'ShellUnavailableError',
+        reason: expect.stringContaining('unsafe procfs detected'),
+      });
     });
 
     it('readFile throws when the file is missing (non-zero exit)', async () => {

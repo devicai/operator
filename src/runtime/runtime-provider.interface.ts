@@ -126,6 +126,26 @@ export class ShellCommandTimeoutError extends Error {
   }
 }
 
+/**
+ * Raised by {@link RuntimeSandbox.openShell} when the container refuses to
+ * spawn the shell process at all — as opposed to a shell that opened fine and
+ * later died mid-command.
+ *
+ * The distinction matters to callers: a mid-command reset is transient and
+ * worth retrying, while this one means the container cannot run *any* new
+ * process and will keep failing until it is replaced. Docker reports these
+ * failures INSIDE the hijacked exec stream (the HTTP response is still 200),
+ * so `reason` carries whatever the runtime wrote there — e.g.
+ * `OCI runtime exec failed: ... unsafe procfs detected ...`, which is what a
+ * container left behind by a sysbox restart answers to every exec.
+ */
+export class ShellUnavailableError extends Error {
+  constructor(readonly reason: string) {
+    super(`the sandbox container cannot start a shell process: ${reason}`);
+    this.name = 'ShellUnavailableError';
+  }
+}
+
 export interface ShellRunResult {
   code: number;
   /** cwd of the session after the command (reflects internal `cd`s). */

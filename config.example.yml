@@ -254,6 +254,26 @@ hotPool:
   # maxSize: 20
   # Reconcile cadence (ms).
   reconcileIntervalMs: 15000
+  # Liveness of the pooled pods.
+  #
+  # A pod can wait here for weeks, and "the container is up" is not the same
+  # as "the container works": restarting the OCI runtime under a live
+  # container (a sysbox upgrade, an unattended-upgrades service restart)
+  # leaves it running but unable to accept ANY new exec — and Docker still
+  # reports it healthy. Because the pool serves the oldest pod first, those
+  # are exactly the ones users would get.
+  #
+  # So each pod is asked to actually run something: right before it is handed
+  # over, and every `intervalMs` while it waits. Failures are destroyed, and
+  # the same reconcile pass refills the slot. Watch `unhealthyEvictions` in
+  # GET /hot-pool/status: a number that climbs fast means new pods are born
+  # broken — look at the host, not at the pool.
+  healthProbe:
+    enabled: true
+    timeoutMs: 10000
+    intervalMs: 300000       # 5 min between probes of the same pod
+    maxClaimAttempts: 3      # pods a single claim may discard before falling
+                             # back to a fresh create
 
 # Public ingress — expose each running sandbox at <sandboxId>.<wildcardDomain>.
 # An embedded reverse proxy listens on `proxyPort` and routes by Host header

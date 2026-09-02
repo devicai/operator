@@ -10,7 +10,11 @@ import {
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { CONFIG } from '../config/config.loader';
-import { HotPoolConfig, ModuleConfig } from '../config/config.types';
+import {
+  HotPoolConfig,
+  HotPoolHealthProbeConfig,
+  ModuleConfig,
+} from '../config/config.types';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SnapshotRepository } from '../repositories/snapshot.repository';
 import { SnapshotsService } from '../snapshots/snapshots.service';
@@ -34,6 +38,14 @@ import {
 
 /** How many past claims `getStatus()` reports. */
 const RECENT_CLAIMS_LIMIT = 10;
+
+/** Fallbacks for {@link HotPoolHealthProbeConfig}. */
+const PROBE_DEFAULTS = {
+  enabled: true,
+  timeoutMs: 10_000,
+  intervalMs: 300_000,
+  maxClaimAttempts: 3,
+} as const;
 
 /**
  * Maintains a fleet of pre-restored sandboxes, ready to be claimed instantly.
@@ -60,6 +72,15 @@ export class HotPoolService implements OnModuleInit {
   // Runtime claim counters (process-local; reset on restart).
   private totalClaims = 0;
   private lastClaimedAt: Date | null = null;
+
+  /**
+   * Last time each pooled sandbox proved it could run a process. Process-local
+   * on purpose: after a restart every pod is re-probed, which is the safe
+   * direction to be wrong in.
+   */
+  private readonly lastProbeOk = new Map<string, number>();
+  /** Pods discarded by a probe, for the status endpoint. */
+  private unhealthyEvictions = 0;
 
   constructor(
     @Inject(CONFIG) private readonly config: ModuleConfig,
@@ -238,15 +259,48 @@ export class HotPoolService implements OnModuleInit {
     }
     const ttlSeconds =
       dto.ttlSeconds ?? this.config.defaults.defaultTtlSeconds;
-    const claimed = await this.sandboxRepo.atomicClaimHot(
-      this.liveConfig.snapshotId,
-      {
-        bindingId: dto.bindingId,
-        ttlSeconds,
-        maxTtlSeconds: this.config.defaults.maxTtlSeconds,
-        autoExtend: dto.autoExtend,
-      },
-    );
+
+    // Pods are handed out oldest-first, so a fleet-wide breakage (see
+    // HotPoolHealthProbeConfig) is served BEFORE the healthy pods — every
+    // claim would land on a dead one. Discard those as we find them; each
+    // discard is also a refill, so the pool self-heals as it is used.
+    const probe = this.probeSettings();
+    const maxAttempts = probe.enabled ? probe.maxClaimAttempts : 1;
+    let claimed: SandboxDocument | null = null;
+    for (let attempt = 0; attempt < maxAttempts; attempt++) {
+      const candidate = await this.sandboxRepo.atomicClaimHot(
+        this.liveConfig.snapshotId,
+        {
+          bindingId: dto.bindingId,
+          ttlSeconds,
+          maxTtlSeconds: this.config.defaults.maxTtlSeconds,
+          autoExtend: dto.autoExtend,
+        },
+      );
+      if (!candidate) break;
+
+      if (!probe.enabled) {
+        claimed = candidate;
+        break;
+      }
+
+      const health = await this.sandboxesService.probeHealth(
+        candidate,
+        probe.timeoutMs,
+      );
+      if (health.healthy) {
+        this.lastProbeOk.set(candidate.sandboxId, Date.now());
+        claimed = candidate;
+        break;
+      }
+
+      this.unhealthyEvictions += 1;
+      this.logger.error(
+        `Discarding unhealthy hot sandbox ${candidate.sandboxId} on claim ` +
+          `(age=${this.ageSeconds(candidate)}s): ${health.reason}`,
+      );
+      await this.destroyHot(candidate);
+    }
 
     if (!claimed) {
       throw new BadRequestException(
@@ -341,6 +395,7 @@ export class HotPoolService implements OnModuleInit {
       await this.cleanupFailedHotSandboxes();
       if (this.liveConfig.enabled && this.liveConfig.snapshotId) {
         await this.cleanupOrphanHotSandboxes();
+        await this.cleanupUnhealthyHotSandboxes();
       }
 
       if (!this.liveConfig.enabled) {
@@ -427,6 +482,73 @@ export class HotPoolService implements OnModuleInit {
   }
 
   /**
+   * Reap pods that no longer answer a probe.
+   *
+   * The claim path already discards them one by one, but only as fast as
+   * sandboxes are claimed — an idle pool would keep a fleet of dead pods
+   * warm for days and then serve them all at once. Probing here bounds how
+   * long a broken pod stays claimable to `intervalMs`, and every eviction is
+   * refilled by the same reconcile pass that found it.
+   *
+   * Probes are staggered by their own success: a pod that answered less than
+   * `intervalMs` ago is skipped, so the steady-state cost is one exec per pod
+   * per interval, not one per reconcile tick.
+   */
+  private async cleanupUnhealthyHotSandboxes(): Promise<void> {
+    const probe = this.probeSettings();
+    if (!probe.enabled) return;
+
+    const hotDocs = await this.sandboxRepo.findHotReserved(
+      this.liveConfig.snapshotId,
+    );
+    const live = new Set(hotDocs.map((d) => d.sandboxId));
+    for (const id of this.lastProbeOk.keys()) {
+      if (!live.has(id)) this.lastProbeOk.delete(id);
+    }
+
+    const now = Date.now();
+    for (const doc of hotDocs) {
+      const last = this.lastProbeOk.get(doc.sandboxId);
+      if (last !== undefined && now - last < probe.intervalMs) continue;
+
+      const health = await this.sandboxesService.probeHealth(
+        doc,
+        probe.timeoutMs,
+      );
+      if (health.healthy) {
+        this.lastProbeOk.set(doc.sandboxId, Date.now());
+        continue;
+      }
+
+      this.unhealthyEvictions += 1;
+      this.logger.error(
+        `Removing unhealthy hot sandbox ${doc.sandboxId} ` +
+          `(age=${this.ageSeconds(doc)}s): ${health.reason}`,
+      );
+      this.lastProbeOk.delete(doc.sandboxId);
+      await this.destroyHot(doc);
+    }
+  }
+
+  /** Probe knobs with their defaults applied. */
+  private probeSettings(): Required<HotPoolHealthProbeConfig> {
+    const cfg = this.liveConfig.healthProbe ?? {};
+    return {
+      enabled: cfg.enabled ?? PROBE_DEFAULTS.enabled,
+      timeoutMs: cfg.timeoutMs ?? PROBE_DEFAULTS.timeoutMs,
+      intervalMs: cfg.intervalMs ?? PROBE_DEFAULTS.intervalMs,
+      maxClaimAttempts:
+        cfg.maxClaimAttempts ?? PROBE_DEFAULTS.maxClaimAttempts,
+    };
+  }
+
+  private ageSeconds(doc: SandboxDocument): number {
+    const createdAt = new Date((doc as any).createdAt).getTime();
+    if (!Number.isFinite(createdAt)) return 0;
+    return Math.max(0, Math.floor((Date.now() - createdAt) / 1000));
+  }
+
+  /**
    * Reap hot docs whose status drifted to `failed` (provisioning crashed
    * mid-flight). They don't count toward the live pool but pile up in the
    * DB if left untouched.
@@ -496,6 +618,7 @@ export class HotPoolService implements OnModuleInit {
       lastClaimedAt: this.lastClaimedAt
         ? this.lastClaimedAt.toISOString()
         : null,
+      unhealthyEvictions: this.unhealthyEvictions,
     };
   }
 
