@@ -471,11 +471,12 @@ export class SandboxesService {
       throw err;
     }
     // This REST endpoint is synchronous and sits behind a gateway that cuts the
-    // origin request at ~60s. Default the per-command budget BELOW that (and
-    // bound the queue wait, see DockerShellSession.runStream) so a stuck command
-    // returns a clean exit-124 + shell reset instead of a 504. An explicit
-    // `timeoutSeconds` overrides it (0 disables).
-    const restDefaultMs = this.config.defaults?.restCommandTimeoutMs ?? 45000;
+    // origin request off (Cloudflare returns a 524 at 125s -- measured against
+    // sandbox.devic.ai on 2026-09-08). Default the per-command budget BELOW that
+    // (and bound the queue wait, see DockerShellSession.runStream) so a stuck
+    // command returns a clean exit-124 + shell reset instead of a 504. An
+    // explicit `timeoutSeconds` overrides it (0 disables).
+    const restDefaultMs = this.config.defaults?.restCommandTimeoutMs ?? 110000;
     const timeoutMs =
       dto.timeoutSeconds !== undefined
         ? dto.timeoutSeconds * 1000
