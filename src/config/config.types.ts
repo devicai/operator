@@ -81,10 +81,13 @@ export interface SandboxDefaultsConfig {
    * Default per-command budget (ms) for the synchronous REST exec endpoint
    * (`POST /sandboxes/:id/command`), used when the request omits an explicit
    * `timeoutSeconds`. Kept BELOW the upstream gateway timeout (Cloudflare cuts
-   * an origin request at ~60s) so a stuck command returns a clean exit-124 +
-   * shell reset instead of a 504. Long-running work should use the WebSocket
-   * terminal (kept on `commandTimeoutMs`, which a keepalive protects from the
-   * idle cut). 0 disables. Default 45000 (45s).
+   * an origin request at 125s with a 524 -- measured against sandbox.devic.ai
+   * on 2026-09-08) so a stuck command returns a clean exit-124 + shell reset
+   * instead of a 504. Long-running work should use the WebSocket terminal (kept
+   * on `commandTimeoutMs`, which a keepalive protects from the idle cut).
+   * 0 disables. Default 110000 (110s): the previous 45s was below what a plain
+   * `npm i -g <cli>` needs (~33s and rising), so routine installs died on a
+   * timeout that had no reason to be that tight.
    */
   restCommandTimeoutMs?: number;
 }
