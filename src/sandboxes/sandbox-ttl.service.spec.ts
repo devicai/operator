@@ -33,7 +33,7 @@ function makeService(overrides: {
     runtime.listManaged = jest.fn().mockResolvedValue(overrides.managed ?? []);
   }
   const snapshotsService = {
-    persistToSnapshot: jest.fn().mockResolvedValue(undefined),
+    persistToSnapshot: jest.fn().mockResolvedValue('saved'),
   };
 
   const service = Object.create(SandboxTtlService.prototype) as SandboxTtlService;
@@ -90,6 +90,25 @@ describe('SandboxTtlService.checkExpiredSandboxes', () => {
     expect(runtime.remove).toHaveBeenCalled();
   });
 
+  it.each(['failed', 'conflict', 'skipped'])('retains an unsaved linked disk after %s and retries next tick', async (outcome) => {
+    const { service, snapshotsService, runtime, sandboxRepo } = makeService({
+      expired: [{ ...expiredDoc('retry'), snapshotId: 'snap-1' }],
+    });
+    snapshotsService.persistToSnapshot.mockResolvedValueOnce(outcome);
+    await service.checkExpiredSandboxes();
+    expect(runtime.remove).not.toHaveBeenCalled();
+    expect(sandboxRepo.atomicExpire).not.toHaveBeenCalled();
+    await service.checkExpiredSandboxes();
+    expect(runtime.remove).toHaveBeenCalledTimes(1);
+  });
+  it('preserves a throwing save and still processes other expired sandboxes', async () => {
+    const { service, snapshotsService, runtime } = makeService({
+      expired: [{ ...expiredDoc('failed'), snapshotId: 'snap-1' }, expiredDoc('other')],
+    });
+    snapshotsService.persistToSnapshot.mockRejectedValueOnce(new Error('storage offline'));
+    await service.checkExpiredSandboxes();
+    expect(runtime.remove.mock.calls).toEqual([['sandbox-other']]);
+  });
   it('keeps reaping the rest when one removal fails', async () => {
     const { service, runtime } = makeService({
       expired: [expiredDoc('one'), expiredDoc('two')],

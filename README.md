@@ -609,6 +609,26 @@ writable layer held all ten, and the committed image restored all ten. The
 sysbox mount points (`/var/lib/docker`, `/var/lib/containerd`, …) stay out of
 the commit, so nested-runtime state is never dragged in.
 
+#### Save failure protection
+
+A linked sandbox is removed at close/expiry only after its snapshot save succeeds.
+A failed, skipped or conflicting TTL save preserves the live disk and ownership
+for a later retry. The sandbox stays protected from orphan cleanup; new operations
+after its expiry are rejected with `SANDBOX_EXPIRING`. Failed synchronous closes
+return `SNAPSHOT_SAVE_FAILED` (503), or `SNAPSHOT_SAVE_IN_PROGRESS` (409).
+Asynchronous closes restore the sandbox to `running` after a save failure so TTL
+can retry. An in-flight capture is not assumed to be a successful final save.
+
+Monitor repeated save failures: a retained container consumes resources until
+storage recovers or an operator recovers/discards the disk. An explicit
+`save: false` is still a discard, and `force` can abandon a capture. This does
+not provide durability against losing the sandbox host itself. A service crash
+during an asynchronous close can leave `stopping` ownership requiring recovery;
+that disk is retained, not automatically discarded.
+
+For a real local stop/TTL/restore smoke with commit-based saving, see
+[`test/manual/session-persistence-smoke.py`](test/manual/session-persistence-smoke.py).
+
 ### Sandbox Profiles
 
 | Method | Endpoint | Description |

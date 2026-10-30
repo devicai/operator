@@ -115,6 +115,22 @@ describe('SandboxesService.stop', () => {
     expect(registry.remove).toHaveBeenCalled();
   });
 
+  it('does not discard a linked disk after an in-flight capture failed', async () => {
+    const doc = runningDoc({ savingSnapshotId: 'snap1' });
+    const { service, sandboxRepo, registry, snapshotsService } = makeService(doc, 'failed');
+    (sandboxRepo as any).findOne = jest.fn().mockResolvedValue({ ...doc, savingSnapshotId: undefined });
+    await service.stop('sbx1', {}, undefined, { async: true });
+    jest.advanceTimersByTime(2500);
+    await new Promise((r) => setImmediate(r));
+    expect(snapshotsService.persistToSnapshot).toHaveBeenCalled();
+    expect(registry.remove).not.toHaveBeenCalled();
+  });
+  it('refuses new operations on an expired disk awaiting persistence', async () => {
+    const { service, runtime } = makeService(runningDoc());
+    await expect((service as any).getSandboxInstance(runningDoc({ expiresAt: new Date(Date.now() - 1) })))
+      .rejects.toMatchObject({ response: { code: 'SANDBOX_EXPIRING' } });
+    expect(runtime.get).not.toHaveBeenCalled();
+  });
   it('lets force through to abandon a stuck capture', async () => {
     const { service, registry } = makeService(
       runningDoc({ savingSnapshotId: 'snap1' }),
@@ -123,6 +139,18 @@ describe('SandboxesService.stop', () => {
     expect(registry.remove).toHaveBeenCalled();
   });
 
+  it.each(['failed', 'skipped'])('does not close after a synchronous %s save', async (outcome) => {
+    const { service, registry } = makeService(runningDoc(), outcome);
+    await expect(service.stop('sbx1', {})).rejects.toMatchObject({ response: { code: 'SNAPSHOT_SAVE_FAILED' } });
+    expect(registry.remove).not.toHaveBeenCalled();
+  });
+  it('restores a failed asynchronous save to running for expiry retry', async () => {
+    const { service, registry, sandboxRepo } = makeService(runningDoc(), 'failed');
+    await service.stop('sbx1', {}, undefined, { async: true });
+    await new Promise((r) => setImmediate(r));
+    expect(registry.remove).not.toHaveBeenCalled();
+    expect(sandboxRepo.updateById).toHaveBeenLastCalledWith('oid-sbx', { $set: { status: SandboxStatus.RUNNING } }, {});
+  });
   it('surfaces a concurrent save as a conflict instead of stopping anyway', async () => {
     const { service, registry } = makeService(runningDoc(), 'conflict');
 

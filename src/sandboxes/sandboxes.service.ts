@@ -1,4 +1,4 @@
-import { Injectable, Inject, Logger, NotFoundException, BadRequestException, ConflictException, forwardRef, Optional } from '@nestjs/common';
+import { Injectable, Inject, Logger, NotFoundException, BadRequestException, ConflictException, ServiceUnavailableException, forwardRef, Optional } from '@nestjs/common';
 import * as net from 'net';
 import { randomUUID } from 'crypto';
 import { nanoid } from 'nanoid';
@@ -361,6 +361,14 @@ export class SandboxesService {
   }
 
   private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
+    // Expiry keeps ownership while the final snapshot is saved. Do not admit
+    // new writes during that window (or while a failed save waits for retry).
+    if (doc.expiresAt && new Date(doc.expiresAt).getTime() <= Date.now()) {
+      throw new ConflictException({
+        code: 'SANDBOX_EXPIRING',
+        message: 'The sandbox has reached its lifetime and is waiting for its disk to be saved.',
+      });
+    }
     const containerName = await this.registry.get(doc.sandboxId);
     const name = containerName ?? doc.name;
 
@@ -713,7 +721,7 @@ export class SandboxesService {
         { $set: { status: SandboxStatus.STOPPING } },
         scope,
       );
-      void this.waitForCaptureThenStop(doc, scope, reason);
+      void this.waitForCaptureThenStop(doc, scope, reason, opts);
       return stopping ?? doc;
     }
 
@@ -749,16 +757,18 @@ export class SandboxesService {
           snapshotId: saveTarget,
         });
       }
+      if (outcome !== 'saved')
+        throw new ServiceUnavailableException({
+          code: 'SNAPSHOT_SAVE_FAILED',
+          message: 'The disk could not be saved. The sandbox has been preserved; retry saving before closing it.',
+          snapshotId: saveTarget,
+        });
     }
 
     return this.finishStop(doc, scope, reason);
   }
 
-  /**
-   * Background half of an async stop: persist, then tear down no matter how the
-   * save went. A failed save must not leave the sandbox running forever — the
-   * caller already got its answer and nothing else will come back for it.
-   */
+  /** A failed background save preserves the live disk for a later retry. */
   private async saveThenStop(
     doc: SandboxDocument,
     scope: ExtensionScope,
@@ -766,35 +776,34 @@ export class SandboxesService {
     targetSnapshotId?: string,
   ): Promise<void> {
     try {
-      await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId, {
+      const outcome = await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId, {
         terminal: true,
       });
+      if (outcome !== 'saved') throw new Error(`Snapshot save: ${outcome}`);
     } catch (err) {
-      this.logger.error(
-        `Background save for ${doc.sandboxId} failed: ${(err as Error).message}`,
-      );
+      this.logger.error(`Background save for ${doc.sandboxId} failed; preserving disk: ${(err as Error).message}`);
+      await this.sandboxRepo.updateById((doc as any)._id.toString(), {
+        $set: { status: SandboxStatus.RUNNING },
+      }, scope).catch((error) => this.logger.error(`Could not restore sandbox status: ${String(error)}`));
+      return;
     }
     try {
       await this.finishStop(doc, scope, reason);
     } catch (err) {
-      this.logger.error(
-        `Background stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
-      );
+      this.logger.error(`Background stop for ${doc.sandboxId} failed: ${(err as Error).message}`);
     }
   }
 
   /**
-   * Wait for the capture in flight to clear the sandbox's flag, then tear the
-   * container down. No second save: the capture already running IS the save.
-   *
-   * Bounded — a capture that never finishes (its process died without clearing
-   * the flag, which the boot sweep only fixes on restart) must not leave the
-   * container running forever.
+   * Wait for an in-flight capture, then perform the requested final save.
+   * Clearing the capture flag alone is not proof that it saved successfully,
+   * or that it targeted the linked snapshot. A timeout preserves the disk.
    */
   private async waitForCaptureThenStop(
     doc: SandboxDocument,
     scope: ExtensionScope,
     reason?: string,
+    opts: StopSandboxDto = {},
   ): Promise<void> {
     const deadline = Date.now() + CAPTURE_WAIT_TIMEOUT_MS;
     try {
@@ -805,15 +814,21 @@ export class SandboxesService {
           .catch(() => null);
         if (!fresh) return;
         if (!fresh.savingSnapshotId) {
-          await this.finishStop(fresh, scope, reason);
+          const target = opts.snapshotId ?? fresh.snapshotId;
+          if (opts.save !== false && target)
+            await this.saveThenStop(fresh, scope, reason, target);
+          else
+            await this.finishStop(fresh, scope, reason);
           return;
         }
       }
       this.logger.warn(
         `Capture of ${doc.sandboxId} did not finish within ` +
-          `${CAPTURE_WAIT_TIMEOUT_MS}ms; stopping anyway`,
+          `${CAPTURE_WAIT_TIMEOUT_MS}ms; preserving disk`,
       );
-      await this.finishStop(doc, scope, reason);
+      await this.sandboxRepo.updateById((doc as any)._id.toString(), {
+        $set: { status: SandboxStatus.RUNNING },
+      }, scope);
     } catch (err) {
       this.logger.error(
         `Deferred stop for ${doc.sandboxId} failed: ${(err as Error).message}`,
