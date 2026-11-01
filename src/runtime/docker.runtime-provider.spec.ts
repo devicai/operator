@@ -830,6 +830,7 @@ describe('DockerRuntimeProvider', () => {
         stdout?: Buffer;
         stderr?: Buffer;
       },
+      drainDelayMs = 0,
     ) {
       getImage.mockReturnValue({ inspect: jest.fn().mockResolvedValue({}) });
 
@@ -853,7 +854,10 @@ describe('DockerRuntimeProvider', () => {
           },
           end: jest.fn(),
           once: (e: string, cb: any) => {
-            if (e === 'end' || e === 'close') setImmediate(cb);
+            if (e === 'end' || e === 'close') {
+              if (drainDelayMs) setTimeout(cb, drainDelayMs);
+              else setImmediate(cb);
+            }
           },
         };
         return {
@@ -1027,6 +1031,20 @@ describe('DockerRuntimeProvider', () => {
         expect(existsSync(dest)).toBe(false);
       } finally {
         rmSync(dest, { force: true });
+      }
+    });
+
+    it('handles a destination write failure before Docker finishes streaming', async () => {
+      const h = await buildFsSandbox(() => ({ code: 0, stdout: Buffer.from('data') }), 100);
+      // Opening a directory as a file fails even when tests run as root.
+      const dest = mkdtempSync(join(tmpdir(), 'copytohost-write-error-'));
+      try {
+        await expect(h.sandbox.copyToHost('/workspace/snap.tar.gz', dest))
+          .rejects.toMatchObject({ code: 'EISDIR' });
+        // Allow the mocked Docker stream to finish: no later unhandled rejection.
+        await new Promise((resolve) => setTimeout(resolve, 120));
+      } finally {
+        rmSync(dest, { recursive: true, force: true });
       }
     });
   });

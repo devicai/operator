@@ -107,27 +107,27 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
           continue;
         }
 
+        // Keep RUNNING ownership until a durable save succeeds. Marking it
+        // expired first also lets the orphan sweeper delete an unsaved disk
+        // after a process crash, and permits a restore from a stale snapshot.
+        if (doc.snapshotId) {
+          try {
+            const outcome = await this.snapshotsService.persistToSnapshot(
+              doc, undefined, { terminal: true },
+            );
+            if (outcome !== 'saved') {
+              this.logger.warn(`Expiry save for ${doc.sandboxId}: ${outcome}; preserving disk for retry`);
+              continue;
+            }
+          } catch (err) {
+            this.logger.error(`Expiry save for ${doc.sandboxId} failed; preserving disk: ${(err as Error).message}`);
+            continue;
+          }
+        }
         const claimed = await this.sandboxRepo.atomicExpire(
           (doc as any)._id.toString(),
         );
         if (!claimed) continue;
-
-        if (doc.snapshotId) {
-          // Expiry saves too: a session that runs out of time keeps whatever
-          // it did, same as one closed on purpose.
-          // The container is removed a few lines down, so the commit may freeze
-          // it and the regenerable caches may go.
-          const outcome = await this.snapshotsService.persistToSnapshot(
-            doc,
-            undefined,
-            { terminal: true },
-          );
-          if (outcome !== 'saved') {
-            this.logger.warn(
-              `Expiry save for ${doc.sandboxId} into ${doc.snapshotId}: ${outcome}`,
-            );
-          }
-        }
 
         try {
           // `doc.name` is the container name — the document is the source of

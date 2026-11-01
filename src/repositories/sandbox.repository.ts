@@ -36,7 +36,11 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
   async atomicExpire(id: string): Promise<SandboxDocument | null> {
     return this.model
       .findOneAndUpdate(
-        { _id: id, status: SandboxStatus.RUNNING, hotReserved: { $ne: true } },
+        {
+          _id: id, status: SandboxStatus.RUNNING, hotReserved: { $ne: true },
+          expiresAt: { $lte: new Date() },
+          savingSnapshotId: { $in: [null, ''] },
+        },
         { $set: { status: SandboxStatus.EXPIRED } },
         { new: true },
       )
@@ -211,8 +215,7 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
               },
             },
             // A sandbox being captured must survive the sweep whatever its
-            // status says: the TTL reaper marks it `expired` BEFORE persisting,
-            // and removing the container mid-tar kills the save.
+            // status says; removing the container mid-tar kills the save.
             { savingSnapshotId: { $exists: true, $ne: null } },
           ],
         },

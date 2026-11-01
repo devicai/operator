@@ -251,7 +251,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     await this.removeIfExists(cfg.name);
 
     const env = Object.entries(cfg.env).map(([k, v]) => `${k}=${v}`);
-    const exposed: Record<string, {}> = {};
+    const exposed: Record<string, Record<string, never>> = {};
     const portBindings: Record<
       string,
       Array<{ HostPort: string; HostIp?: string }>
@@ -1381,41 +1381,50 @@ class DockerSandbox implements RuntimeSandbox {
     const stderrChunks: Buffer[] = [];
     stderrStream.on('data', (c: Buffer) => stderrChunks.push(c));
 
-    this.container.modem.demuxStream(stream, stdoutStream, stderrStream);
-
     const out = createWriteStream(hostPath);
     const written = new Promise<void>((res, rej) => {
       out.on('finish', () => res());
       out.on('error', rej);
     });
     stdoutStream.on('error', (err) => out.destroy(err as Error));
-    stdoutStream.pipe(out);
+    try {
+      // Observe the destination immediately, while Docker is still streaming.
+      // Waiting for the source first leaves EACCES/ENOSPC rejections unhandled
+      // and can terminate Operator instead of reporting a failed snapshot save.
+      await Promise.all([
+        written,
+        new Promise<void>((resolve, reject) => {
+          const done = () => {
+            // Docker demux writes to its sinks but never ends them.
+            stdoutStream.end();
+            stderrStream.end();
+            resolve();
+          };
+          stream.once('end', done);
+          stream.once('close', done);
+          stream.once('error', reject);
+          stdoutStream.pipe(out);
+          this.container.modem.demuxStream(stream, stdoutStream, stderrStream);
+        }),
+      ]);
 
-    await new Promise<void>((resolve, reject) => {
-      const done = () => resolve();
-      stream.once('end', done);
-      stream.once('close', done);
-      stream.once('error', reject);
-    });
-
-    // demuxStream writes into the sinks but never ends them, so close our side
-    // now that the source is drained — otherwise `out` never emits 'finish'.
-    // By the time the source emits 'end' every chunk has already been written
-    // through synchronously, so nothing is lost here.
-    stdoutStream.end();
-    stderrStream.end();
-    await written;
-
-    const inspect = await exec.inspect();
-    const code = inspect.ExitCode ?? 0;
-    if (code !== 0) {
+      const inspect = await exec.inspect();
+      const code = inspect.ExitCode ?? 0;
+      if (code !== 0) {
+        throw new Error(
+          `${opts.label} failed (exit ${code}): ` +
+            Buffer.concat(stderrChunks).toString('utf-8').trim(),
+        );
+      }
+    } catch (err) {
+      (stream as Readable).destroy?.();
+      stdoutStream.destroy();
+      stderrStream.destroy();
+      out.destroy();
       try {
         unlinkSync(hostPath);
       } catch {}
-      throw new Error(
-        `${opts.label} failed (exit ${code}): ` +
-          Buffer.concat(stderrChunks).toString('utf-8').trim(),
-      );
+      throw err;
     }
   }
 
