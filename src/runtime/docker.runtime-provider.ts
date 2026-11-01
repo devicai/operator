@@ -251,7 +251,7 @@ export class DockerRuntimeProvider implements RuntimeProvider {
     await this.removeIfExists(cfg.name);
 
     const env = Object.entries(cfg.env).map(([k, v]) => `${k}=${v}`);
-    const exposed: Record<string, {}> = {};
+    const exposed: Record<string, Record<string, never>> = {};
     const portBindings: Record<
       string,
       Array<{ HostPort: string; HostIp?: string }>

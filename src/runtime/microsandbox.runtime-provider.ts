@@ -35,6 +35,8 @@ import {
 type MicrosandboxSdk = typeof import('microsandbox');
 let _sdk: MicrosandboxSdk | null = null;
 function sdk(): MicrosandboxSdk {
+  // Lazy CommonJS loading avoids requiring the optional native binding on Docker hosts.
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
   return (_sdk ??= require('microsandbox'));
 }
 

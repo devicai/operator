@@ -116,7 +116,7 @@ describe('checkStartCommandSyntax', () => {
   it('does not execute the command it checks', async () => {
     const marker = `/tmp/devic-syntax-check-${process.pid}`;
     await checkStartCommandSyntax(`touch ${marker}`);
-    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
     expect(require('fs').existsSync(marker)).toBe(false);
   });
 });
