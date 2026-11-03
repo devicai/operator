@@ -25,9 +25,17 @@ function makeService(over: { owner?: any; ttlDefault?: number } = {}) {
 
   const sandboxRepo = {
     findOwningSandbox: jest.fn(async () => owner ?? null),
-    updateById: jest.fn(async (_id: string, patch: any) => {
-      updates.push(patch.$set ?? patch);
-      return { ...owner, ...(patch.$set ?? {}) };
+    updateOne: jest.fn(async (_id: any, patch: any) => {
+      updates.push(patch);
+      return {
+        ...owner,
+        expiresAt: new Date(
+          Math.max(
+            new Date(owner.expiresAt).getTime(),
+            patch.$max.expiresAt.getTime(),
+          ),
+        ),
+      };
     }),
     create: jest.fn(),
   };
@@ -60,8 +68,7 @@ describe('single snapshot ownership', () => {
       // Inheriting the last minute of somebody else's session would strand the
       // caller almost immediately.
       expect(updates).toHaveLength(1);
-      expect(updates[0].ttlSeconds).toBe(1800);
-      expect(new Date(updates[0].expiresAt).getTime()).toBeGreaterThan(
+      expect(new Date(updates[0].$max.expiresAt).getTime()).toBeGreaterThan(
         Date.now() + 1_700_000,
       );
     });
@@ -73,11 +80,12 @@ describe('single snapshot ownership', () => {
         snapshotId: 'snap1',
         expiresAt: new Date(Date.now() + 3_600_000), // an hour left
       };
-      const { service, updates } = makeService({ owner });
+      const { service } = makeService({ owner });
 
-      await (service as any).attachToOwner(owner, { ttlSeconds: 60 });
-
-      expect(updates).toHaveLength(0);
+      const attached = await (service as any).attachToOwner(owner, {
+        ttlSeconds: 60,
+      });
+      expect(attached.expiresAt).toEqual(owner.expiresAt);
     });
 
     it('says out loud which request could not be honoured', async () => {
@@ -122,6 +130,7 @@ describe('single snapshot ownership', () => {
         SnapshotsService.prototype,
       ) as SnapshotsService;
       Object.assign(service as any, {
+        sandboxRepo: { findOwningSandbox: jest.fn().mockResolvedValue(null) },
         snapshotRepo: {
           findOne: jest.fn(async () => snapshotDoc),
           updateById: jest.fn(async (_id: string, patch: any) => {

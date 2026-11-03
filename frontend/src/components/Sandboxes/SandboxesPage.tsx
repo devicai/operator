@@ -21,7 +21,12 @@ import {
   faUpRightFromSquare,
 } from '@fortawesome/free-solid-svg-icons';
 import type { ColumnsType } from 'antd/es/table';
-import { useSandboxes, useStopSandbox, useDestroySandbox } from '../../hooks/useSandboxes';
+import {
+  useSandboxes,
+  useStopSandbox,
+  useDestroySandbox,
+  useRecoverSandbox,
+} from '../../hooks/useSandboxes';
 import { useSnapshots } from '../../hooks/useSnapshots';
 import { useUsage } from '../../hooks/useUsage';
 import type { SandboxDto } from '../../api/types';
@@ -48,6 +53,8 @@ const STATUS_COLORS: Record<string, string> = {
   stopped: 'default',
   expired: 'red',
   failed: 'red',
+  recovery_pending: 'orange',
+  recovery_stopping: 'orange',
 };
 
 function formatRemaining(expiresAt: string): string {
@@ -65,7 +72,9 @@ function formatRemaining(expiresAt: string): string {
  */
 function claimTime(row: SandboxDto): string | null {
   if (row.hotReserved) return null;
-  return row.claimedAt ?? ((row.metadata as any)?.hotClaimedAt as string) ?? null;
+  return (
+    row.claimedAt ?? ((row.metadata as any)?.hotClaimedAt as string) ?? null
+  );
 }
 
 /** Hot-pool origin filter — maps to the API's two independent flags. */
@@ -81,6 +90,7 @@ const ORIGIN_QUERY: Record<
 };
 
 const SandboxesPage: React.FC = () => {
+  const recover = useRecoverSandbox();
   const [statusFilter, setStatusFilter] = useState<string | undefined>();
   const [snapshotFilter, setSnapshotFilter] = useState<string | undefined>();
   const [originFilter, setOriginFilter] = useState<OriginFilter | undefined>();
@@ -185,6 +195,11 @@ const SandboxesPage: React.FC = () => {
                 </Tag>
               </Tooltip>
             )}
+            {row.status === 'recovery_pending' && (
+              <Tooltip title={row.stoppedReason}>
+                <Tag color="orange">Disk preserved; recovery required</Tag>
+              </Tooltip>
+            )}
             {row.stoppedReason === 'disk-limit' && (
               <Tooltip
                 title={`Stopped automatically: wrote ${formatSize(row.diskBytes)}, over the per-sandbox disk cap`}
@@ -222,7 +237,9 @@ const SandboxesPage: React.FC = () => {
       dataIndex: 'status',
       key: 'status',
       width: 100,
-      render: (s: string) => <Tag color={STATUS_COLORS[s] ?? 'default'}>{s}</Tag>,
+      render: (s: string) => (
+        <Tag color={STATUS_COLORS[s] ?? 'default'}>{s}</Tag>
+      ),
     },
     {
       title: 'Image',
@@ -260,7 +277,7 @@ const SandboxesPage: React.FC = () => {
           <Tooltip
             title={
               (limit
-                ? `${((ratio) * 100).toFixed(0)}% of the ${formatSize(limit)} per-sandbox cap`
+                ? `${(ratio * 100).toFixed(0)}% of the ${formatSize(limit)} per-sandbox cap`
                 : 'Written on top of the image') +
               (row.diskCheckedAt ? ` · measured ${formatRelative(row.diskCheckedAt)}` : '')
             }
@@ -397,6 +414,30 @@ const SandboxesPage: React.FC = () => {
       align: 'right',
       render: (_: any, row) => (
         <Space size={4}>
+          {row.status === 'recovery_pending' && (
+            <Popconfirm
+              title="Recover preserved changes?"
+              description="Resume this disk independently. Create a new snapshot after recovery to retain its changes."
+              onConfirm={() =>
+                recover
+                  .mutateAsync(row.sandboxId)
+                  .then(() => {
+                    message.success(
+                      'Disk recovered. Create a snapshot to retain the changes.',
+                    );
+                  })
+                  .catch(() => {
+                    message.error(
+                      'Recovery failed; the disk remains preserved.',
+                    );
+                  })
+              }
+            >
+              <Button size="small" loading={recover.isPending}>
+                Recover
+              </Button>
+            </Popconfirm>
+          )}
           {row.status === 'running' && (
             <>
               <Tooltip title="Terminal">
@@ -442,9 +483,12 @@ const SandboxesPage: React.FC = () => {
           <Popconfirm
             title="Destroy this sandbox?"
             description={
-              row.snapshotId
-                ? `Nothing is saved. Snapshot ${row.snapshotId} keeps its last saved version, and everything done in this sandbox since it started is lost. Use Stop to keep it.`
-                : 'The sandbox and its filesystem are removed.'
+              row.status === 'recovery_pending' ||
+              row.status === 'recovery_stopping'
+                ? 'The preserved disk and its unsaved changes will be permanently removed. Recover it and create a new snapshot to keep them.'
+                : row.snapshotId
+                  ? `Nothing is saved. Snapshot ${row.snapshotId} keeps its last saved version, and everything done in this sandbox since it started is lost. Use Stop to keep it.`
+                  : 'The sandbox and its filesystem are removed.'
             }
             okText={row.snapshotId ? 'Destroy, losing the changes' : 'Destroy'}
             okButtonProps={{ danger: true }}
@@ -487,6 +531,7 @@ const SandboxesPage: React.FC = () => {
               { label: 'Stopping', value: 'stopping' },
               { label: 'Stopped', value: 'stopped' },
               { label: 'Expired', value: 'expired' },
+              { label: 'Recovery required', value: 'recovery_pending' },
               { label: 'Failed', value: 'failed' },
             ]}
           />

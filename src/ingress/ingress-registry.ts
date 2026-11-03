@@ -59,7 +59,19 @@ export class IngressRegistry implements OnModuleDestroy {
     ttlSeconds: number,
   ): Promise<void> {
     const ttl = Math.max(1, Math.floor(ttlSeconds));
-    await this.redis.set(this.key(subdomain), JSON.stringify(entry), 'EX', ttl);
+    const published = await this.redis.eval(
+      `
+      local current = redis.call('GET', KEYS[1])
+      if current and cjson.decode(current).sandboxId ~= ARGV[1] then return 0 end
+      redis.call('SET', KEYS[1], ARGV[2], 'EX', ARGV[3])
+      return 1`,
+      1,
+      this.key(subdomain),
+      entry.sandboxId,
+      JSON.stringify(entry),
+      ttl,
+    );
+    if (!published) throw new Error('PUBLIC_ROUTE_IN_USE');
   }
 
   async lookup(subdomain: string): Promise<IngressEntry | null> {
@@ -79,9 +91,7 @@ export class IngressRegistry implements OnModuleDestroy {
    * Remove the route for a subdomain.
    *
    * With `ownerSandboxId`, the entry is only removed if it still names that
-   * sandbox. A subdomain belongs to a SNAPSHOT, not to a sandbox, so several
-   * sandboxes restored from one snapshot compete for the same key and the last
-   * to publish wins. An unconditional delete then lets a sandbox that expired
+   * sandbox. A subdomain belongs to a SNAPSHOT, not to a sandbox, and a successor can acquire the key after its owner releases it. An unconditional delete then lets a sandbox that expired
    * take down the route of whichever one currently holds it — leaving a live
    * sandbox unreachable and the next visit restoring yet another.
    *
@@ -93,15 +103,37 @@ export class IngressRegistry implements OnModuleDestroy {
       return (await this.redis.del(key)) > 0;
     }
 
-    const current = await this.lookup(subdomain);
-    if (!current) return false;
-    if (current.sandboxId !== ownerSandboxId) return false;
-    return (await this.redis.del(key)) > 0;
+    return (
+      Number(
+        await this.redis.eval(
+          `
+      local current = redis.call('GET', KEYS[1])
+      if not current or cjson.decode(current).sandboxId ~= ARGV[1] then return 0 end
+      return redis.call('DEL', KEYS[1])`,
+          1,
+          key,
+          ownerSandboxId,
+        ),
+      ) > 0
+    );
   }
 
-  async extendTtl(subdomain: string, ttlSeconds: number): Promise<void> {
+  async extendTtl(
+    subdomain: string,
+    ttlSeconds: number,
+    ownerSandboxId: string,
+  ): Promise<void> {
     const ttl = Math.max(1, Math.floor(ttlSeconds));
-    await this.redis.expire(this.key(subdomain), ttl);
+    await this.redis.eval(
+      `
+      local current = redis.call('GET', KEYS[1])
+      if not current or cjson.decode(current).sandboxId ~= ARGV[1] then return 0 end
+      return redis.call('EXPIRE', KEYS[1], ARGV[2])`,
+      1,
+      this.key(subdomain),
+      ownerSandboxId,
+      ttl,
+    );
   }
 
   // --- Wake-up coordination -------------------------------------------------

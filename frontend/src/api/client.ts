@@ -63,6 +63,7 @@ api.interceptors.response.use(
 
 // Sandboxes
 export const sandboxesApi = {
+  recover: (id: string) => api.post<SandboxDto>(`/sandboxes/${id}/recover`),
   getAll(params?: {
     limit?: number;
     offset?: number;

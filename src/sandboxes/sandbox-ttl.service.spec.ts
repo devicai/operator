@@ -14,6 +14,8 @@ function makeService(overrides: {
   config?: any;
 } = {}) {
   const sandboxRepo = {
+    find: jest.fn().mockResolvedValue({ data: [] }),
+    updateOne: jest.fn().mockResolvedValue(null),
     findExpired: jest.fn().mockResolvedValue(overrides.expired ?? []),
     atomicExpire: jest.fn().mockImplementation(async () => ({})),
     findLiveContainerNames: jest
@@ -261,5 +263,73 @@ describe('SandboxTtlService scheduling', () => {
     service.onApplicationShutdown();
     expect(spy).toHaveBeenCalledTimes(2);
     spy.mockRestore();
+  });
+});
+
+describe('expiry recovery', () => {
+  it('stops a disk whose snapshot is missing without removing its filesystem', async () => {
+    const doc = { ...expiredDoc('lost'), snapshotId: 'deleted' };
+    const { service, sandboxRepo, snapshotsService, runtime } = makeService({
+      expired: [doc],
+    });
+    snapshotsService.persistToSnapshot.mockResolvedValue('skipped');
+    sandboxRepo.updateOne.mockResolvedValue(doc);
+    const detach = jest.fn().mockResolvedValue(undefined);
+    runtime.get.mockResolvedValue({
+      status: 'running',
+      connect: async () => ({ detach }),
+    });
+    await service.checkExpiredSandboxes();
+    expect(detach).toHaveBeenCalledTimes(1);
+    expect(runtime.remove).not.toHaveBeenCalled();
+    expect(sandboxRepo.atomicExpire).not.toHaveBeenCalled();
+    expect(sandboxRepo.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({ savingSnapshotId: { $in: [null, ''] } }),
+      expect.objectContaining({
+        $set: expect.objectContaining({ status: 'recovery_stopping' }),
+      }),
+      {},
+    );
+    expect(sandboxRepo.updateOne).toHaveBeenLastCalledWith(
+      expect.anything(),
+      { $set: { status: 'recovery_pending' } },
+      {},
+    );
+  });
+
+  it('backs off transient failures and parks the third failure', async () => {
+    const doc: any = {
+      ...expiredDoc('retry'),
+      snapshotId: 'snap',
+      metadata: {},
+    };
+    const { service, sandboxRepo, snapshotsService, runtime } = makeService({
+      expired: [doc],
+    });
+    snapshotsService.persistToSnapshot.mockResolvedValue('failed');
+    await service.checkExpiredSandboxes();
+    expect(runtime.get).not.toHaveBeenCalled();
+    expect(sandboxRepo.updateOne).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({
+        $set: expect.objectContaining({ 'metadata.expirySaveFailures': 1 }),
+      }),
+      {},
+    );
+    doc.metadata.expirySaveFailures = 2;
+    sandboxRepo.updateOne.mockResolvedValue(doc);
+    await service.checkExpiredSandboxes();
+    expect(runtime.get).toHaveBeenCalledWith(doc.name);
+    expect(runtime.remove).not.toHaveBeenCalled();
+  });
+
+  it('does not stop a disk if another capture or TTL renewal wins the claim', async () => {
+    const { service, snapshotsService, runtime } = makeService({
+      expired: [{ ...expiredDoc('race'), snapshotId: 'snap' }],
+    });
+    snapshotsService.persistToSnapshot.mockResolvedValue('conflict');
+    await service.checkExpiredSandboxes();
+    expect(runtime.get).not.toHaveBeenCalled();
+    expect(runtime.remove).not.toHaveBeenCalled();
   });
 });

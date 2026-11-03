@@ -161,6 +161,7 @@ export interface PersistOptions {
    * nothing here and would stall a sandbox still serving requests.
    */
   terminal?: boolean;
+  expectedVersion?: number;
 }
 
 @Injectable()
@@ -277,6 +278,24 @@ export class SnapshotsService implements OnModuleInit {
       const orphanedCreates = await this.snapshotRepo.updateMany(
         { status: SnapshotStatus.CREATING } as any,
         { $set: { status: SnapshotStatus.FAILED } },
+      );
+      // Like capture cleanup above, this runs at boot of the sole Operator
+      // process for this database. Interrupted creates/stops keep their disks
+      // but must not reserve running memory or ownership forever.
+      await this.sandboxRepo.updateMany(
+        {
+          status: { $in: [SandboxStatus.CREATING, SandboxStatus.STOPPING] },
+        } as any,
+        {
+          $set: {
+            status: SandboxStatus.RECOVERY_STOPPING,
+            stoppedReason: 'interrupted-operation',
+          },
+        },
+      );
+      await this.sandboxRepo.updateMany(
+        { savingSnapshotId: { $exists: true } } as any,
+        { $unset: { savingSnapshotId: '' } },
       );
       const files = this.sweepPartialCaptures();
       if (stale || orphanedCreates || files) {
@@ -496,9 +515,10 @@ export class SnapshotsService implements OnModuleInit {
     const tmpPath = this.tempCapturePath(snapshotPath, snapshotId);
     // Same protection as a persist: while we read this container's filesystem,
     // nothing may stop or remove it.
-    await this.markSandboxSaving(sandboxDoc, snapshotId);
-
+    let ownsCapture = false;
     try {
+      await this.markSandboxSaving(sandboxDoc, snapshotId);
+      ownsCapture = true;
       this.logger.log(
         `Creating ${captureScope} snapshot ${snapshotId} from sandbox ${sandboxDoc.sandboxId}...`,
       );
@@ -572,7 +592,7 @@ export class SnapshotsService implements OnModuleInit {
       );
       throw err;
     } finally {
-      await this.clearSandboxSaving(sandboxDoc);
+      if (ownsCapture) await this.clearSandboxSaving(sandboxDoc);
     }
   }
 
@@ -608,21 +628,42 @@ export class SnapshotsService implements OnModuleInit {
     owner: SandboxDocument,
     dto: RestoreSnapshotDto,
   ): Promise<SandboxDocument> {
+    if (owner.status && owner.status !== SandboxStatus.RUNNING) {
+      throw new ConflictException({
+        code:
+          owner.status === SandboxStatus.RECOVERY_PENDING
+            ? 'SNAPSHOT_RECOVERY_REQUIRED'
+            : 'SNAPSHOT_IN_USE',
+        message: 'The snapshot owner is not available yet.',
+        sandboxId: owner.sandboxId,
+      });
+    }
     const requested = dto.ttlSeconds ?? this.config.defaults.defaultTtlSeconds;
     const wantedExpiry = new Date(Date.now() + requested * 1000);
-    const currentExpiry = owner.expiresAt ? new Date(owner.expiresAt) : null;
-
-    let doc = owner;
-    if (!currentExpiry || wantedExpiry > currentExpiry) {
-      doc =
-        (await this.sandboxRepo
-          .updateById(
-            (owner as any)._id.toString(),
-            { $set: { expiresAt: wantedExpiry, ttlSeconds: requested } },
-            {},
-          )
-          .catch(() => null)) ?? owner;
-    }
+    const doc = await this.sandboxRepo.updateOne(
+      {
+        sandboxId: owner.sandboxId,
+        status: SandboxStatus.RUNNING,
+        expiresAt: { $gt: new Date() },
+        savingSnapshotId: { $in: [null, ''] },
+      } as any,
+      { $max: { expiresAt: wantedExpiry } },
+      {},
+    );
+    if (!doc)
+      throw new ConflictException({
+        code: 'SNAPSHOT_IN_USE',
+        message:
+          'The owning session is expiring, saving or closing. Retry when it finishes.',
+      });
+    await this.registry?.extendTtl(
+      doc.sandboxId,
+      Math.max(
+        1,
+        Math.ceil((new Date(doc.expiresAt).getTime() - Date.now()) / 1000),
+      ),
+    );
+    await this.ingressService?.refreshTtl(doc);
 
     const mismatched: string[] = [];
     if (dto.cpus !== undefined && dto.cpus !== owner.cpus) {
@@ -734,9 +775,9 @@ export class SnapshotsService implements OnModuleInit {
     // them can coexist.
     const wantsLink = dto.linked !== false && !options.hotReserved;
     if (wantsLink) {
-      const owner = await this.sandboxRepo
-        .findOwningSandbox(snapshot.snapshotId)
-        .catch(() => null);
+      const owner = await this.sandboxRepo.findOwningSandbox(
+        snapshot.snapshotId,
+      );
       if (owner) {
         const attached = await this.attachToOwner(owner, dto);
         return { sandbox: attached, attached: true };
@@ -765,7 +806,7 @@ export class SnapshotsService implements OnModuleInit {
       await this.resourceUsage.assertMemoryAvailable(restoreMemoryMib);
     }
 
-    const isLinked = dto.linked !== false; // default true
+    const isLinked = wantsLink;
     const exposedHttpPort = dto.exposedHttpPort ?? snapshot.exposedHttpPort;
 
     // When ingress is enabled and the runtime is microsandbox, the public
@@ -832,9 +873,30 @@ export class SnapshotsService implements OnModuleInit {
     // version, which turns the restore into a plain container create. Checked
     // per restore rather than cached: the image may have been evicted to keep
     // the cache under its cap, or pruned out of band.
-    const fromImage = await this.imageService.isUsable(snapshot);
-
     try {
+      if (isLinked) {
+        // The document already exists: a crash after reservation cannot leave
+        // an owner ID without a recoverable sandbox record.
+        await this.clearTerminalOwner(snapshot);
+        const claimed = await this.snapshotRepo.updateOne(
+          {
+            snapshotId: snapshot.snapshotId,
+            status: SnapshotStatus.READY,
+            ownerSandboxId: { $in: [null, sandboxId] },
+            saveState: { $ne: SnapshotSaveState.SAVING },
+            ...this.versionFilter(snapshot.persistVersion ?? 0),
+          } as any,
+          { $set: { ownerSandboxId: sandboxId } },
+          {},
+        );
+        if (!claimed)
+          throw new ConflictException({
+            code: 'SNAPSHOT_IN_USE',
+            message:
+              'Another restore, save or deletion acquired this snapshot. Retry.',
+          });
+      }
+      const fromImage = await this.imageService.isUsable(snapshot);
       const sandbox = await this.runtime.create({
         name: containerName,
         image: fromImage ? snapshot.imageRef! : snapshot.image,
@@ -977,6 +1039,39 @@ export class SnapshotsService implements OnModuleInit {
     });
   }
 
+  private versionFilter(version: number): Record<string, any> {
+    return version === 0
+      ? { $or: [{ persistVersion: 0 }, { persistVersion: null }] }
+      : { persistVersion: version };
+  }
+
+  private async clearTerminalOwner(snapshot: SnapshotDocument): Promise<void> {
+    if (!snapshot.ownerSandboxId) return;
+    const owner = await this.sandboxRepo.findOne(
+      { sandboxId: snapshot.ownerSandboxId } as any,
+      {},
+    );
+    const live =
+      owner &&
+      owner.snapshotId === snapshot.snapshotId &&
+      [
+        SandboxStatus.CREATING,
+        SandboxStatus.RUNNING,
+        SandboxStatus.STOPPING,
+        SandboxStatus.RECOVERY_PENDING,
+        SandboxStatus.RECOVERY_STOPPING,
+      ].includes(owner.status);
+    if (!live)
+      await this.snapshotRepo.updateOne(
+        {
+          snapshotId: snapshot.snapshotId,
+          ownerSandboxId: snapshot.ownerSandboxId,
+        } as any,
+        { $unset: { ownerSandboxId: '' } },
+        {},
+      );
+  }
+
   async findAll(
     scope: ExtensionScope,
     options?: { limit?: number; offset?: number; sandboxId?: string },
@@ -1069,6 +1164,42 @@ export class SnapshotsService implements OnModuleInit {
 
   async destroy(id: string, scope: ExtensionScope): Promise<void> {
     const doc = await this.findById(id, scope);
+    await this.clearTerminalOwner(doc);
+    const claimed = await this.snapshotRepo.updateOne(
+      {
+        snapshotId: doc.snapshotId,
+        status: {
+          $in: [
+            SnapshotStatus.READY,
+            SnapshotStatus.FAILED,
+            SnapshotStatus.DELETING,
+          ],
+        },
+        ownerSandboxId: null,
+        saveState: { $ne: SnapshotSaveState.SAVING },
+      } as any,
+      { $set: { status: SnapshotStatus.DELETING } },
+      scope,
+    );
+    if (!claimed)
+      throw new ConflictException({
+        code: 'SNAPSHOT_IN_USE',
+        message:
+          'Close or discard the owning session and wait for captures before deleting.',
+      });
+    // Legacy sessions do not carry ownerSandboxId. The deleting claim fences
+    // new restores/saves before checking these existing owners.
+    if (await this.sandboxRepo.findOwningSandbox(doc.snapshotId)) {
+      await this.snapshotRepo.updateOne(
+        { snapshotId: doc.snapshotId, status: SnapshotStatus.DELETING } as any,
+        { $set: { status: doc.status } },
+        scope,
+      );
+      throw new ConflictException({
+        code: 'SNAPSHOT_IN_USE',
+        message: 'A session still owns this snapshot.',
+      });
+    }
 
     // Best-effort: a sandbox restored from this image still holds it and the
     // daemon will refuse. The cache sweep reclaims it once that sandbox is
@@ -1247,7 +1378,7 @@ export class SnapshotsService implements OnModuleInit {
         {},
       );
     } catch {
-      snapshotDoc = null;
+      return 'failed';
     }
 
     if (!snapshotDoc || snapshotDoc.status !== SnapshotStatus.READY) {
@@ -1269,7 +1400,8 @@ export class SnapshotsService implements OnModuleInit {
     const currentVersion = snapshotDoc.persistVersion ?? 0;
     if (
       typeof baseVersion === 'number' &&
-      !targetSnapshotId &&
+      (snapshotId === sandboxDoc.snapshotId ||
+        snapshotId === sandboxDoc.metadata?.restoredFrom) &&
       currentVersion > baseVersion
     ) {
       const message =
@@ -1294,12 +1426,28 @@ export class SnapshotsService implements OnModuleInit {
       return 'conflict';
     }
 
+    // Explicit saves to unrelated snapshots require an expected version. A
+    // caller naming its linked/origin snapshot must still pass the base guard.
+    const sameOrigin =
+      snapshotId === sandboxDoc.snapshotId ||
+      snapshotId === sandboxDoc.metadata?.restoredFrom;
+    if (!sameOrigin && options.expectedVersion !== currentVersion)
+      return 'conflict';
+    if (
+      await this.sandboxRepo.findOwningSandbox(snapshotId, sandboxDoc.sandboxId)
+    )
+      return 'conflict';
+    await this.clearTerminalOwner(snapshotDoc);
+
     // Claim the snapshot before touching anything. Two sessions saving into the
     // same snapshot would interleave their tars over one file; the loser is
     // told so rather than silently corrupting the winner's artifact.
     const claimed = await this.snapshotRepo.updateOne(
       {
         snapshotId: snapshotDoc.snapshotId,
+        status: SnapshotStatus.READY,
+        ownerSandboxId: { $in: [null, sandboxDoc.sandboxId] },
+        ...this.versionFilter(currentVersion),
         saveState: { $ne: SnapshotSaveState.SAVING },
       } as any,
       {
@@ -1325,7 +1473,12 @@ export class SnapshotsService implements OnModuleInit {
 
     // Mirrored on the sandbox so stop/destroy can refuse to tear down a
     // container whose filesystem is being read right now.
-    await this.markSandboxSaving(sandboxDoc, snapshotDoc.snapshotId);
+    try {
+      await this.markSandboxSaving(sandboxDoc, snapshotDoc.snapshotId);
+    } catch {
+      await this.releaseSnapshotSave(snapshotDoc, sandboxDoc, false);
+      return 'conflict';
+    }
 
     const persistScope: SnapshotScope =
       (snapshotDoc.scope as SnapshotScope) ?? 'workdir';
@@ -1457,6 +1610,7 @@ export class SnapshotsService implements OnModuleInit {
       await this.advanceBaseVersion(
         sandboxDoc,
         (snapshotDoc.persistVersion ?? 0) + 1,
+        snapshotDoc.snapshotId,
       );
 
       // Only now, with the tarball renamed into place, can a rebuild publish an
@@ -1608,7 +1762,11 @@ export class SnapshotsService implements OnModuleInit {
           `${Date.now() - startedAt} ms)`,
       );
 
-      await this.advanceBaseVersion(sandboxDoc, nextVersion);
+      await this.advanceBaseVersion(
+        sandboxDoc,
+        nextVersion,
+        snapshotDoc.snapshotId,
+      );
 
       // The tarball is now behind. It stays the artifact of record — export,
       // backups and migration all read it — so the background pass refreshes
@@ -1779,7 +1937,13 @@ export class SnapshotsService implements OnModuleInit {
   private async advanceBaseVersion(
     sandboxDoc: SandboxDocument,
     version: number,
+    snapshotId: string,
   ): Promise<void> {
+    if (
+      snapshotId !== sandboxDoc.snapshotId &&
+      snapshotId !== sandboxDoc.metadata?.restoredFrom
+    )
+      return;
     await this.sandboxRepo
       .updateById(
         (sandboxDoc as any)._id.toString(),
@@ -1797,14 +1961,18 @@ export class SnapshotsService implements OnModuleInit {
     sandboxDoc: SandboxDocument,
     snapshotId: string,
   ): Promise<void> {
-    try {
-      await this.sandboxRepo.updateById(
-        (sandboxDoc as any)._id.toString(),
-        { $set: { savingSnapshotId: snapshotId } },
-        {},
-      );
-      (sandboxDoc as any).savingSnapshotId = snapshotId;
-    } catch {}
+    const claimed = await this.sandboxRepo.updateOne(
+      {
+        sandboxId: sandboxDoc.sandboxId,
+        status: { $in: [SandboxStatus.RUNNING, SandboxStatus.STOPPING] },
+        savingSnapshotId: { $in: [null, ''] },
+      } as any,
+      { $set: { savingSnapshotId: snapshotId } },
+      {},
+    );
+    if (!claimed)
+      throw new ConflictException('Sandbox is not available for capture');
+    sandboxDoc.savingSnapshotId = snapshotId;
   }
 
   /** Clear the capture flag on the sandbox. Never throws. */
@@ -1831,6 +1999,7 @@ export class SnapshotsService implements OnModuleInit {
   private async releaseSnapshotSave(
     snapshotDoc: SnapshotDocument,
     sandboxDoc: SandboxDocument,
+    clearSandbox = true,
   ): Promise<void> {
     try {
       const id = (snapshotDoc as any)._id.toString();
@@ -1852,7 +2021,7 @@ export class SnapshotsService implements OnModuleInit {
         `Could not clear save state on snapshot ${snapshotDoc.snapshotId}: ${(err as Error).message}`,
       );
     }
-    await this.clearSandboxSaving(sandboxDoc);
+    if (clearSandbox) await this.clearSandboxSaving(sandboxDoc);
   }
 
   // ---------------------------------------------------------------------------
@@ -2074,10 +2243,15 @@ export class SnapshotsService implements OnModuleInit {
     ttlSeconds: number,
   ): Promise<{ sandboxId: string }> {
     const existing = await this.sandboxRepo
-      .findRunningFromSnapshot(snapshotId)
+      .findOwningSandbox(snapshotId)
       .catch(() => null);
 
     if (existing) {
+      if (existing.status && existing.status !== SandboxStatus.RUNNING)
+        throw new ConflictException({
+          code: 'SNAPSHOT_IN_USE',
+          message: 'The owning session is not available.',
+        });
       this.logger.log(
         `Republishing running sandbox ${existing.sandboxId} for snapshot ` +
           `${snapshotId} instead of restoring another`,

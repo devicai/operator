@@ -156,11 +156,21 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
    */
   async findOwningSandbox(
     snapshotId: string,
+    excludeSandboxId?: string,
   ): Promise<SandboxDocument | null> {
     return this.model
       .findOne({
         snapshotId,
-        status: { $in: [SandboxStatus.RUNNING, SandboxStatus.CREATING] },
+        ...(excludeSandboxId ? { sandboxId: { $ne: excludeSandboxId } } : {}),
+        status: {
+          $in: [
+            SandboxStatus.RUNNING,
+            SandboxStatus.CREATING,
+            SandboxStatus.STOPPING,
+            SandboxStatus.RECOVERY_PENDING,
+            SandboxStatus.RECOVERY_STOPPING,
+          ],
+        },
         hotReserved: { $ne: true },
       })
       .sort({ createdAt: -1 })
@@ -211,6 +221,8 @@ export class SandboxRepository extends BaseRepository<SandboxDocument> {
                   SandboxStatus.CREATING,
                   SandboxStatus.RUNNING,
                   SandboxStatus.STOPPING,
+                  SandboxStatus.RECOVERY_PENDING,
+                  SandboxStatus.RECOVERY_STOPPING,
                 ],
               },
             },

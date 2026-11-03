@@ -1,4 +1,13 @@
-export type SandboxStatus = 'pending' | 'creating' | 'running' | 'stopping' | 'stopped' | 'expired' | 'failed';
+export type SandboxStatus =
+  | 'pending'
+  | 'creating'
+  | 'running'
+  | 'stopping'
+  | 'stopped'
+  | 'expired'
+  | 'failed'
+  | 'recovery_pending'
+  | 'recovery_stopping';
 
 export interface SandboxDto {
   _id: string;

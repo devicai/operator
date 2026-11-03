@@ -7,6 +7,7 @@ export enum SnapshotStatus {
   READY = 'ready',
   RESTORING = 'restoring',
   FAILED = 'failed',
+  DELETING = 'deleting',
 }
 
 /**
@@ -45,6 +46,10 @@ export enum SnapshotSaveStage {
 
 @Schema({ timestamps: true, collection: 'snapshots' })
 export class Snapshot {
+  /** Durable ownership, reserved only after the sandbox document exists. */
+  @Prop()
+  ownerSandboxId?: string;
+
   @ApiProperty()
   @Prop({ required: true, unique: true, index: true })
   snapshotId: string;
@@ -260,7 +265,7 @@ export class Snapshot {
     enum: SnapshotSaveState,
     description:
       "'saving' while a capture is writing this snapshot. The status stays " +
-      "READY throughout: the artifact on disk is the PREVIOUS capture and is " +
+      'READY throughout: the artifact on disk is the PREVIOUS capture and is ' +
       'complete and restorable (captures write to a temp file and rename), so ' +
       'a caller that knowingly forces a restore gets the last saved version ' +
       'rather than a truncated tarball.',

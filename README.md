@@ -772,3 +772,50 @@ Planned improvements:
 ## License
 
 Apache-2.0
+
+### Snapshot ownership and recovery
+
+A linked restore owns the snapshot. Concurrent restores either attach to its
+running owner or return `409 SNAPSHOT_IN_USE` while it is starting, saving or
+closing. An expired owner is never renewed by a restore. Only linked owners use
+the stable snapshot URL; `linked: false` forks and claimed hot-pool sessions use
+an independent URL derived from their sandbox ID. Clients must use the returned
+`publicUrl`, not derive it from the source snapshot. Existing forks are republished
+with their independent URL when Operator starts.
+
+Snapshot deletion returns `409 SNAPSHOT_IN_USE` while an owner (including a
+preserved disk) or capture exists. Close and save the session first, or explicitly
+destroy it to discard its changes. An explicit `snapshotId` on stop still checks
+the sandbox's original version. Saving to an unrelated snapshot requires the
+current `expectedVersion` and no other owner. Save conflicts never merge disks.
+
+When expiration cannot save, transient failures retry after 60 and 120 seconds.
+After three failures, or immediately for a missing snapshot/version conflict,
+Operator enters `recovery_stopping`, stops the container without removing it,
+then records `recovery_pending`. The writable layer is excluded from orphan
+cleanup; the stopped container consumes disk but no running-container RAM.
+The periodic reconciliation finishes interrupted stops. The UI exposes the
+reason and a Recover action.
+
+`POST /api/v1/sandboxes/:id/recover` resumes the preserved disk as an independent
+sandbox with a fresh default TTL. It does not overwrite or reclaim the original
+snapshot. Create a **new snapshot** of the recovered sandbox to retain the
+changes, then close or destroy the recovered session. Recovery does not recreate
+a container that has been removed outside Operator. Preserved disks are never
+automatically discarded; use the existing explicit sandbox DELETE to discard.
+
+Boot-time interrupted-capture reconciliation assumes one Operator application
+process owns a database, as before. Drain the old process before starting its
+replacement; do not run mixed releases against the same database. Interrupted
+creates/stops are parked for recovery. Existing duplicates are not merged or
+silently deleted: inspect their disks and recover each separately.
+
+Local regression (after building, with Node 24 and Docker available):
+
+```sh
+node test/integration/snapshot-ownership.live.cjs
+```
+
+The regression uses loopback ports 3339/3839/27339/26339, a dedicated Mongo
+container/database, Redis, and a generated private API key. It exercises the
+public API and removes its own sandboxes, snapshots and service containers.

@@ -10,6 +10,8 @@ export enum SandboxStatus {
   STOPPED = 'stopped',
   EXPIRED = 'expired',
   FAILED = 'failed',
+  RECOVERY_PENDING = 'recovery_pending',
+  RECOVERY_STOPPING = 'recovery_stopping',
 }
 
 @Schema({ timestamps: true, collection: 'sandboxes' })
@@ -103,7 +105,7 @@ export class Sandbox {
 
   @ApiProperty({
     description:
-      'Bytes written by this sandbox on top of its image (the container\'s ' +
+      "Bytes written by this sandbox on top of its image (the container's " +
       'writable layer), as of the last sampling. The image itself is shared ' +
       'between sandboxes and is not counted.',
     required: false,

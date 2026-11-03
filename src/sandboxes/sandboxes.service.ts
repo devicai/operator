@@ -360,7 +360,19 @@ export class SandboxesService {
     );
   }
 
-  private async getSandboxInstance(doc: SandboxDocument): Promise<RuntimeSandbox> {
+  private async getSandboxInstance(
+    doc: SandboxDocument,
+  ): Promise<RuntimeSandbox> {
+    if (
+      [
+        SandboxStatus.RECOVERY_PENDING,
+        SandboxStatus.RECOVERY_STOPPING,
+      ].includes(doc.status)
+    )
+      throw new ConflictException({
+        code: 'SANDBOX_RECOVERY_REQUIRED',
+        message: 'Recover this disk before executing commands.',
+      });
     // Expiry keeps ownership while the final snapshot is saved. Do not admit
     // new writes during that window (or while a failed save waits for retry).
     if (doc.expiresAt && new Date(doc.expiresAt).getTime() <= Date.now()) {
@@ -738,7 +750,13 @@ export class SandboxesService {
         { $set: { status: SandboxStatus.STOPPING } },
         scope,
       );
-      void this.saveThenStop(doc, scope, reason, saveTarget);
+      void this.saveThenStop(
+        doc,
+        scope,
+        reason,
+        saveTarget,
+        opts.expectedVersion,
+      );
       return stopping ?? doc;
     }
 
@@ -746,7 +764,7 @@ export class SandboxesService {
       const outcome = await this.snapshotsService.persistToSnapshot(
         doc,
         saveTarget,
-        { terminal: true },
+        { terminal: true, expectedVersion: opts.expectedVersion },
       );
       if (outcome === 'conflict') {
         throw new ConflictException({
@@ -774,11 +792,17 @@ export class SandboxesService {
     scope: ExtensionScope,
     reason?: string,
     targetSnapshotId?: string,
+    expectedVersion?: number,
   ): Promise<void> {
     try {
-      const outcome = await this.snapshotsService.persistToSnapshot(doc, targetSnapshotId, {
-        terminal: true,
-      });
+      const outcome = await this.snapshotsService.persistToSnapshot(
+        doc,
+        targetSnapshotId,
+        {
+          terminal: true,
+          expectedVersion,
+        },
+      );
       if (outcome !== 'saved') throw new Error(`Snapshot save: ${outcome}`);
     } catch (err) {
       this.logger.error(`Background save for ${doc.sandboxId} failed; preserving disk: ${(err as Error).message}`);
@@ -816,9 +840,14 @@ export class SandboxesService {
         if (!fresh.savingSnapshotId) {
           const target = opts.snapshotId ?? fresh.snapshotId;
           if (opts.save !== false && target)
-            await this.saveThenStop(fresh, scope, reason, target);
-          else
-            await this.finishStop(fresh, scope, reason);
+            await this.saveThenStop(
+              fresh,
+              scope,
+              reason,
+              target,
+              opts.expectedVersion,
+            );
+          else await this.finishStop(fresh, scope, reason);
           return;
         }
       }
@@ -930,6 +959,79 @@ export class SandboxesService {
 
     await this.registry.remove(doc.sandboxId);
     await this.sandboxRepo.deleteById((doc as any)._id.toString(), scope);
+  }
+
+  /** Resume preserved changes as a fork; never overwrite the old snapshot. */
+  async recover(id: string, scope: ExtensionScope): Promise<SandboxDocument> {
+    const doc = await this.findById(id, scope);
+    if (doc.status === SandboxStatus.RECOVERY_PENDING)
+      await this.resourceUsage.assertMemoryAvailable(doc.memoryMib);
+    const claimed = await this.sandboxRepo.updateOne(
+      {
+        sandboxId: doc.sandboxId,
+        status: SandboxStatus.RECOVERY_PENDING,
+        savingSnapshotId: { $in: [null, ''] },
+      } as any,
+      { $set: { status: SandboxStatus.CREATING } },
+      scope,
+    );
+    if (!claimed)
+      throw new ConflictException('Sandbox is not available for recovery');
+    try {
+      const handle = await this.runtime.get(doc.name);
+      if (!handle)
+        throw new BadRequestException('Preserved container is missing');
+      if (handle.status !== 'running') await handle.start();
+      const ttl = this.config.defaults.defaultTtlSeconds;
+      await this.registry.register(doc.sandboxId, doc.name, ttl);
+      const recovered = await this.sandboxRepo.updateById(
+        doc._id.toString(),
+        {
+          $set: {
+            status: SandboxStatus.RUNNING,
+            expiresAt: new Date(Date.now() + ttl * 1000),
+            ttlSeconds: ttl,
+            'metadata.linked': false,
+            'metadata.recoveredFrom': doc.snapshotId,
+          },
+          $unset: {
+            snapshotId: '',
+            stoppedReason: '',
+            subdomain: '',
+            publicUrl: '',
+            internalEndpoint: '',
+            'metadata.expirySaveFailures': '',
+            'metadata.expiryRetryAt': '',
+          },
+        },
+        scope,
+      );
+      return await this.publishIfEnabled(recovered!, scope);
+    } catch (error) {
+      await this.sandboxRepo.updateById(
+        doc._id.toString(),
+        { $set: { status: SandboxStatus.RECOVERY_STOPPING } },
+        scope,
+      );
+      // A start may have succeeded before a later write failed. The periodic
+      // reconciler finishes parking if stopping itself fails here.
+      try {
+        const handle = await this.runtime.get(doc.name);
+        if (handle?.status === 'running')
+          await (await handle.connect()).detach();
+        await this.registry.remove(doc.sandboxId);
+        await this.sandboxRepo.updateById(
+          doc._id.toString(),
+          { $set: { status: SandboxStatus.RECOVERY_PENDING } },
+          scope,
+        );
+      } catch (stopError) {
+        this.logger.error(
+          `Recovery rollback for ${doc.sandboxId} failed: ${String(stopError)}`,
+        );
+      }
+      throw error;
+    }
   }
 
   async extendTtl(
@@ -1050,7 +1152,9 @@ export class SandboxesService {
    */
   private ttlCeilingMs(doc: SandboxDocument): number {
     const anchor = doc.claimedAt ?? (doc as any).createdAt;
-    return new Date(anchor).getTime() + this.config.defaults.maxTtlSeconds * 1000;
+    return (
+      new Date(anchor).getTime() + this.config.defaults.maxTtlSeconds * 1000
+    );
   }
 
   /**
