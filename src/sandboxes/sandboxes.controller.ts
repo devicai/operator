@@ -112,6 +112,15 @@ export class SandboxesController {
     return this.service.getStatus(id, req.extensionScope ?? {});
   }
 
+  @Post(':id/recover')
+  @ApiOperation({
+    summary:
+      'Resume a preserved disk as an independent sandbox; create a new snapshot to retain its changes',
+  })
+  recover(@Param('id') id: string, @Req() req: any) {
+    return this.service.recover(id, req.extensionScope ?? {});
+  }
+
   @Post()
   @ApiOperation({ summary: 'Create sandbox' })
   create(@Body() dto: CreateSandboxDto, @Req() req: any) {

@@ -98,6 +98,7 @@ describe('ResourceUsageService', () => {
         SandboxStatus.CREATING,
         SandboxStatus.RUNNING,
         SandboxStatus.STOPPING,
+        SandboxStatus.RECOVERY_STOPPING,
       ]);
       expect(aggregateCall[1].$group.total).toEqual({ $sum: '$memoryMib' });
     });

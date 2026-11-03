@@ -22,6 +22,7 @@ const ACTIVE_SANDBOX_STATUSES: SandboxStatus[] = [
   SandboxStatus.CREATING,
   SandboxStatus.RUNNING,
   SandboxStatus.STOPPING,
+  SandboxStatus.RECOVERY_STOPPING,
 ];
 
 @Injectable()

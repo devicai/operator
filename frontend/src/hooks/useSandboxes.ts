@@ -51,7 +51,19 @@ export function useStopSandbox() {
 export function useDestroySandbox() {
   const queryClient = useQueryClient();
   return useMutation({
-    mutationFn: (id: string) => sandboxesApi.destroy(id).then((res) => res.data),
-    onSuccess: () => queryClient.invalidateQueries({ queryKey: [SANDBOXES_KEY] }),
+    mutationFn: (id: string) =>
+      sandboxesApi.destroy(id).then((res) => res.data),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: [SANDBOXES_KEY] }),
+  });
+}
+
+export function useRecoverSandbox() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      sandboxesApi.recover(id).then((res) => res.data),
+    onSuccess: () =>
+      queryClient.invalidateQueries({ queryKey: [SANDBOXES_KEY] }),
   });
 }

@@ -14,7 +14,7 @@ import { SnapshotsService } from './snapshots.service';
 function makeService(runningSandbox: any = null) {
   const logger = { log: jest.fn(), warn: jest.fn(), error: jest.fn() };
   const sandboxRepo = {
-    findRunningFromSnapshot: jest.fn(async () => runningSandbox),
+    findOwningSandbox: jest.fn(async () => runningSandbox),
   };
   const publishIfEnabled = jest.fn(async (s: any) => s);
   // `restore` now reports whether it created a sandbox or handed back the one
@@ -64,7 +64,7 @@ describe('wakeRestore', () => {
   // still better than serving an error page.
   it('falls back to restoring when the lookup fails', async () => {
     const { wake, sandboxRepo, restore } = makeService(null);
-    sandboxRepo.findRunningFromSnapshot.mockRejectedValueOnce(
+    sandboxRepo.findOwningSandbox.mockRejectedValueOnce(
       new Error('mongo is down'),
     );
 

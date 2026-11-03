@@ -7,6 +7,7 @@ import {
   OnModuleInit,
   OnApplicationShutdown,
 } from '@nestjs/common';
+import { SandboxStatus } from '../schemas/sandbox.schema';
 import { SandboxRepository } from '../repositories/sandbox.repository';
 import { SandboxRegistry } from './sandbox-registry';
 import { IngressService } from '../ingress/ingress.service';
@@ -96,6 +97,11 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
       this.logger.log(`Found ${expired.length} expired sandbox(es)`);
 
       for (const doc of expired) {
+        if (
+          doc.metadata?.expiryRetryAt &&
+          new Date(doc.metadata.expiryRetryAt).getTime() > Date.now()
+        )
+          continue;
         // Something is already capturing this filesystem (an async stop, a
         // create). Leave it alone: expiring it here would remove the container
         // out from under the tar. It reappears next tick, once the flag clears.
@@ -116,11 +122,11 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
               doc, undefined, { terminal: true },
             );
             if (outcome !== 'saved') {
-              this.logger.warn(`Expiry save for ${doc.sandboxId}: ${outcome}; preserving disk for retry`);
+              await this.deferOrPark(doc, outcome);
               continue;
             }
-          } catch (err) {
-            this.logger.error(`Expiry save for ${doc.sandboxId} failed; preserving disk: ${(err as Error).message}`);
+          } catch (_err) {
+            await this.deferOrPark(doc, 'failed');
             continue;
           }
         }
@@ -184,6 +190,63 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
     }
   }
 
+  /** A stopped container retains its writable layer but consumes no RAM. */
+  private async deferOrPark(doc: any, outcome: string): Promise<void> {
+    const failures = (doc.metadata?.expirySaveFailures ?? 0) + 1;
+    if (outcome === 'failed' && failures < 3) {
+      await this.sandboxRepo.updateOne(
+        { sandboxId: doc.sandboxId, status: SandboxStatus.RUNNING } as any,
+        {
+          $set: {
+            'metadata.expirySaveFailures': failures,
+            'metadata.expiryRetryAt': new Date(
+              Date.now() + 30_000 * 2 ** failures,
+            ).toISOString(),
+          },
+        },
+        {},
+      );
+      return;
+    }
+    const parked = await this.sandboxRepo.updateOne(
+      {
+        sandboxId: doc.sandboxId,
+        status: SandboxStatus.RUNNING,
+        expiresAt: { $lte: new Date() },
+        savingSnapshotId: { $in: [null, ''] },
+      } as any,
+      {
+        $set: {
+          status: SandboxStatus.RECOVERY_STOPPING,
+          stoppedReason: 'snapshot-save-' + outcome,
+          'metadata.expirySaveFailures': failures,
+        },
+        $unset: { publicUrl: '', internalEndpoint: '' },
+      },
+      {},
+    );
+    if (!parked) return;
+    await this.stopPreservedDisk(parked);
+    this.logger.warn(
+      `Sandbox ${doc.sandboxId} requires recovery (${outcome}); disk preserved`,
+    );
+  }
+
+  private async stopPreservedDisk(doc: any): Promise<void> {
+    const handle = await this.runtime.get(doc.name);
+    if (handle?.status === 'running') await (await handle.connect()).detach();
+    await this.registry.remove(doc.sandboxId);
+    await this.ingressService?.unpublish(doc);
+    await this.sandboxRepo.updateOne(
+      {
+        sandboxId: doc.sandboxId,
+        status: SandboxStatus.RECOVERY_STOPPING,
+      } as any,
+      { $set: { status: SandboxStatus.RECOVERY_PENDING } },
+      {},
+    );
+  }
+
   /**
    * Reconcile the runtime against the database: remove every managed container
    * whose sandbox is gone or in a terminal state.
@@ -203,6 +266,21 @@ export class SandboxTtlService implements OnModuleInit, OnApplicationShutdown {
     this.sweeping = true;
 
     try {
+      // Complete a parking interrupted by a process crash or runtime failure.
+      const recovery = await this.sandboxRepo.find(
+        { status: SandboxStatus.RECOVERY_STOPPING } as any,
+        {},
+        { limit: 10000 },
+      );
+      for (const doc of recovery.data) {
+        try {
+          await this.stopPreservedDisk(doc);
+        } catch (error) {
+          this.logger.error(
+            `Could not park ${doc.sandboxId}: ${String(error)}`,
+          );
+        }
+      }
       const managed = await this.runtime.listManaged();
       if (managed.length === 0) return;
 

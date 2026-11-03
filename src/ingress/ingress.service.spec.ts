@@ -211,7 +211,7 @@ describe('IngressService', () => {
 
     // An unlinked restore (a fork, or one woken by a visit) never gets
     // `snapshotId` on the document, but it still belongs at the same address.
-    it('reads the origin from metadata.restoredFrom when the sandbox is unlinked', async () => {
+    it('gives an unlinked fork its own URL', async () => {
       snapshots.set('snapORIG', { snapshotId: 'snapORIG', slug: 'demo-site' });
       runtime.getAddress.mockResolvedValueOnce({ host: '10.1.1.3', port: 8000 });
 
@@ -221,7 +221,7 @@ describe('IngressService', () => {
         metadata: { restoredFrom: 'snapORIG', linked: false },
       } as any);
 
-      expect(result?.subdomain).toBe('demo-site');
+      expect(result?.subdomain).toBe('unlinkedone');
     });
 
     it('keeps publishing by sandbox id when the sandbox has no snapshot', async () => {
@@ -249,17 +249,16 @@ describe('IngressService', () => {
       expect(result?.subdomain).toBe('orphanbox');
     });
 
-    it('stays reachable when the snapshot lookup itself fails', async () => {
+    it('refuses publication when snapshot ownership cannot be checked', async () => {
       snapshotRepo.findOne.mockRejectedValueOnce(new Error('mongo is down'));
-      runtime.getAddress.mockResolvedValueOnce({ host: '10.1.1.6', port: 80 });
-
-      const result = await service.publish({
-        sandboxId: 'ResilientBox',
-        name: 'sandbox-ResilientBox',
-        snapshotId: 'snapABC',
-      } as any);
-
-      expect(result?.subdomain).toBe('resilientbox');
+      await expect(
+        service.publish({
+          sandboxId: 'ResilientBox',
+          name: 'sandbox-ResilientBox',
+          snapshotId: 'snapABC',
+        } as any),
+      ).rejects.toThrow('mongo is down');
+      expect(registry.publish).not.toHaveBeenCalled();
     });
   });
 

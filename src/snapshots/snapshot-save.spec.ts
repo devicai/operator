@@ -32,6 +32,8 @@ function makeService(overrides: { snapshot?: any; claim?: any } = {}) {
     updateMany: jest.fn().mockResolvedValue(0),
   };
   const sandboxRepo = {
+    updateOne: jest.fn().mockResolvedValue({}),
+    updateMany: jest.fn().mockResolvedValue(0),
     updateById: jest.fn().mockResolvedValue(undefined),
     // A linked restore first checks whether the snapshot is already running as
     // something; these cases have nothing running.
@@ -105,7 +107,10 @@ describe('persistToSnapshot', () => {
     const outcome = await service.persistToSnapshot(sandboxDoc());
 
     expect(outcome).toBe('failed');
-    const updates = sandboxRepo.updateById.mock.calls.map(([, u]) => u);
+    const updates = [
+      ...sandboxRepo.updateOne.mock.calls,
+      ...sandboxRepo.updateById.mock.calls,
+    ].map(([, u]) => u);
     expect(updates[0].$set.savingSnapshotId).toBe('snap1');
     // Even when the capture blows up, the flag must not outlive it — it gates
     // stop/destroy and would strand the sandbox.
@@ -268,5 +273,53 @@ describe('restore while a save is running', () => {
 
     expect(err).not.toBeInstanceOf(ConflictException);
     expect((err as Error).message).toMatch(/not found on disk/i);
+  });
+});
+
+describe('atomic save claims', () => {
+  it('checks the version in the same Mongo write that claims the save', async () => {
+    const { service, snapshotRepo } = makeService({
+      snapshot: {
+        _id: 'snap',
+        snapshotId: 'snap1',
+        status: 'ready',
+        persistVersion: 5,
+      },
+      claim: null,
+    });
+    const doc = sandboxDoc();
+    doc.metadata = { baseVersion: 5 };
+    expect(await service.persistToSnapshot(doc, 'snap1')).toBe('conflict');
+    expect(snapshotRepo.updateOne).toHaveBeenCalledWith(
+      expect.objectContaining({
+        status: 'ready',
+        persistVersion: 5,
+        ownerSandboxId: { $in: [null, doc.sandboxId] },
+      }),
+      expect.anything(),
+      {},
+    );
+  });
+
+  it('does not let explicit snapshotId bypass a stale base', async () => {
+    const { service, snapshotRepo } = makeService({
+      snapshot: {
+        _id: 'snap',
+        snapshotId: 'snap1',
+        status: 'ready',
+        persistVersion: 6,
+      },
+    });
+    const doc = sandboxDoc();
+    doc.metadata = { baseVersion: 5 };
+    expect(await service.persistToSnapshot(doc, 'snap1')).toBe('conflict');
+    expect(snapshotRepo.updateOne).not.toHaveBeenCalled();
+  });
+
+  it('does not clear a different capture when the sandbox claim loses', async () => {
+    const { service, sandboxRepo } = makeService();
+    sandboxRepo.updateOne.mockResolvedValue(null);
+    expect(await service.persistToSnapshot(sandboxDoc())).toBe('conflict');
+    expect(sandboxRepo.updateById).not.toHaveBeenCalled();
   });
 });

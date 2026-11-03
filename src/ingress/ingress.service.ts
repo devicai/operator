@@ -74,7 +74,15 @@ export class IngressService implements OnModuleInit {
     let repaired = 0;
     for (const sandbox of sandboxes) {
       try {
-        if (await this.publish(sandbox)) repaired += 1;
+        const result = await this.publish(sandbox);
+        if (result) {
+          await this.sandboxRepo.updateById(
+            sandbox._id.toString(),
+            { $set: result },
+            {},
+          );
+          repaired += 1;
+        }
       } catch (err) {
         this.logger.warn(
           `Could not reattach sandbox ${sandbox.sandboxId}: ${(err as Error).message}`,
@@ -130,6 +138,19 @@ export class IngressService implements OnModuleInit {
     if (!this.isEnabled()) return null;
     const cfg = this.requireConfig();
 
+    if (sandbox.snapshotId) {
+      const snapshot = await this.snapshotRepo.findOne(
+        { snapshotId: sandbox.snapshotId } as any,
+        {},
+      );
+      if (
+        snapshot?.ownerSandboxId &&
+        snapshot.ownerSandboxId !== sandbox.sandboxId
+      ) {
+        throw new Error('SNAPSHOT_OWNED_BY_ANOTHER_SANDBOX');
+      }
+    }
+
     // Allow the runtime to make the sandbox reachable from this process
     // (e.g. Docker connects the local container to the per-sandbox bridge).
     if (this.runtime.attachLocal) {
@@ -152,6 +173,9 @@ export class IngressService implements OnModuleInit {
     }
 
     const subdomain = await this.resolveSubdomain(sandbox);
+    if (sandbox.subdomain && sandbox.subdomain !== subdomain) {
+      await this.registry.unpublish(sandbox.subdomain, sandbox.sandboxId);
+    }
     const entry: IngressEntry = {
       sandboxId: sandbox.sandboxId,
       upstreamHost: address.host,
@@ -211,7 +235,11 @@ export class IngressService implements OnModuleInit {
       sandbox as SandboxDocument,
       cfg.registryMaxTtlSeconds,
     );
-    await this.registry.extendTtl(sandbox.subdomain.toLowerCase(), ttl);
+    await this.registry.extendTtl(
+      sandbox.subdomain.toLowerCase(),
+      ttl,
+      sandbox.sandboxId,
+    );
   }
 
   /**
@@ -240,19 +268,11 @@ export class IngressService implements OnModuleInit {
    * out a different URL on every restore. Anything not born of a snapshot keeps
    * the historical behaviour of being published under its own id.
    *
-   * The origin is read from `metadata.restoredFrom`, not from `snapshotId`:
-   * the latter is only set for LINKED restores, and an unlinked sandbox (a
-   * fork, or one revived by visiting its URL) still belongs at the same
-   * address.
-   *
-   * If two sandboxes of the same snapshot are alive at once they both claim
-   * this subdomain and the last to publish wins — the registry entry is a
-   * single key. That is the intended trade-off: the address identifies the
-   * snapshot, not the process serving it.
+   * Only linked owners use the stable snapshot URL. Forks and hot-pool
+   * sessions publish their own sandbox ID, even when restoredFrom is present.
    */
   private async resolveSubdomain(sandbox: SandboxDocument): Promise<string> {
-    const origin =
-      sandbox.snapshotId ?? (sandbox.metadata?.restoredFrom as string | undefined);
+    const origin = sandbox.snapshotId;
     if (!origin) return toDnsLabel(sandbox.sandboxId);
 
     try {
@@ -282,4 +302,3 @@ export class IngressService implements OnModuleInit {
     return Math.min(maxTtl, Math.ceil(remainingMs / 1000) + 60);
   }
 }
-

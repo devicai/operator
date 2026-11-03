@@ -1,7 +1,16 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsOptional, IsString } from 'class-validator';
+import { IsBoolean, IsOptional, IsString, IsInt, Min } from 'class-validator';
 
 export class StopSandboxDto {
+  @ApiPropertyOptional({
+    description:
+      'Required expected version when saving to an unrelated snapshot.',
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  expectedVersion?: number;
+
   @ApiPropertyOptional({
     default: true,
     description:
